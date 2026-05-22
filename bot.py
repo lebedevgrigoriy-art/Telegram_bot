@@ -7,6 +7,7 @@ import logging
 import requests
 from datetime import datetime, time as dtime
 import pytz
+import asyncio
 
 from telegram import Update
 from telegram.ext import (
@@ -18,14 +19,6 @@ from telegram.ext import (
     ConversationHandler,
 )
 
-# --- Настройки ---
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-MY_CHAT_ID = int(os.environ.get("MY_CHAT_ID"))
-BYBIT_BOT_TOKEN = os.environ.get("BYBIT_BOT_TOKEN")
-BYBIT_CHAT_ID = int(os.environ.get("BYBIT_CHAT_ID"))
-BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY")
-BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET")
-BYBIT_BOT_ID = os.environ.get("BYBIT_BOT_ID")
 TIMEZONE = pytz.timezone("Asia/Bangkok")
 
 logging.basicConfig(
@@ -33,6 +26,15 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+# Токены и ID
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+MY_CHAT_ID = int(os.environ.get("MY_CHAT_ID"))
+BYBIT_BOT_TOKEN = os.environ.get("BYBIT_BOT_TOKEN")
+BYBIT_CHAT_ID = int(os.environ.get("BYBIT_CHAT_ID"))
+BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY")
+BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET")
+BYBIT_BOT_ID = os.environ.get("BYBIT_BOT_ID")
 
 Q1, Q2, Q3, Q4 = range(4)
 
@@ -210,7 +212,7 @@ def format_bybit_report(data):
             f"🏦 Капитал: `{capital} USDT`\n"
         )
     except Exception as e:
-        return f"❌ Ошибка обработки данных: {e}\n\n```{json.dumps(data, indent=2)[:500]}```"
+        return f"❌ Ошибка: {e}\n\n```{json.dumps(data, indent=2)[:500]}```"
 
 
 async def bybit_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -236,15 +238,9 @@ async def weekly_bybit_report(context: ContextTypes.DEFAULT_TYPE):
 # ЗАПУСК
 # =====================
 
-import threading
-
-
-def run_reflection_bot():
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    app = Application.builder().token(BOT_TOKEN).build()
+async def main():
+    # Бот рефлексии
+    reflection_app = Application.builder().token(BOT_TOKEN).build()
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("ask", ask)],
@@ -257,41 +253,37 @@ def run_reflection_bot():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    app.add_handler(CommandHandler("start", start_reflection))
-    app.add_handler(conv_handler)
-    app.add_handler(CommandHandler("history", history))
+    reflection_app.add_handler(CommandHandler("start", start_reflection))
+    reflection_app.add_handler(conv_handler)
+    reflection_app.add_handler(CommandHandler("history", history))
 
-    app.job_queue.run_daily(
+    reflection_app.job_queue.run_daily(
         evening_questions,
         time=dtime(hour=21, minute=0, second=0, tzinfo=TIMEZONE),
     )
 
-    logger.info("Бот рефлексии запущен.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-def run_bybit_bot():
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    app = Application.builder().token(BYBIT_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("status", bybit_status))
-
-    app.job_queue.run_daily(
+    # Bybit бот
+    bybit_app = Application.builder().token(BYBIT_BOT_TOKEN).build()
+    bybit_app.add_handler(CommandHandler("status", bybit_status))
+    bybit_app.job_queue.run_daily(
         weekly_bybit_report,
         time=dtime(hour=20, minute=0, second=0, tzinfo=TIMEZONE),
         days=(6,),
     )
 
-    logger.info("Bybit бот запущен.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Запускаем оба бота одновременно
+    async with reflection_app, bybit_app:
+        await reflection_app.start()
+        await bybit_app.start()
+
+        await reflection_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        await bybit_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+
+        logger.info("Оба бота запущены.")
+
+        # Держим процесс живым
+        await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
-    t1 = threading.Thread(target=run_reflection_bot)
-    t2 = threading.Thread(target=run_bybit_bot)
-    t1.start()
-    t2.start()
-    t1.join()
-    t2.join()
+    asyncio.run(main())
