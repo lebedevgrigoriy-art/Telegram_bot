@@ -182,26 +182,45 @@ def bybit_request(endpoint, params=None):
     return r.json()
 
 
-def get_wallet():
-    """Получаем баланс UNIFIED кошелька."""
-    data = bybit_request("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
-    if data.get("retCode") != 0:
-        return None, data.get("retMsg", "Ошибка")
-
+def get_all_balances():
+    """Пробуем все типы аккаунтов и суммируем."""
+    total_usd = 0.0
     coins = {}
-    try:
-        coin_list = data["result"]["list"][0]["coin"]
-        for coin in coin_list:
-            symbol = coin["coin"]
-            equity = float(coin.get("equity", 0) or 0)
-            usd_value = float(coin.get("usdValue", 0) or 0)
-            if usd_value > 0.01:
-                coins[symbol] = {"equity": equity, "usdValue": usd_value}
-    except Exception as e:
-        return None, str(e)
 
-    total_usd = sum(c["usdValue"] for c in coins.values())
-    return {"coins": coins, "totalUsd": total_usd}, None
+    for account_type in ["UNIFIED", "SPOT", "FUND"]:
+        try:
+            data = bybit_request("/v5/account/wallet-balance", {"accountType": account_type})
+            if data.get("retCode") != 0:
+                continue
+            coin_list = data["result"]["list"][0]["coin"]
+            for coin in coin_list:
+                symbol = coin["coin"]
+                usd_value = float(coin.get("usdValue", 0) or 0)
+                equity = float(coin.get("equity", 0) or 0)
+                if usd_value > 0.01:
+                    if symbol not in coins:
+                        coins[symbol] = {"equity": 0, "usdValue": 0}
+                    coins[symbol]["equity"] += equity
+                    coins[symbol]["usdValue"] += usd_value
+                    total_usd += usd_value
+        except Exception:
+            continue
+
+    # Также проверяем asset баланс (Trading Bot хранит там)
+    try:
+        data = bybit_request("/v5/asset/transfer/query-account-coins-balance", {
+            "accountType": "SPOT",
+            "coin": "USDT",
+        })
+        if data.get("retCode") == 0:
+            balance = float(data["result"].get("balance", {}).get("walletBalance", 0) or 0)
+            if balance > 0.01 and "USDT" not in coins:
+                coins["USDT"] = {"equity": balance, "usdValue": balance}
+                total_usd += balance
+    except Exception:
+        pass
+
+    return {"coins": coins, "totalUsd": total_usd}
 
 
 def load_snapshot():
@@ -227,7 +246,10 @@ def format_wallet_report(current, previous=None):
     for symbol, info in current["coins"].items():
         text += f"• {symbol}: `{info['equity']:.6f}` (${info['usdValue']:.2f})\n"
 
-    if previous:
+    if not current["coins"]:
+        text += "_Монеты с балансом не найдены_\n"
+
+    if previous and previous.get("totalUsd", 0) > 0:
         prev_total = previous["totalUsd"]
         diff = total - prev_total
         pct = (diff / prev_total * 100) if prev_total > 0 else 0
@@ -242,24 +264,14 @@ async def bybit_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != BYBIT_CHAT_ID:
         return
     await update.message.reply_text("Запрашиваю баланс с Bybit... ⏳")
-    wallet, err = get_wallet()
-    if err:
-        await update.message.reply_text(f"❌ Ошибка: {err}")
-        return
+    wallet = get_all_balances()
     previous = load_snapshot()
     text = format_wallet_report(wallet, previous)
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def weekly_bybit_report(context: ContextTypes.DEFAULT_TYPE):
-    wallet, err = get_wallet()
-    if err:
-        await context.bot.send_message(
-            chat_id=BYBIT_CHAT_ID,
-            text=f"❌ Ошибка получения баланса: {err}",
-        )
-        return
-
+    wallet = get_all_balances()
     previous = load_snapshot()
     text = "🗓 *Еженедельный отчёт Bybit*\n\n" + format_wallet_report(wallet, previous)
     await context.bot.send_message(
@@ -271,15 +283,13 @@ async def weekly_bybit_report(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def bybit_snap(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сохранить текущий баланс как точку отсчёта."""
     if update.effective_chat.id != BYBIT_CHAT_ID:
         return
-    wallet, err = get_wallet()
-    if err:
-        await update.message.reply_text(f"❌ Ошибка: {err}")
-        return
+    wallet = get_all_balances()
     save_snapshot(wallet)
-    await update.message.reply_text("✅ Снимок баланса сохранён. Через неделю покажу изменение.")
+    await update.message.reply_text(
+        f"✅ Снимок сохранён. Итого: ${wallet['totalUsd']:.2f}\nЧерез неделю покажу изменение."
+    )
 
 
 # =====================
