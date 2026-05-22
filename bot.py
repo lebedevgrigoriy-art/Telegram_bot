@@ -27,7 +27,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Токены и ID
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 MY_CHAT_ID = int(os.environ.get("MY_CHAT_ID"))
 BYBIT_BOT_TOKEN = os.environ.get("BYBIT_BOT_TOKEN")
@@ -156,10 +155,7 @@ async def evening_questions(context: ContextTypes.DEFAULT_TYPE):
 # BYBIT ТРЕКЕР
 # =====================
 
-def bybit_request(endpoint, params=None):
-    if params is None:
-        params = {}
-    base_url = "https://api.bybit.com"
+def bybit_sign(params):
     timestamp = str(int(time.time() * 1000))
     recv_window = "5000"
     params_str = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
@@ -175,17 +171,43 @@ def bybit_request(endpoint, params=None):
         "X-BAPI-SIGN": signature,
         "X-BAPI-RECV-WINDOW": recv_window,
     }
-    response = requests.get(f"{base_url}{endpoint}", headers=headers, params=params)
-    return response.json()
+    return headers
+
+
+def bybit_get(endpoint, params=None):
+    if params is None:
+        params = {}
+    headers = bybit_sign(params)
+    response = requests.get(
+        f"https://api.bybit.com{endpoint}",
+        headers=headers,
+        params=params,
+        timeout=10,
+    )
+    return response.text, response.status_code
 
 
 def get_grid_pnl():
-    params = {"botId": BYBIT_BOT_ID, "category": "spot"}
-    return bybit_request("/v5/spot-algo/get-bot-detail", params)
+    """Пробуем получить данные грид-бота."""
+    params = {"botId": BYBIT_BOT_ID}
+    text, code = bybit_get("/v5/spot-algo/get-bot-detail", params)
+    return text, code
 
 
-def format_bybit_report(data):
+def format_bybit_report(raw_text):
     try:
+        data = json.loads(raw_text)
+        ret_code = data.get("retCode", -1)
+        ret_msg = data.get("retMsg", "")
+
+        if ret_code != 0:
+            return (
+                f"⚠️ Bybit вернул ошибку:\n"
+                f"Код: {ret_code}\n"
+                f"Сообщение: {ret_msg}\n\n"
+                f"Сырой ответ:\n`{raw_text[:600]}`"
+            )
+
         result = data.get("result", {})
         pnl = result.get("pnl", "—")
         pnl_ratio = result.get("pnlRatio", "—")
@@ -212,21 +234,21 @@ def format_bybit_report(data):
             f"🏦 Капитал: `{capital} USDT`\n"
         )
     except Exception as e:
-        return f"❌ Ошибка: {e}\n\n```{json.dumps(data, indent=2)[:500]}```"
+        return f"❌ Ошибка парсинга: {e}\n\nСырой ответ:\n`{raw_text[:600]}`"
 
 
 async def bybit_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != BYBIT_CHAT_ID:
         return
     await update.message.reply_text("Запрашиваю данные с Bybit... ⏳")
-    data = get_grid_pnl()
-    text = format_bybit_report(data)
+    raw_text, code = get_grid_pnl()
+    text = format_bybit_report(raw_text)
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def weekly_bybit_report(context: ContextTypes.DEFAULT_TYPE):
-    data = get_grid_pnl()
-    text = "🗓 *Еженедельный отчёт Bybit*\n\n" + format_bybit_report(data)
+    raw_text, code = get_grid_pnl()
+    text = "🗓 *Еженедельный отчёт Bybit*\n\n" + format_bybit_report(raw_text)
     await context.bot.send_message(
         chat_id=BYBIT_CHAT_ID,
         text=text,
@@ -239,7 +261,6 @@ async def weekly_bybit_report(context: ContextTypes.DEFAULT_TYPE):
 # =====================
 
 async def main():
-    # Бот рефлексии
     reflection_app = Application.builder().token(BOT_TOKEN).build()
 
     conv_handler = ConversationHandler(
@@ -256,13 +277,11 @@ async def main():
     reflection_app.add_handler(CommandHandler("start", start_reflection))
     reflection_app.add_handler(conv_handler)
     reflection_app.add_handler(CommandHandler("history", history))
-
     reflection_app.job_queue.run_daily(
         evening_questions,
         time=dtime(hour=21, minute=0, second=0, tzinfo=TIMEZONE),
     )
 
-    # Bybit бот
     bybit_app = Application.builder().token(BYBIT_BOT_TOKEN).build()
     bybit_app.add_handler(CommandHandler("status", bybit_status))
     bybit_app.job_queue.run_daily(
@@ -271,17 +290,12 @@ async def main():
         days=(6,),
     )
 
-    # Запускаем оба бота одновременно
     async with reflection_app, bybit_app:
         await reflection_app.start()
         await bybit_app.start()
-
         await reflection_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         await bybit_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-
         logger.info("Оба бота запущены.")
-
-        # Держим процесс живым
         await asyncio.Event().wait()
 
 
