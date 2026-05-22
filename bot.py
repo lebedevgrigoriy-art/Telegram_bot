@@ -1,10 +1,6 @@
 import os
-import time
-import hmac
-import hashlib
 import json
 import logging
-import requests
 from datetime import datetime, time as dtime
 import pytz
 import asyncio
@@ -18,6 +14,7 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
 )
+from pybit.unified_trading import HTTP
 
 TIMEZONE = pytz.timezone("Asia/Bangkok")
 
@@ -34,6 +31,11 @@ BYBIT_CHAT_ID = int(os.environ.get("BYBIT_CHAT_ID"))
 BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY")
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET")
 BYBIT_BOT_ID = os.environ.get("BYBIT_BOT_ID")
+
+bybit_session = HTTP(
+    api_key=BYBIT_API_KEY,
+    api_secret=BYBIT_API_SECRET,
+)
 
 Q1, Q2, Q3, Q4 = range(4)
 
@@ -155,100 +157,57 @@ async def evening_questions(context: ContextTypes.DEFAULT_TYPE):
 # BYBIT ТРЕКЕР
 # =====================
 
-def bybit_sign(params):
-    timestamp = str(int(time.time() * 1000))
-    recv_window = "5000"
-    params_str = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-    sign_str = timestamp + BYBIT_API_KEY + recv_window + params_str
-    signature = hmac.new(
-        BYBIT_API_SECRET.encode("utf-8"),
-        sign_str.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-    headers = {
-        "X-BAPI-API-KEY": BYBIT_API_KEY,
-        "X-BAPI-TIMESTAMP": timestamp,
-        "X-BAPI-SIGN": signature,
-        "X-BAPI-RECV-WINDOW": recv_window,
-    }
-    return headers
-
-
-def bybit_get(endpoint, params=None):
-    if params is None:
-        params = {}
-    headers = bybit_sign(params)
-    response = requests.get(
-        f"https://api.bybit.com{endpoint}",
-        headers=headers,
-        params=params,
-        timeout=10,
-    )
-    return response.text, response.status_code
-
-
 def get_grid_pnl():
-    """Пробуем получить данные грид-бота."""
-    params = {"botId": BYBIT_BOT_ID}
-    text, code = bybit_get("/v5/spot-algo/get-bot-detail", params)
-    return text, code
-
-
-def format_bybit_report(raw_text):
     try:
-        data = json.loads(raw_text)
+        response = bybit_session.get_spot_algo_orders(
+            orderFilter="StopOrder",
+            botId=BYBIT_BOT_ID,
+        )
+        return response
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def format_bybit_report(data):
+    try:
+        if "error" in data:
+            return f"❌ Ошибка запроса: {data['error']}"
+
         ret_code = data.get("retCode", -1)
         ret_msg = data.get("retMsg", "")
 
         if ret_code != 0:
             return (
-                f"⚠️ Bybit вернул ошибку:\n"
-                f"Код: {ret_code}\n"
-                f"Сообщение: {ret_msg}\n\n"
-                f"Сырой ответ:\n`{raw_text[:600]}`"
+                f"⚠️ Bybit ответил с ошибкой:\n"
+                f"Код: `{ret_code}`\n"
+                f"Сообщение: `{ret_msg}`\n\n"
+                f"Сырой ответ:\n`{json.dumps(data)[:500]}`"
             )
 
         result = data.get("result", {})
-        pnl = result.get("pnl", "—")
-        pnl_ratio = result.get("pnlRatio", "—")
-        grid_profit = result.get("gridProfit", "—")
-        invested = result.get("investment", "—")
-        capital = result.get("assets", "—")
-        pair = result.get("symbol", "BTC/USDT")
-
-        if pnl_ratio != "—":
-            pnl_pct = float(pnl_ratio) * 100
-            pnl_str = f"{pnl_pct:+.2f}%"
-            emoji = "📈" if pnl_pct >= 0 else "📉"
-        else:
-            pnl_str = "—"
-            emoji = "📊"
-
         now = datetime.now(TIMEZONE).strftime("%d.%m.%Y %H:%M")
+
         return (
-            f"{emoji} *Грид-бот {pair}*\n"
+            f"📊 *Данные грид-бота BTC/USDT*\n"
             f"_{now}_\n\n"
-            f"💰 Инвестировано: `{invested} USDT`\n"
-            f"📊 P&L: `{pnl} USDT` ({pnl_str})\n"
-            f"⚡️ Grid-прибыль: `{grid_profit} USDT`\n"
-            f"🏦 Капитал: `{capital} USDT`\n"
+            f"`{json.dumps(result, indent=2)[:800]}`"
         )
     except Exception as e:
-        return f"❌ Ошибка парсинга: {e}\n\nСырой ответ:\n`{raw_text[:600]}`"
+        return f"❌ Ошибка: {e}\n\nСырой ответ:\n`{json.dumps(data)[:500]}`"
 
 
 async def bybit_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != BYBIT_CHAT_ID:
         return
     await update.message.reply_text("Запрашиваю данные с Bybit... ⏳")
-    raw_text, code = get_grid_pnl()
-    text = format_bybit_report(raw_text)
+    data = get_grid_pnl()
+    text = format_bybit_report(data)
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def weekly_bybit_report(context: ContextTypes.DEFAULT_TYPE):
-    raw_text, code = get_grid_pnl()
-    text = "🗓 *Еженедельный отчёт Bybit*\n\n" + format_bybit_report(raw_text)
+    data = get_grid_pnl()
+    text = "🗓 *Еженедельный отчёт Bybit*\n\n" + format_bybit_report(data)
     await context.bot.send_message(
         chat_id=BYBIT_CHAT_ID,
         text=text,
