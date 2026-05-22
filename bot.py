@@ -1,7 +1,11 @@
 import os
+import time
+import hmac
+import hashlib
 import json
 import logging
-from datetime import datetime, time
+import requests
+from datetime import datetime, time as dtime
 import pytz
 
 from telegram import Update
@@ -17,19 +21,12 @@ from telegram.ext import (
 # --- Настройки ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 MY_CHAT_ID = int(os.environ.get("MY_CHAT_ID"))
-JOURNAL_FILE = "journal.json"
-TIMEZONE = pytz.timezone("Asia/Bangkok")  # Самуи — Bangkok UTC+7
-
-# Вопросы для рефлексии
-QUESTIONS = [
-    "🌙 Как прошёл сегодняшний день? Что запомнилось больше всего?",
-    "🙏 Кому или чему ты сегодня благодарен?",
-    "📖 Какой урок или вывод можно вынести из сегодняшнего дня?",
-    "🗓 Какой у тебя план на завтра? Три главных дела.",
-]
-
-# Состояния диалога
-Q1, Q2, Q3, Q4 = range(4)
+BYBIT_BOT_TOKEN = os.environ.get("BYBIT_BOT_TOKEN")
+BYBIT_CHAT_ID = int(os.environ.get("BYBIT_CHAT_ID"))
+BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY")
+BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET")
+BYBIT_BOT_ID = os.environ.get("BYBIT_BOT_ID")
+TIMEZONE = pytz.timezone("Asia/Bangkok")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -37,8 +34,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+Q1, Q2, Q3, Q4 = range(4)
 
-# --- Работа с журналом ---
+QUESTIONS = [
+    "🌙 Как прошёл сегодняшний день? Что запомнилось больше всего?",
+    "🙏 Кому или чему ты сегодня благодарен?",
+    "📖 Какой урок или вывод можно вынести из сегодняшнего дня?",
+    "🗓 Какой у тебя план на завтра? Три главных дела.",
+]
+
+JOURNAL_FILE = "journal.json"
+
+
+# =====================
+# ЖУРНАЛ РЕФЛЕКСИИ
+# =====================
 
 def load_journal():
     if not os.path.exists(JOURNAL_FILE):
@@ -47,7 +57,7 @@ def load_journal():
         return json.load(f)
 
 
-def save_entry(date_str: str, answers: dict):
+def save_entry(date_str, answers):
     journal = load_journal()
     journal[date_str] = {
         "date": date_str,
@@ -58,9 +68,7 @@ def save_entry(date_str: str, answers: dict):
         json.dump(journal, f, ensure_ascii=False, indent=2)
 
 
-# --- Хендлеры команд ---
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_reflection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MY_CHAT_ID:
         return
     await update.message.reply_text(
@@ -78,9 +86,7 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     context.user_data["answers"] = {}
     context.user_data["date"] = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
-    await update.message.reply_text(
-        "Время для вечерней рефлексии ✍️\n\n" + QUESTIONS[0]
-    )
+    await update.message.reply_text("Время для вечерней рефлексии ✍️\n\n" + QUESTIONS[0])
     return Q1
 
 
@@ -107,8 +113,7 @@ async def answer_q4(update: Update, context: ContextTypes.DEFAULT_TYPE):
     date_str = context.user_data["date"]
     save_entry(date_str, context.user_data["answers"])
     await update.message.reply_text(
-        "✅ Всё записано. Хорошего вечера!\n\n"
-        f"Запись за {date_str} сохранена в дневник."
+        f"✅ Всё записано. Хорошего вечера!\n\nЗапись за {date_str} сохранена."
     )
     return ConversationHandler.END
 
@@ -125,10 +130,8 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not journal:
         await update.message.reply_text("Дневник пока пустой. Напиши /ask чтобы начать.")
         return
-
     sorted_entries = sorted(journal.items(), reverse=True)[:7]
     text = "📔 *Последние записи:*\n\n"
-
     for date_str, entry in sorted_entries:
         answers = entry.get("answers", {})
         text += f"*{date_str}*\n"
@@ -137,26 +140,112 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"📖 {answers.get('lesson', '—')}\n"
         text += f"🗓 {answers.get('plan', '—')}\n"
         text += "─────────────\n"
-
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
-# --- Ежевечерняя рассылка ---
-
 async def evening_questions(context: ContextTypes.DEFAULT_TYPE):
-    """Запускается каждый день в 21:00 по Bangkok."""
     await context.bot.send_message(
         chat_id=MY_CHAT_ID,
         text="Добрый вечер! Время для рефлексии 🌙\n\nНапиши /ask чтобы начать.",
     )
 
 
-# --- Главная функция ---
+# =====================
+# BYBIT ТРЕКЕР
+# =====================
 
-def main():
+def bybit_request(endpoint, params=None):
+    if params is None:
+        params = {}
+    base_url = "https://api.bybit.com"
+    timestamp = str(int(time.time() * 1000))
+    recv_window = "5000"
+    params_str = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    sign_str = timestamp + BYBIT_API_KEY + recv_window + params_str
+    signature = hmac.new(
+        BYBIT_API_SECRET.encode("utf-8"),
+        sign_str.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    headers = {
+        "X-BAPI-API-KEY": BYBIT_API_KEY,
+        "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-SIGN": signature,
+        "X-BAPI-RECV-WINDOW": recv_window,
+    }
+    response = requests.get(f"{base_url}{endpoint}", headers=headers, params=params)
+    return response.json()
+
+
+def get_grid_pnl():
+    params = {"botId": BYBIT_BOT_ID, "category": "spot"}
+    return bybit_request("/v5/spot-algo/get-bot-detail", params)
+
+
+def format_bybit_report(data):
+    try:
+        result = data.get("result", {})
+        pnl = result.get("pnl", "—")
+        pnl_ratio = result.get("pnlRatio", "—")
+        grid_profit = result.get("gridProfit", "—")
+        invested = result.get("investment", "—")
+        capital = result.get("assets", "—")
+        pair = result.get("symbol", "BTC/USDT")
+
+        if pnl_ratio != "—":
+            pnl_pct = float(pnl_ratio) * 100
+            pnl_str = f"{pnl_pct:+.2f}%"
+            emoji = "📈" if pnl_pct >= 0 else "📉"
+        else:
+            pnl_str = "—"
+            emoji = "📊"
+
+        now = datetime.now(TIMEZONE).strftime("%d.%m.%Y %H:%M")
+        return (
+            f"{emoji} *Грид-бот {pair}*\n"
+            f"_{now}_\n\n"
+            f"💰 Инвестировано: `{invested} USDT`\n"
+            f"📊 P&L: `{pnl} USDT` ({pnl_str})\n"
+            f"⚡️ Grid-прибыль: `{grid_profit} USDT`\n"
+            f"🏦 Капитал: `{capital} USDT`\n"
+        )
+    except Exception as e:
+        return f"❌ Ошибка обработки данных: {e}\n\n```{json.dumps(data, indent=2)[:500]}```"
+
+
+async def bybit_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != BYBIT_CHAT_ID:
+        return
+    await update.message.reply_text("Запрашиваю данные с Bybit... ⏳")
+    data = get_grid_pnl()
+    text = format_bybit_report(data)
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def weekly_bybit_report(context: ContextTypes.DEFAULT_TYPE):
+    data = get_grid_pnl()
+    text = "🗓 *Еженедельный отчёт Bybit*\n\n" + format_bybit_report(data)
+    await context.bot.send_message(
+        chat_id=BYBIT_CHAT_ID,
+        text=text,
+        parse_mode="Markdown",
+    )
+
+
+# =====================
+# ЗАПУСК
+# =====================
+
+import threading
+
+
+def run_reflection_bot():
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Диалог из 4 вопросов
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("ask", ask)],
         states={
@@ -168,19 +257,41 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("start", start_reflection))
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("history", history))
 
-    # Планировщик: каждый день в 21:00 Bangkok time
     app.job_queue.run_daily(
         evening_questions,
-        time=time(hour=21, minute=0, second=0, tzinfo=TIMEZONE),
+        time=dtime(hour=21, minute=0, second=0, tzinfo=TIMEZONE),
     )
 
-    logger.info("Бот запущен.")
+    logger.info("Бот рефлексии запущен.")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+def run_bybit_bot():
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    app = Application.builder().token(BYBIT_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("status", bybit_status))
+
+    app.job_queue.run_daily(
+        weekly_bybit_report,
+        time=dtime(hour=20, minute=0, second=0, tzinfo=TIMEZONE),
+        days=(6,),
+    )
+
+    logger.info("Bybit бот запущен.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
-    main()
+    t1 = threading.Thread(target=run_reflection_bot)
+    t2 = threading.Thread(target=run_bybit_bot)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
