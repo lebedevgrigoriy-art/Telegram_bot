@@ -33,7 +33,9 @@ BYBIT_BOT_TOKEN = os.environ.get("BYBIT_BOT_TOKEN")
 BYBIT_CHAT_ID = int(os.environ.get("BYBIT_CHAT_ID"))
 BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY")
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET")
-BYBIT_BOT_ID = os.environ.get("BYBIT_BOT_ID")
+
+SNAPSHOT_FILE = "snapshot.json"
+JOURNAL_FILE = "journal.json"
 
 Q1, Q2, Q3, Q4 = range(4)
 
@@ -43,8 +45,6 @@ QUESTIONS = [
     "📖 Какой урок или вывод можно вынести из сегодняшнего дня?",
     "🗓 Какой у тебя план на завтра? Три главных дела.",
 ]
-
-JOURNAL_FILE = "journal.json"
 
 
 # =====================
@@ -173,58 +173,113 @@ def bybit_request(endpoint, params=None):
         "X-BAPI-SIGN": signature,
         "X-BAPI-RECV-WINDOW": recv_window,
     }
+    r = requests.get(
+        f"https://api.bybit.com{endpoint}",
+        headers=headers,
+        params=params,
+        timeout=10,
+    )
+    return r.json()
+
+
+def get_wallet():
+    """Получаем баланс UNIFIED кошелька."""
+    data = bybit_request("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
+    if data.get("retCode") != 0:
+        return None, data.get("retMsg", "Ошибка")
+
+    coins = {}
     try:
-        r = requests.get(
-            f"https://api.bybit.com{endpoint}",
-            headers=headers,
-            params=params,
-            timeout=10,
-        )
-        return r.status_code, r.text
+        coin_list = data["result"]["list"][0]["coin"]
+        for coin in coin_list:
+            symbol = coin["coin"]
+            equity = float(coin.get("equity", 0) or 0)
+            usd_value = float(coin.get("usdValue", 0) or 0)
+            if usd_value > 0.01:
+                coins[symbol] = {"equity": equity, "usdValue": usd_value}
     except Exception as e:
-        return 0, str(e)
+        return None, str(e)
+
+    total_usd = sum(c["usdValue"] for c in coins.values())
+    return {"coins": coins, "totalUsd": total_usd}, None
 
 
-async def bybit_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Пробуем все возможные эндпоинты чтобы найти правильный."""
-    if update.effective_chat.id != BYBIT_CHAT_ID:
-        return
+def load_snapshot():
+    if not os.path.exists(SNAPSHOT_FILE):
+        return None
+    with open(SNAPSHOT_FILE, "r") as f:
+        return json.load(f)
 
-    await update.message.reply_text("🔍 Пробую все эндпоинты...")
 
-    endpoints = [
-        ("/v5/spot-algo/get-bot-detail", {"botId": BYBIT_BOT_ID}),
-        ("/v5/spot-algo/get-open-orders", {"botId": BYBIT_BOT_ID}),
-        ("/v5/spot-algo/get-history-orders", {"botId": BYBIT_BOT_ID}),
-        ("/v5/algo/spot/get-bot-detail", {"botId": BYBIT_BOT_ID}),
-        ("/v5/spot-algo/get-algo-open-orders", {}),
-        ("/v5/account/wallet-balance", {"accountType": "UNIFIED"}),
-    ]
+def save_snapshot(data):
+    data["saved_at"] = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M")
+    with open(SNAPSHOT_FILE, "w") as f:
+        json.dump(data, f, indent=2)
 
-    for endpoint, params in endpoints:
-        code, text = bybit_request(endpoint, params)
-        short = text[:200] if text else "(пусто)"
-        await update.message.reply_text(
-            f"*{endpoint}*\nКод: {code}\n`{short}`",
-            parse_mode="Markdown"
-        )
+
+def format_wallet_report(current, previous=None):
+    now = datetime.now(TIMEZONE).strftime("%d.%m.%Y %H:%M")
+    total = current["totalUsd"]
+
+    text = f"📊 *Баланс Bybit*\n_{now}_\n\n"
+    text += f"💰 Итого: `${total:.2f}`\n\n"
+
+    for symbol, info in current["coins"].items():
+        text += f"• {symbol}: `{info['equity']:.6f}` (${info['usdValue']:.2f})\n"
+
+    if previous:
+        prev_total = previous["totalUsd"]
+        diff = total - prev_total
+        pct = (diff / prev_total * 100) if prev_total > 0 else 0
+        emoji = "📈" if diff >= 0 else "📉"
+        text += f"\n{emoji} За неделю: `{diff:+.2f}$` ({pct:+.2f}%)\n"
+        text += f"_Предыдущий снимок: {previous.get('saved_at', '—')}_"
+
+    return text
 
 
 async def bybit_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != BYBIT_CHAT_ID:
         return
-    await update.message.reply_text("Запрашиваю данные с Bybit... ⏳")
-    code, text = bybit_request("/v5/spot-algo/get-bot-detail", {"botId": BYBIT_BOT_ID})
-    await update.message.reply_text(f"Код: {code}\n`{text[:500]}`", parse_mode="Markdown")
+    await update.message.reply_text("Запрашиваю баланс с Bybit... ⏳")
+    wallet, err = get_wallet()
+    if err:
+        await update.message.reply_text(f"❌ Ошибка: {err}")
+        return
+    previous = load_snapshot()
+    text = format_wallet_report(wallet, previous)
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def weekly_bybit_report(context: ContextTypes.DEFAULT_TYPE):
-    code, text = bybit_request("/v5/spot-algo/get-bot-detail", {"botId": BYBIT_BOT_ID})
+    wallet, err = get_wallet()
+    if err:
+        await context.bot.send_message(
+            chat_id=BYBIT_CHAT_ID,
+            text=f"❌ Ошибка получения баланса: {err}",
+        )
+        return
+
+    previous = load_snapshot()
+    text = "🗓 *Еженедельный отчёт Bybit*\n\n" + format_wallet_report(wallet, previous)
     await context.bot.send_message(
         chat_id=BYBIT_CHAT_ID,
-        text=f"🗓 Еженедельный отчёт\nКод: {code}\n`{text[:500]}`",
+        text=text,
         parse_mode="Markdown",
     )
+    save_snapshot(wallet)
+
+
+async def bybit_snap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сохранить текущий баланс как точку отсчёта."""
+    if update.effective_chat.id != BYBIT_CHAT_ID:
+        return
+    wallet, err = get_wallet()
+    if err:
+        await update.message.reply_text(f"❌ Ошибка: {err}")
+        return
+    save_snapshot(wallet)
+    await update.message.reply_text("✅ Снимок баланса сохранён. Через неделю покажу изменение.")
 
 
 # =====================
@@ -255,7 +310,7 @@ async def main():
 
     bybit_app = Application.builder().token(BYBIT_BOT_TOKEN).build()
     bybit_app.add_handler(CommandHandler("status", bybit_status))
-    bybit_app.add_handler(CommandHandler("debug", bybit_debug))
+    bybit_app.add_handler(CommandHandler("snap", bybit_snap))
     bybit_app.job_queue.run_daily(
         weekly_bybit_report,
         time=dtime(hour=20, minute=0, second=0, tzinfo=TIMEZONE),
