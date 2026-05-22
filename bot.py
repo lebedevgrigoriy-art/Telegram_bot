@@ -1,6 +1,10 @@
 import os
 import json
 import logging
+import time
+import hmac
+import hashlib
+import requests
 from datetime import datetime, time as dtime
 import pytz
 import asyncio
@@ -14,7 +18,6 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
 )
-from pybit.unified_trading import HTTP
 
 TIMEZONE = pytz.timezone("Asia/Bangkok")
 
@@ -31,11 +34,6 @@ BYBIT_CHAT_ID = int(os.environ.get("BYBIT_CHAT_ID"))
 BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY")
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET")
 BYBIT_BOT_ID = os.environ.get("BYBIT_BOT_ID")
-
-bybit_session = HTTP(
-    api_key=BYBIT_API_KEY,
-    api_secret=BYBIT_API_SECRET,
-)
 
 Q1, Q2, Q3, Q4 = range(4)
 
@@ -157,60 +155,74 @@ async def evening_questions(context: ContextTypes.DEFAULT_TYPE):
 # BYBIT ТРЕКЕР
 # =====================
 
-def get_grid_pnl():
+def bybit_request(endpoint, params=None):
+    if params is None:
+        params = {}
+    timestamp = str(int(time.time() * 1000))
+    recv_window = "5000"
+    params_str = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    sign_str = timestamp + BYBIT_API_KEY + recv_window + params_str
+    signature = hmac.new(
+        BYBIT_API_SECRET.encode("utf-8"),
+        sign_str.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    headers = {
+        "X-BAPI-API-KEY": BYBIT_API_KEY,
+        "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-SIGN": signature,
+        "X-BAPI-RECV-WINDOW": recv_window,
+    }
     try:
-        response = bybit_session.get_spot_algo_orders(
-            orderFilter="StopOrder",
-            botId=BYBIT_BOT_ID,
+        r = requests.get(
+            f"https://api.bybit.com{endpoint}",
+            headers=headers,
+            params=params,
+            timeout=10,
         )
-        return response
+        return r.status_code, r.text
     except Exception as e:
-        return {"error": str(e)}
+        return 0, str(e)
 
 
-def format_bybit_report(data):
-    try:
-        if "error" in data:
-            return f"❌ Ошибка запроса: {data['error']}"
+async def bybit_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пробуем все возможные эндпоинты чтобы найти правильный."""
+    if update.effective_chat.id != BYBIT_CHAT_ID:
+        return
 
-        ret_code = data.get("retCode", -1)
-        ret_msg = data.get("retMsg", "")
+    await update.message.reply_text("🔍 Пробую все эндпоинты...")
 
-        if ret_code != 0:
-            return (
-                f"⚠️ Bybit ответил с ошибкой:\n"
-                f"Код: `{ret_code}`\n"
-                f"Сообщение: `{ret_msg}`\n\n"
-                f"Сырой ответ:\n`{json.dumps(data)[:500]}`"
-            )
+    endpoints = [
+        ("/v5/spot-algo/get-bot-detail", {"botId": BYBIT_BOT_ID}),
+        ("/v5/spot-algo/get-open-orders", {"botId": BYBIT_BOT_ID}),
+        ("/v5/spot-algo/get-history-orders", {"botId": BYBIT_BOT_ID}),
+        ("/v5/algo/spot/get-bot-detail", {"botId": BYBIT_BOT_ID}),
+        ("/v5/spot-algo/get-algo-open-orders", {}),
+        ("/v5/account/wallet-balance", {"accountType": "UNIFIED"}),
+    ]
 
-        result = data.get("result", {})
-        now = datetime.now(TIMEZONE).strftime("%d.%m.%Y %H:%M")
-
-        return (
-            f"📊 *Данные грид-бота BTC/USDT*\n"
-            f"_{now}_\n\n"
-            f"`{json.dumps(result, indent=2)[:800]}`"
+    for endpoint, params in endpoints:
+        code, text = bybit_request(endpoint, params)
+        short = text[:200] if text else "(пусто)"
+        await update.message.reply_text(
+            f"*{endpoint}*\nКод: {code}\n`{short}`",
+            parse_mode="Markdown"
         )
-    except Exception as e:
-        return f"❌ Ошибка: {e}\n\nСырой ответ:\n`{json.dumps(data)[:500]}`"
 
 
 async def bybit_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != BYBIT_CHAT_ID:
         return
     await update.message.reply_text("Запрашиваю данные с Bybit... ⏳")
-    data = get_grid_pnl()
-    text = format_bybit_report(data)
-    await update.message.reply_text(text, parse_mode="Markdown")
+    code, text = bybit_request("/v5/spot-algo/get-bot-detail", {"botId": BYBIT_BOT_ID})
+    await update.message.reply_text(f"Код: {code}\n`{text[:500]}`", parse_mode="Markdown")
 
 
 async def weekly_bybit_report(context: ContextTypes.DEFAULT_TYPE):
-    data = get_grid_pnl()
-    text = "🗓 *Еженедельный отчёт Bybit*\n\n" + format_bybit_report(data)
+    code, text = bybit_request("/v5/spot-algo/get-bot-detail", {"botId": BYBIT_BOT_ID})
     await context.bot.send_message(
         chat_id=BYBIT_CHAT_ID,
-        text=text,
+        text=f"🗓 Еженедельный отчёт\nКод: {code}\n`{text[:500]}`",
         parse_mode="Markdown",
     )
 
@@ -243,6 +255,7 @@ async def main():
 
     bybit_app = Application.builder().token(BYBIT_BOT_TOKEN).build()
     bybit_app.add_handler(CommandHandler("status", bybit_status))
+    bybit_app.add_handler(CommandHandler("debug", bybit_debug))
     bybit_app.job_queue.run_daily(
         weekly_bybit_report,
         time=dtime(hour=20, minute=0, second=0, tzinfo=TIMEZONE),
