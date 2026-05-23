@@ -6,6 +6,7 @@ import hmac
 import hashlib
 import requests
 from datetime import datetime, time as dtime
+from collections import Counter
 import pytz
 import asyncio
 
@@ -34,10 +35,10 @@ BYBIT_CHAT_ID = int(os.environ.get("BYBIT_CHAT_ID"))
 BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY")
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET")
 
-SNAPSHOT_FILE = "snapshot.json"
 JOURNAL_FILE = "journal.json"
+SNAPSHOT_FILE = "snapshot.json"
 
-Q1, Q2, Q3, Q4 = range(4)
+Q1, Q2, Q3, Q4, Q5 = range(5)
 
 QUESTIONS = [
     "🌙 Как прошёл сегодняшний день? Что запомнилось больше всего?",
@@ -69,6 +70,35 @@ def save_entry(date_str, answers):
         json.dump(journal, f, ensure_ascii=False, indent=2)
 
 
+def get_yesterday_plan():
+    """Возвращает план на сегодня из вчерашней записи."""
+    journal = load_journal()
+    today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
+    sorted_dates = sorted(journal.keys(), reverse=True)
+    for date_str in sorted_dates:
+        if date_str < today:
+            plan = journal[date_str].get("answers", {}).get("plan", "")
+            if plan:
+                return date_str, plan
+    return None, None
+
+
+def get_monthly_gratitude_summary():
+    """Собирает тезисы благодарности за последний месяц."""
+    journal = load_journal()
+    now = datetime.now(TIMEZONE)
+    current_month = now.strftime("%Y-%m")
+
+    gratitudes = []
+    for date_str, entry in journal.items():
+        if date_str.startswith(current_month):
+            g = entry.get("answers", {}).get("gratitude", "")
+            if g:
+                gratitudes.append(g)
+
+    return gratitudes
+
+
 async def start_reflection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MY_CHAT_ID:
         return
@@ -76,8 +106,9 @@ async def start_reflection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Привет! Я твой бот для ежевечерней рефлексии 🌙\n\n"
         "Каждый вечер в 21:00 я буду присылать тебе вопросы.\n\n"
         "Команды:\n"
-        "/ask — задать вопросы прямо сейчас\n"
+        "/ask — начать рефлексию прямо сейчас\n"
         "/history — последние 7 записей\n"
+        "/gratitude — сводка благодарностей за месяц\n"
         "/cancel — отменить текущий диалог"
     )
 
@@ -111,6 +142,28 @@ async def answer_q3(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def answer_q4(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["answers"]["plan"] = update.message.text
+
+    # После плана показываем вчерашний план и спрашиваем про выполнение
+    date_str, yesterday_plan = get_yesterday_plan()
+    if yesterday_plan:
+        await update.message.reply_text(
+            f"📋 *Твой план со вчера ({date_str}):*\n\n{yesterday_plan}\n\n"
+            f"✅ Удалось выполнить что-то из списка? Напиши коротко.",
+            parse_mode="Markdown"
+        )
+        return Q5
+
+    # Если вчерашнего плана нет — завершаем
+    date_str = context.user_data["date"]
+    save_entry(date_str, context.user_data["answers"])
+    await update.message.reply_text(
+        f"✅ Всё записано. Хорошего вечера!\n\nЗапись за {date_str} сохранена."
+    )
+    return ConversationHandler.END
+
+
+async def answer_plan_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["answers"]["plan_review"] = update.message.text
     date_str = context.user_data["date"]
     save_entry(date_str, context.user_data["answers"])
     await update.message.reply_text(
@@ -136,6 +189,8 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for date_str, entry in sorted_entries:
         answers = entry.get("answers", {})
         text += f"*{date_str}*\n"
+        if answers.get("plan_review"):
+            text += f"✅ {answers.get('plan_review')}\n"
         text += f"🌙 {answers.get('day', '—')}\n"
         text += f"🙏 {answers.get('gratitude', '—')}\n"
         text += f"📖 {answers.get('lesson', '—')}\n"
@@ -144,10 +199,118 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
+async def gratitude_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает тезисную сводку благодарностей за месяц через Claude API."""
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+
+    gratitudes = get_monthly_gratitude_summary()
+    now = datetime.now(TIMEZONE)
+
+    if not gratitudes:
+        await update.message.reply_text("За этот месяц записей ещё нет.")
+        return
+
+    await update.message.reply_text("Анализирую благодарности за месяц... ⏳")
+
+    # Формируем текст для анализа
+    all_gratitudes = "\n".join(f"- {g}" for g in gratitudes)
+    month_name = now.strftime("%B %Y")
+
+    try:
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": os.environ.get("ANTHROPIC_API_KEY", ""),
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 500,
+                "messages": [{
+                    "role": "user",
+                    "content": f"""Вот записи благодарности человека за {month_name}:
+
+{all_gratitudes}
+
+Сделай тезисную сводку на русском языке:
+1. Кому или чему он благодарил чаще всего (имена, явления, вещи)
+2. За что именно — коротко и по существу
+3. Общий тон благодарностей
+
+Пиши коротко, без воды, 5-8 предложений максимум."""
+                }]
+            },
+            timeout=30,
+        )
+        data = response.json()
+        summary = data["content"][0]["text"]
+    except Exception as e:
+        # Если API недоступен — делаем простую сводку сами
+        summary = f"За {month_name} записано {len(gratitudes)} дней благодарности.\n\n"
+        summary += "Записи:\n" + "\n".join(f"• {g[:100]}" for g in gratitudes[-5:])
+
+    await update.message.reply_text(
+        f"🙏 *Благодарности за {month_name}*\n\n{summary}",
+        parse_mode="Markdown"
+    )
+
+
 async def evening_questions(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(
         chat_id=MY_CHAT_ID,
         text="Добрый вечер! Время для рефлексии 🌙\n\nНапиши /ask чтобы начать.",
+    )
+
+
+async def monthly_gratitude_report(context: ContextTypes.DEFAULT_TYPE):
+    """Автоматический отчёт в первый день месяца."""
+    gratitudes = get_monthly_gratitude_summary()
+    now = datetime.now(TIMEZONE)
+    month_name = now.strftime("%B %Y")
+
+    if not gratitudes:
+        return
+
+    all_gratitudes = "\n".join(f"- {g}" for g in gratitudes)
+
+    try:
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": os.environ.get("ANTHROPIC_API_KEY", ""),
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 500,
+                "messages": [{
+                    "role": "user",
+                    "content": f"""Вот записи благодарности человека за {month_name}:
+
+{all_gratitudes}
+
+Сделай тезисную сводку на русском языке:
+1. Кому или чему он благодарил чаще всего
+2. За что именно — коротко и по существу
+3. Общий тон благодарностей
+
+Пиши коротко, без воды, 5-8 предложений максимум."""
+                }]
+            },
+            timeout=30,
+        )
+        data = response.json()
+        summary = data["content"][0]["text"]
+    except Exception:
+        summary = "\n".join(f"• {g[:100]}" for g in gratitudes[-5:])
+
+    await context.bot.send_message(
+        chat_id=MY_CHAT_ID,
+        text=f"🙏 *Итоги благодарностей за {month_name}*\n\n{summary}",
+        parse_mode="Markdown",
     )
 
 
@@ -182,114 +345,12 @@ def bybit_request(endpoint, params=None):
     return r.json()
 
 
-def get_portfolio():
-    """Получаем все монеты из всех доступных аккаунтов."""
-    coins = {}
-    total_usd = 0.0
-
-    for account_type in ["UNIFIED", "SPOT", "FUND"]:
-        try:
-            data = bybit_request("/v5/account/wallet-balance", {"accountType": account_type})
-            if data.get("retCode") != 0:
-                continue
-            coin_list = data["result"]["list"][0]["coin"]
-            for coin in coin_list:
-                symbol = coin["coin"]
-                # Берём totalOrderIM + walletBalance для полной картины
-                wallet_balance = float(coin.get("walletBalance", 0) or 0)
-                usd_value = float(coin.get("usdValue", 0) or 0)
-                locked = float(coin.get("locked", 0) or 0)
-                total = wallet_balance + locked
-
-                if total > 0.000001 or usd_value > 0:
-                    if symbol not in coins:
-                        coins[symbol] = {"amount": 0, "usdValue": 0}
-                    coins[symbol]["amount"] += total
-                    coins[symbol]["usdValue"] += usd_value
-                    total_usd += usd_value
-        except Exception as e:
-            logger.error(f"Error fetching {account_type}: {e}")
-            continue
-
-    return {"coins": coins, "totalUsd": total_usd}
-
-
-def load_snapshot():
-    if not os.path.exists(SNAPSHOT_FILE):
-        return None
-    with open(SNAPSHOT_FILE, "r") as f:
-        return json.load(f)
-
-
-def save_snapshot(data):
-    data["saved_at"] = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M")
-    with open(SNAPSHOT_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-
-
-def format_report(current, previous=None):
-    now = datetime.now(TIMEZONE).strftime("%d.%m.%Y %H:%M")
-    total = current["totalUsd"]
-
-    text = f"📊 *Портфель Bybit*\n_{now}_\n\n"
-    text += f"💰 Итого: `${total:.2f}`\n\n"
-
-    for symbol, info in current["coins"].items():
-        text += f"• {symbol}: `{info['amount']:.6f}` (${info['usdValue']:.2f})\n"
-
-    if not current["coins"]:
-        text += "_Данные не найдены_\n"
-
-    if previous and previous.get("totalUsd", 0) > 0:
-        prev_total = previous["totalUsd"]
-        diff = total - prev_total
-        pct = (diff / prev_total * 100) if prev_total > 0 else 0
-        emoji = "📈" if diff >= 0 else "📉"
-        text += f"\n{emoji} За неделю: `{diff:+.2f}$` ({pct:+.2f}%)\n"
-        text += f"_Снимок от: {previous.get('saved_at', '—')}_"
-
-    return text
-
-
-async def bybit_raw(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != BYBIT_CHAT_ID:
-        return
-    await update.message.reply_text("🔍 Запрашиваю сырые данные...")
-    data = bybit_request("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
-    text = json.dumps(data, indent=2)[:3000]
-    await update.message.reply_text(f"`{text}`", parse_mode="Markdown")
-
-
 async def bybit_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != BYBIT_CHAT_ID:
         return
-    await update.message.reply_text("Запрашиваю портфель с Bybit... ⏳")
-    portfolio = get_portfolio()
-    previous = load_snapshot()
-    text = format_report(portfolio, previous)
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-
-async def bybit_snap(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != BYBIT_CHAT_ID:
-        return
-    portfolio = get_portfolio()
-    save_snapshot(portfolio)
     await update.message.reply_text(
-        f"✅ Снимок сохранён.\nИтого: ${portfolio['totalUsd']:.2f}\n\nЧерез неделю покажу изменение."
+        "Bybit трекер пока недоступен — API не предоставляет доступ к балансу Trading Bot аккаунта."
     )
-
-
-async def weekly_bybit_report(context: ContextTypes.DEFAULT_TYPE):
-    portfolio = get_portfolio()
-    previous = load_snapshot()
-    text = "🗓 *Еженедельный отчёт Bybit*\n\n" + format_report(portfolio, previous)
-    await context.bot.send_message(
-        chat_id=BYBIT_CHAT_ID,
-        text=text,
-        parse_mode="Markdown",
-    )
-    save_snapshot(portfolio)
 
 
 # =====================
@@ -302,6 +363,7 @@ async def main():
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("ask", ask)],
         states={
+            Q5: [MessageHandler(filters.TEXT & ~filters.COMMAND, answer_plan_review)],
             Q1: [MessageHandler(filters.TEXT & ~filters.COMMAND, answer_q1)],
             Q2: [MessageHandler(filters.TEXT & ~filters.COMMAND, answer_q2)],
             Q3: [MessageHandler(filters.TEXT & ~filters.COMMAND, answer_q3)],
@@ -313,20 +375,22 @@ async def main():
     reflection_app.add_handler(CommandHandler("start", start_reflection))
     reflection_app.add_handler(conv_handler)
     reflection_app.add_handler(CommandHandler("history", history))
+    reflection_app.add_handler(CommandHandler("gratitude", gratitude_summary))
+
     reflection_app.job_queue.run_daily(
         evening_questions,
         time=dtime(hour=21, minute=0, second=0, tzinfo=TIMEZONE),
     )
 
+    # Первого числа каждого месяца в 09:00
+    reflection_app.job_queue.run_monthly(
+        monthly_gratitude_report,
+        when=dtime(hour=9, minute=0, second=0, tzinfo=TIMEZONE),
+        day=1,
+    )
+
     bybit_app = Application.builder().token(BYBIT_BOT_TOKEN).build()
     bybit_app.add_handler(CommandHandler("status", bybit_status))
-    bybit_app.add_handler(CommandHandler("snap", bybit_snap))
-    bybit_app.add_handler(CommandHandler("raw", bybit_raw))
-    bybit_app.job_queue.run_daily(
-        weekly_bybit_report,
-        time=dtime(hour=20, minute=0, second=0, tzinfo=TIMEZONE),
-        days=(6,),
-    )
 
     async with reflection_app, bybit_app:
         await reflection_app.start()
