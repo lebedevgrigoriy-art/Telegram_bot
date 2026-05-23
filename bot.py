@@ -182,10 +182,10 @@ def bybit_request(endpoint, params=None):
     return r.json()
 
 
-def get_all_balances():
-    """Пробуем все типы аккаунтов и суммируем."""
-    total_usd = 0.0
+def get_portfolio():
+    """Получаем все монеты из всех доступных аккаунтов."""
     coins = {}
+    total_usd = 0.0
 
     for account_type in ["UNIFIED", "SPOT", "FUND"]:
         try:
@@ -195,30 +195,21 @@ def get_all_balances():
             coin_list = data["result"]["list"][0]["coin"]
             for coin in coin_list:
                 symbol = coin["coin"]
+                # Берём totalOrderIM + walletBalance для полной картины
+                wallet_balance = float(coin.get("walletBalance", 0) or 0)
                 usd_value = float(coin.get("usdValue", 0) or 0)
-                equity = float(coin.get("equity", 0) or 0)
-                if usd_value > 0.01:
+                locked = float(coin.get("locked", 0) or 0)
+                total = wallet_balance + locked
+
+                if total > 0.000001 or usd_value > 0:
                     if symbol not in coins:
-                        coins[symbol] = {"equity": 0, "usdValue": 0}
-                    coins[symbol]["equity"] += equity
+                        coins[symbol] = {"amount": 0, "usdValue": 0}
+                    coins[symbol]["amount"] += total
                     coins[symbol]["usdValue"] += usd_value
                     total_usd += usd_value
-        except Exception:
+        except Exception as e:
+            logger.error(f"Error fetching {account_type}: {e}")
             continue
-
-    # Также проверяем asset баланс (Trading Bot хранит там)
-    try:
-        data = bybit_request("/v5/asset/transfer/query-account-coins-balance", {
-            "accountType": "SPOT",
-            "coin": "USDT",
-        })
-        if data.get("retCode") == 0:
-            balance = float(data["result"].get("balance", {}).get("walletBalance", 0) or 0)
-            if balance > 0.01 and "USDT" not in coins:
-                coins["USDT"] = {"equity": balance, "usdValue": balance}
-                total_usd += balance
-    except Exception:
-        pass
 
     return {"coins": coins, "totalUsd": total_usd}
 
@@ -236,18 +227,18 @@ def save_snapshot(data):
         json.dump(data, f, indent=2)
 
 
-def format_wallet_report(current, previous=None):
+def format_report(current, previous=None):
     now = datetime.now(TIMEZONE).strftime("%d.%m.%Y %H:%M")
     total = current["totalUsd"]
 
-    text = f"📊 *Баланс Bybit*\n_{now}_\n\n"
+    text = f"📊 *Портфель Bybit*\n_{now}_\n\n"
     text += f"💰 Итого: `${total:.2f}`\n\n"
 
     for symbol, info in current["coins"].items():
-        text += f"• {symbol}: `{info['equity']:.6f}` (${info['usdValue']:.2f})\n"
+        text += f"• {symbol}: `{info['amount']:.6f}` (${info['usdValue']:.2f})\n"
 
     if not current["coins"]:
-        text += "_Монеты с балансом не найдены_\n"
+        text += "_Данные не найдены_\n"
 
     if previous and previous.get("totalUsd", 0) > 0:
         prev_total = previous["totalUsd"]
@@ -255,7 +246,7 @@ def format_wallet_report(current, previous=None):
         pct = (diff / prev_total * 100) if prev_total > 0 else 0
         emoji = "📈" if diff >= 0 else "📉"
         text += f"\n{emoji} За неделю: `{diff:+.2f}$` ({pct:+.2f}%)\n"
-        text += f"_Предыдущий снимок: {previous.get('saved_at', '—')}_"
+        text += f"_Снимок от: {previous.get('saved_at', '—')}_"
 
     return text
 
@@ -263,33 +254,33 @@ def format_wallet_report(current, previous=None):
 async def bybit_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != BYBIT_CHAT_ID:
         return
-    await update.message.reply_text("Запрашиваю баланс с Bybit... ⏳")
-    wallet = get_all_balances()
+    await update.message.reply_text("Запрашиваю портфель с Bybit... ⏳")
+    portfolio = get_portfolio()
     previous = load_snapshot()
-    text = format_wallet_report(wallet, previous)
+    text = format_report(portfolio, previous)
     await update.message.reply_text(text, parse_mode="Markdown")
-
-
-async def weekly_bybit_report(context: ContextTypes.DEFAULT_TYPE):
-    wallet = get_all_balances()
-    previous = load_snapshot()
-    text = "🗓 *Еженедельный отчёт Bybit*\n\n" + format_wallet_report(wallet, previous)
-    await context.bot.send_message(
-        chat_id=BYBIT_CHAT_ID,
-        text=text,
-        parse_mode="Markdown",
-    )
-    save_snapshot(wallet)
 
 
 async def bybit_snap(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != BYBIT_CHAT_ID:
         return
-    wallet = get_all_balances()
-    save_snapshot(wallet)
+    portfolio = get_portfolio()
+    save_snapshot(portfolio)
     await update.message.reply_text(
-        f"✅ Снимок сохранён. Итого: ${wallet['totalUsd']:.2f}\nЧерез неделю покажу изменение."
+        f"✅ Снимок сохранён.\nИтого: ${portfolio['totalUsd']:.2f}\n\nЧерез неделю покажу изменение."
     )
+
+
+async def weekly_bybit_report(context: ContextTypes.DEFAULT_TYPE):
+    portfolio = get_portfolio()
+    previous = load_snapshot()
+    text = "🗓 *Еженедельный отчёт Bybit*\n\n" + format_report(portfolio, previous)
+    await context.bot.send_message(
+        chat_id=BYBIT_CHAT_ID,
+        text=text,
+        parse_mode="Markdown",
+    )
+    save_snapshot(portfolio)
 
 
 # =====================
