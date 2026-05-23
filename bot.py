@@ -251,6 +251,15 @@ def format_report(current, previous=None):
     return text
 
 
+async def bybit_raw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != BYBIT_CHAT_ID:
+        return
+    await update.message.reply_text("🔍 Запрашиваю сырые данные...")
+    data = bybit_request("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
+    text = json.dumps(data, indent=2)[:3000]
+    await update.message.reply_text(f"`{text}`", parse_mode="Markdown")
+
+
 async def bybit_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != BYBIT_CHAT_ID:
         return
@@ -312,6 +321,7 @@ async def main():
     bybit_app = Application.builder().token(BYBIT_BOT_TOKEN).build()
     bybit_app.add_handler(CommandHandler("status", bybit_status))
     bybit_app.add_handler(CommandHandler("snap", bybit_snap))
+    bybit_app.add_handler(CommandHandler("raw", bybit_raw))
     bybit_app.job_queue.run_daily(
         weekly_bybit_report,
         time=dtime(hour=20, minute=0, second=0, tzinfo=TIMEZONE),
