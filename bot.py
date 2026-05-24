@@ -31,6 +31,13 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 MY_CHAT_ID = int(os.environ.get("MY_CHAT_ID"))
 BYBIT_BOT_TOKEN = os.environ.get("BYBIT_BOT_TOKEN")
 BYBIT_CHAT_ID = int(os.environ.get("BYBIT_CHAT_ID"))
+CINEMA_BOT_TOKEN = os.environ.get("CINEMA_BOT_TOKEN")
+TMDB_API_KEY = os.environ.get("TMDB_API_KEY")
+OMDB_API_KEY = os.environ.get("OMDB_API_KEY")
+KP_API_KEY = os.environ.get("KP_API_KEY")
+
+TMDB_BASE = "https://api.themoviedb.org/3"
+TMDB_IMG = "https://image.tmdb.org/t/p/w500"
 
 JOURNAL_FILE = "journal.json"
 
@@ -93,10 +100,8 @@ def get_monthly_gratitude_summary():
 def make_gratitude_summary(entries, month_name):
     if not entries:
         return "За этот месяц записей ещё нет."
-
     all_text = "\n".join(f"- {g}" for _, g in entries)
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
-
     if anthropic_key:
         try:
             response = requests.post(
@@ -109,34 +114,17 @@ def make_gratitude_summary(entries, month_name):
                 json={
                     "model": "claude-haiku-4-5-20251001",
                     "max_tokens": 500,
-                    "messages": [{
-                        "role": "user",
-                        "content": f"""Вот записи благодарности человека за {month_name}:
-
-{all_text}
-
-Сделай тезисную сводку на русском языке:
-1. Кому или чему он благодарил чаще всего (имена, явления, вещи)
-2. За что именно — коротко и по существу
-3. Общий тон благодарностей
-
-Пиши коротко, без воды, 5-8 предложений максимум."""
-                    }]
+                    "messages": [{"role": "user", "content": f"Вот записи благодарности за {month_name}:\n{all_text}\n\nСделай тезисную сводку: кому благодарил чаще всего, за что, общий тон. 5-8 предложений."}]
                 },
                 timeout=30,
             )
-            data = response.json()
-            summary = data["content"][0]["text"]
+            summary = response.json()["content"][0]["text"]
             return f"🙏 *Благодарности за {month_name}*\n\n{summary}"
         except Exception as e:
             logger.error(f"Claude API error: {e}")
-
-    text = f"🙏 *Благодарности за {month_name}*\n\n"
-    text += f"Всего записей: {len(entries)}\n\n"
-    text += "*Последние записи:*\n"
+    text = f"🙏 *Благодарности за {month_name}*\n\nВсего записей: {len(entries)}\n\n"
     for date_str, g in entries[-5:]:
-        short = g[:120] + ("..." if len(g) > 120 else "")
-        text += f"_{date_str}_: {short}\n\n"
+        text += f"_{date_str}_: {g[:120]}\n\n"
     return text
 
 
@@ -144,15 +132,11 @@ async def start_reflection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MY_CHAT_ID:
         return
     await update.message.reply_text(
-        "Привет! Я твой бот для ежевечерней рефлексии 🌙\n\n"
-        "Каждое утро в 10:00 — напоминание о плане на день.\n"
-        "Каждый вечер в 23:00 — вопросы для рефлексии.\n\n"
-        "Команды:\n"
-        "/ask — начать рефлексию прямо сейчас\n"
+        "Привет! Я твой бот для рефлексии 🌙\n\n"
+        "/ask — начать рефлексию\n"
         "/plan — план на сегодня\n"
         "/history — последние 7 записей\n"
-        "/gratitude — сводка благодарностей за месяц\n"
-        "/cancel — отменить диалог"
+        "/gratitude — сводка благодарностей"
     )
 
 
@@ -185,21 +169,16 @@ async def answer_q3(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def answer_q4(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["answers"]["plan"] = update.message.text
-
     date_str, yesterday_plan = get_yesterday_plan()
     if yesterday_plan:
         await update.message.reply_text(
-            f"📋 *Твой план со вчера ({date_str}):*\n\n{yesterday_plan}\n\n"
-            f"✅ Удалось выполнить что-то из списка? Напиши коротко.",
+            f"📋 *Твой план со вчера ({date_str}):*\n\n{yesterday_plan}\n\n✅ Удалось выполнить что-то из списка?",
             parse_mode="Markdown"
         )
         return Q5
-
     date_str = context.user_data["date"]
     save_entry(date_str, context.user_data["answers"])
-    await update.message.reply_text(
-        f"✅ Всё записано. Хорошего вечера!\n\nЗапись за {date_str} сохранена."
-    )
+    await update.message.reply_text(f"✅ Всё записано. Хорошего вечера!\n\nЗапись за {date_str} сохранена.")
     return ConversationHandler.END
 
 
@@ -207,14 +186,12 @@ async def answer_plan_review(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data["answers"]["plan_review"] = update.message.text
     date_str = context.user_data["date"]
     save_entry(date_str, context.user_data["answers"])
-    await update.message.reply_text(
-        f"✅ Всё записано. Хорошего вечера!\n\nЗапись за {date_str} сохранена."
-    )
+    await update.message.reply_text(f"✅ Всё записано. Хорошего вечера!\n\nЗапись за {date_str} сохранена.")
     return ConversationHandler.END
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Диалог отменён. Напиши /ask чтобы начать снова.")
+    await update.message.reply_text("Диалог отменён.")
     return ConversationHandler.END
 
 
@@ -245,10 +222,7 @@ async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     date_str, plan = get_yesterday_plan()
     if plan:
-        await update.message.reply_text(
-            f"📋 *План на сегодня:*\n\n{plan}",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text(f"📋 *План на сегодня:*\n\n{plan}", parse_mode="Markdown")
     else:
         await update.message.reply_text("Плана нет — вчера не было записи.")
 
@@ -257,40 +231,26 @@ async def gratitude_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MY_CHAT_ID:
         return
     entries = get_monthly_gratitude_summary()
-    now = datetime.now(TIMEZONE)
-    month_name = now.strftime("%B %Y")
-    text = make_gratitude_summary(entries, month_name)
-    await update.message.reply_text(text, parse_mode="Markdown")
+    month_name = datetime.now(TIMEZONE).strftime("%B %Y")
+    await update.message.reply_text(make_gratitude_summary(entries, month_name), parse_mode="Markdown")
 
 
 async def morning_reminder(context: ContextTypes.DEFAULT_TYPE):
     date_str, plan = get_yesterday_plan()
     if plan:
-        await context.bot.send_message(
-            chat_id=MY_CHAT_ID,
-            text=f"☀️ Доброе утро!\n\n*План на сегодня:*\n\n{plan}",
-            parse_mode="Markdown"
-        )
+        await context.bot.send_message(chat_id=MY_CHAT_ID, text=f"☀️ Доброе утро!\n\n*План на сегодня:*\n\n{plan}", parse_mode="Markdown")
     else:
-        await context.bot.send_message(
-            chat_id=MY_CHAT_ID,
-            text="☀️ Доброе утро! Плана на сегодня нет.",
-        )
+        await context.bot.send_message(chat_id=MY_CHAT_ID, text="☀️ Доброе утро! Плана на сегодня нет.")
 
 
 async def evening_questions(context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_message(
-        chat_id=MY_CHAT_ID,
-        text="Добрый вечер! Время для рефлексии 🌙\n\nНапиши /ask чтобы начать.",
-    )
+    await context.bot.send_message(chat_id=MY_CHAT_ID, text="Добрый вечер! Время для рефлексии 🌙\n\nНапиши /ask чтобы начать.")
 
 
 async def monthly_gratitude_report(context: ContextTypes.DEFAULT_TYPE):
     entries = get_monthly_gratitude_summary()
-    now = datetime.now(TIMEZONE)
-    month_name = now.strftime("%B %Y")
-    text = make_gratitude_summary(entries, month_name)
-    await context.bot.send_message(chat_id=MY_CHAT_ID, text=text, parse_mode="Markdown")
+    month_name = datetime.now(TIMEZONE).strftime("%B %Y")
+    await context.bot.send_message(chat_id=MY_CHAT_ID, text=make_gratitude_summary(entries, month_name), parse_mode="Markdown")
 
 
 # =====================
@@ -299,19 +259,12 @@ async def monthly_gratitude_report(context: ContextTypes.DEFAULT_TYPE):
 
 def get_rates():
     try:
-        btc_resp = requests.get(
-            "https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": "bitcoin", "vs_currencies": "usd"},
-            timeout=10,
-        )
+        btc_resp = requests.get("https://api.coingecko.com/api/v3/simple/price", params={"ids": "bitcoin", "vs_currencies": "usd"}, timeout=10)
         btc_usd = btc_resp.json()["bitcoin"]["usd"]
-
         fx_resp = requests.get("https://open.er-api.com/v6/latest/USD", timeout=10)
         fx = fx_resp.json()["rates"]
         rub_per_usd = fx["RUB"]
-        thb_per_usd = fx["THB"]
-        rub_per_thb = rub_per_usd / thb_per_usd
-
+        rub_per_thb = rub_per_usd / fx["THB"]
         return {"btc_usd": btc_usd, "rub_per_usd": rub_per_usd, "rub_per_thb": rub_per_thb}
     except Exception as e:
         logger.error(f"Rates error: {e}")
@@ -323,38 +276,163 @@ def format_rates(rates):
         return "❌ Не удалось получить курсы."
     now = datetime.now(TIMEZONE).strftime("%d.%m.%Y %H:%M")
     btc_str = f"{rates['btc_usd']:,.0f}".replace(",", " ")
-    return (
-        f"📊 *Курсы на {now}*\n\n"
-        f"₿ *Bitcoin:* `${btc_str}`\n"
-        f"💵 *Доллар:* `{rates['rub_per_usd']:.2f} ₽`\n"
-        f"🇹🇭 *Бат:* `{rates['rub_per_thb']:.2f} ₽`\n"
-    )
+    return (f"📊 *Курсы на {now}*\n\n₿ *Bitcoin:* `${btc_str}`\n💵 *Доллар:* `{rates['rub_per_usd']:.2f} ₽`\n🇹🇭 *Бат:* `{rates['rub_per_thb']:.2f} ₽`\n")
 
 
 async def rates_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != BYBIT_CHAT_ID:
         return
-    text = format_rates(get_rates())
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-
-async def morning_rates(context: ContextTypes.DEFAULT_TYPE):
-    text = "☀️ *Доброе утро!*\n\n" + format_rates(get_rates())
-    await context.bot.send_message(
-        chat_id=BYBIT_CHAT_ID,
-        text=text,
-        parse_mode="Markdown",
-    )
+    await update.message.reply_text(format_rates(get_rates()), parse_mode="Markdown")
 
 
 async def bybit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != BYBIT_CHAT_ID:
         return
-    await update.message.reply_text(
-        "Привет! Я слежу за курсами 📊\n\n"
-        "Каждое утро в 08:00 присылаю курсы.\n\n"
-        "/rates — курсы прямо сейчас"
-    )
+    await update.message.reply_text("Привет! Я слежу за курсами 📊\n\nКаждое утро в 08:00 присылаю курсы.\n\n/rates — курсы прямо сейчас")
+
+
+async def morning_rates(context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_message(chat_id=BYBIT_CHAT_ID, text="☀️ *Доброе утро!*\n\n" + format_rates(get_rates()), parse_mode="Markdown")
+
+
+# =====================
+# КИНО БОТ
+# =====================
+
+def get_new_movies(limit=8):
+    try:
+        resp = requests.get(f"{TMDB_BASE}/movie/now_playing", params={"api_key": TMDB_API_KEY, "language": "ru-RU", "region": "US", "page": 1}, timeout=10)
+        return resp.json().get("results", [])[:limit]
+    except Exception as e:
+        logger.error(f"TMDB error: {e}")
+        return []
+
+
+def get_movie_details(tmdb_id):
+    try:
+        detail = requests.get(f"{TMDB_BASE}/movie/{tmdb_id}", params={"api_key": TMDB_API_KEY, "language": "ru-RU"}, timeout=10).json()
+        credits = requests.get(f"{TMDB_BASE}/movie/{tmdb_id}/credits", params={"api_key": TMDB_API_KEY, "language": "ru-RU"}, timeout=10).json()
+        cast = credits.get("cast", [])[:3]
+        actors = ", ".join(a["name"] for a in cast) if cast else "—"
+        genres = ", ".join(g["name"] for g in detail.get("genres", [])[:3]) or "—"
+        overview = detail.get("overview", "")
+        if len(overview) > 150:
+            overview = overview[:150] + "..."
+        return {"genres": genres, "actors": actors, "overview": overview, "imdb_id": detail.get("imdb_id", "")}
+    except Exception as e:
+        logger.error(f"TMDB details error: {e}")
+        return {"genres": "—", "actors": "—", "overview": "—", "imdb_id": ""}
+
+
+def get_omdb_ratings(imdb_id, title):
+    try:
+        params = {"apikey": OMDB_API_KEY}
+        if imdb_id:
+            params["i"] = imdb_id
+        else:
+            params["t"] = title
+        data = requests.get("https://www.omdbapi.com/", params=params, timeout=10).json()
+        result = {}
+        if data.get("imdbRating") and data["imdbRating"] != "N/A":
+            result["imdb"] = data["imdbRating"]
+        for r in data.get("Ratings", []):
+            if "Rotten Tomatoes" in r["Source"]:
+                result["rt"] = r["Value"]
+        return result
+    except Exception as e:
+        logger.error(f"OMDB error: {e}")
+        return {}
+
+
+def get_kp_rating(title, year=None):
+    try:
+        params = {"query": title, "limit": 1}
+        if year:
+            params["year"] = year
+        resp = requests.get("https://api.kinopoisk.dev/v1.4/movie/search", headers={"X-API-KEY": KP_API_KEY}, params=params, timeout=10)
+        docs = resp.json().get("docs", [])
+        if docs:
+            kp = docs[0].get("rating", {}).get("kp")
+            if kp and kp > 0:
+                return f"{kp:.1f}"
+    except Exception as e:
+        logger.error(f"KP error: {e}")
+    return None
+
+
+def format_movie_caption(movie, details, omdb, kp_rating):
+    title = movie.get("title", "—")
+    original = movie.get("original_title", "")
+    year = movie.get("release_date", "")[:4] if movie.get("release_date") else ""
+    tmdb_rating = movie.get("vote_average", 0)
+    caption = f"🎬 *{title}*"
+    if original and original != title:
+        caption += f" / _{original}_"
+    if year:
+        caption += f" ({year})"
+    caption += "\n\n"
+    if details.get("genres"):
+        caption += f"🎭 {details['genres']}\n"
+    if details.get("overview"):
+        caption += f"📝 {details['overview']}\n"
+    if details.get("actors"):
+        caption += f"👥 {details['actors']}\n"
+    caption += "\n*Рейтинги:*\n"
+    if tmdb_rating > 0:
+        caption += f"🎥 TMDB: `{tmdb_rating:.1f}/10`\n"
+    if omdb.get("imdb"):
+        caption += f"⭐ IMDb: `{omdb['imdb']}/10`\n"
+    if omdb.get("rt"):
+        caption += f"🍅 Rotten Tomatoes: `{omdb['rt']}`\n"
+    if kp_rating:
+        caption += f"🇷🇺 Кинопоиск: `{kp_rating}/10`\n"
+    return caption
+
+
+async def send_movies(bot, chat_id, period_label="недели"):
+    await bot.send_message(chat_id=chat_id, text=f"🎬 *Новинки кино {period_label}*\n\nСобираю данные...", parse_mode="Markdown")
+    movies = get_new_movies(limit=8)
+    if not movies:
+        await bot.send_message(chat_id=chat_id, text="❌ Не удалось получить список фильмов.")
+        return
+    for movie in movies:
+        try:
+            tmdb_id = movie["id"]
+            title = movie.get("title", "")
+            year = movie.get("release_date", "")[:4]
+            poster_path = movie.get("poster_path")
+            details = get_movie_details(tmdb_id)
+            omdb = get_omdb_ratings(details.get("imdb_id", ""), title)
+            kp = get_kp_rating(title, year)
+            caption = format_movie_caption(movie, details, omdb, kp)
+            if poster_path:
+                await bot.send_photo(chat_id=chat_id, photo=f"{TMDB_IMG}{poster_path}", caption=caption, parse_mode="Markdown")
+            else:
+                await bot.send_message(chat_id=chat_id, text=caption, parse_mode="Markdown")
+            await asyncio.sleep(1)
+        except Exception as e:
+            logger.error(f"Error sending movie: {e}")
+            continue
+
+
+async def cinema_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+    await update.message.reply_text("Привет! Я слежу за новинками кино 🎬\n\n📅 Каждую субботу в 22:00 — новинки недели\n📅 Первого числа в 20:00 — новинки месяца\n\n/movies — получить подборку прямо сейчас")
+
+
+async def movies_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+    await send_movies(context.bot, MY_CHAT_ID, "этой недели")
+
+
+async def weekly_movies(context: ContextTypes.DEFAULT_TYPE):
+    await send_movies(context.bot, MY_CHAT_ID, "этой недели")
+
+
+async def monthly_movies(context: ContextTypes.DEFAULT_TYPE):
+    await send_movies(context.bot, MY_CHAT_ID, "этого месяца")
 
 
 # =====================
@@ -362,8 +440,8 @@ async def bybit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =====================
 
 async def main():
+    # Бот саморефлексии
     reflection_app = Application.builder().token(BOT_TOKEN).build()
-
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("ask", ask)],
         states={
@@ -375,35 +453,23 @@ async def main():
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
-
     reflection_app.add_handler(CommandHandler("start", start_reflection))
     reflection_app.add_handler(conv_handler)
     reflection_app.add_handler(CommandHandler("history", history))
     reflection_app.add_handler(CommandHandler("gratitude", gratitude_summary))
     reflection_app.add_handler(CommandHandler("plan", plan_command))
+    reflection_app.add_handler(CommandHandler("movies", movies_command))
+    reflection_app.job_queue.run_daily(morning_reminder, time=dtime(hour=10, minute=0, tzinfo=TIMEZONE))
+    reflection_app.job_queue.run_daily(evening_questions, time=dtime(hour=23, minute=0, tzinfo=TIMEZONE))
+    reflection_app.job_queue.run_monthly(monthly_gratitude_report, when=dtime(hour=9, tzinfo=TIMEZONE), day=1)
+    reflection_app.job_queue.run_daily(weekly_movies, time=dtime(hour=22, minute=0, tzinfo=TIMEZONE), days=(5,))
+    reflection_app.job_queue.run_monthly(monthly_movies, when=dtime(hour=20, tzinfo=TIMEZONE), day=1)
 
-    reflection_app.job_queue.run_daily(
-        morning_reminder,
-        time=dtime(hour=10, minute=0, second=0, tzinfo=TIMEZONE),
-    )
-    reflection_app.job_queue.run_daily(
-        evening_questions,
-        time=dtime(hour=23, minute=0, second=0, tzinfo=TIMEZONE),
-    )
-    reflection_app.job_queue.run_monthly(
-        monthly_gratitude_report,
-        when=dtime(hour=9, minute=0, second=0, tzinfo=TIMEZONE),
-        day=1,
-    )
-
-    # Бот курсов (используем Bybit токен)
+    # Бот курсов (Bybit токен)
     rates_app = Application.builder().token(BYBIT_BOT_TOKEN).build()
     rates_app.add_handler(CommandHandler("start", bybit_start))
     rates_app.add_handler(CommandHandler("rates", rates_command))
-    rates_app.job_queue.run_daily(
-        morning_rates,
-        time=dtime(hour=8, minute=0, second=0, tzinfo=TIMEZONE),
-    )
+    rates_app.job_queue.run_daily(morning_rates, time=dtime(hour=8, minute=0, tzinfo=TIMEZONE))
 
     async with reflection_app, rates_app:
         await reflection_app.start()
@@ -416,4 +482,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
- 
