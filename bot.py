@@ -79,58 +79,73 @@ def get_yesterday_plan():
     return None, None
 
 
+def get_today_plan():
+    """Возвращает план на сегодня — из вчерашней записи."""
+    return get_yesterday_plan()
+
+
 def get_monthly_gratitude_summary():
     journal = load_journal()
     now = datetime.now(TIMEZONE)
     current_month = now.strftime("%Y-%m")
-
     entries = []
     for date_str, entry in journal.items():
         if date_str.startswith(current_month):
             g = entry.get("answers", {}).get("gratitude", "")
             if g:
                 entries.append((date_str, g))
-
     return entries
 
 
 def make_gratitude_summary(entries, month_name):
-    """Делаем тезисную сводку без внешнего AI."""
     if not entries:
         return "За этот месяц записей ещё нет."
 
-    # Собираем имена и ключевые слова
-    all_text = " ".join(g for _, g in entries)
+    all_text = "\n".join(f"- {g}" for _, g in entries)
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
 
-    # Ищем имена (слова с заглавной буквы, не в начале предложения)
-    words = all_text.split()
-    names = []
-    for i, word in enumerate(words):
-        clean = word.strip(".,!?;:\"'()").strip()
-        if len(clean) > 2 and clean[0].isupper() and i > 0:
-            names.append(clean)
+    if anthropic_key:
+        try:
+            response = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": anthropic_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 500,
+                    "messages": [{
+                        "role": "user",
+                        "content": f"""Вот записи благодарности человека за {month_name}:
 
-    name_counts = Counter(names).most_common(5)
+{all_text}
 
-    text = f"🙏 *Сводка благодарностей за {month_name}*\n\n"
-    text += f"📊 Всего записей: {len(entries)} из {now_days()} дней месяца\n\n"
+Сделай тезисную сводку на русском языке:
+1. Кому или чему он благодарил чаще всего (имена, явления, вещи)
+2. За что именно — коротко и по существу
+3. Общий тон благодарностей
 
-    if name_counts:
-        text += "*Кого упоминал чаще всего:*\n"
-        for name, count in name_counts:
-            text += f"• {name} — {count} раз\n"
-        text += "\n"
+Пиши коротко, без воды, 5-8 предложений максимум."""
+                    }]
+                },
+                timeout=30,
+            )
+            data = response.json()
+            summary = data["content"][0]["text"]
+            return f"🙏 *Благодарности за {month_name}*\n\n{summary}"
+        except Exception as e:
+            logger.error(f"Claude API error: {e}")
 
+    # Простая сводка если ключа нет
+    text = f"🙏 *Благодарности за {month_name}*\n\n"
+    text += f"Всего записей: {len(entries)}\n\n"
     text += "*Последние записи:*\n"
     for date_str, g in entries[-5:]:
         short = g[:120] + ("..." if len(g) > 120 else "")
         text += f"_{date_str}_: {short}\n\n"
-
     return text
-
-
-def now_days():
-    return datetime.now(TIMEZONE).day
 
 
 async def start_reflection(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -138,11 +153,13 @@ async def start_reflection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "Привет! Я твой бот для ежевечерней рефлексии 🌙\n\n"
-        "Каждый вечер в 21:00 я буду присылать тебе вопросы.\n\n"
+        "Каждое утро в 10:00 — напоминание о плане на день.\n"
+        "Каждый вечер в 23:00 — вопросы для рефлексии.\n\n"
         "Команды:\n"
         "/ask — начать рефлексию прямо сейчас\n"
         "/history — последние 7 записей\n"
         "/gratitude — сводка благодарностей за месяц\n"
+        "/plan — показать план на сегодня\n"
         "/cancel — отменить текущий диалог"
     )
 
@@ -231,6 +248,19 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
+async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+    date_str, plan = get_today_plan()
+    if plan:
+        await update.message.reply_text(
+            f"📋 *Твой план на сегодня:*\n\n{plan}",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text("Плана на сегодня нет — вчера не было записи.")
+
+
 async def gratitude_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MY_CHAT_ID:
         return
@@ -239,6 +269,22 @@ async def gratitude_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     month_name = now.strftime("%B %Y")
     text = make_gratitude_summary(entries, month_name)
     await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def morning_reminder(context: ContextTypes.DEFAULT_TYPE):
+    """Утреннее напоминание в 10:00 — план на сегодня."""
+    date_str, plan = get_today_plan()
+    if plan:
+        await context.bot.send_message(
+            chat_id=MY_CHAT_ID,
+            text=f"☀️ Доброе утро!\n\n*Твой план на сегодня:*\n\n{plan}",
+            parse_mode="Markdown"
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=MY_CHAT_ID,
+            text="☀️ Доброе утро! Плана на сегодня нет — вчера не было записи.",
+        )
 
 
 async def evening_questions(context: ContextTypes.DEFAULT_TYPE):
@@ -295,12 +341,21 @@ async def main():
     reflection_app.add_handler(conv_handler)
     reflection_app.add_handler(CommandHandler("history", history))
     reflection_app.add_handler(CommandHandler("gratitude", gratitude_summary))
+    reflection_app.add_handler(CommandHandler("plan", plan_command))
 
+    # Утреннее напоминание в 10:00
     reflection_app.job_queue.run_daily(
-        evening_questions,
-        time=dtime(hour=21, minute=0, second=0, tzinfo=TIMEZONE),
+        morning_reminder,
+        time=dtime(hour=10, minute=0, second=0, tzinfo=TIMEZONE),
     )
 
+    # Вечерние вопросы в 23:00
+    reflection_app.job_queue.run_daily(
+        evening_questions,
+        time=dtime(hour=23, minute=0, second=0, tzinfo=TIMEZONE),
+    )
+
+    # Ежемесячная сводка благодарностей — 1-го числа в 09:00
     reflection_app.job_queue.run_monthly(
         monthly_gratitude_report,
         when=dtime(hour=9, minute=0, second=0, tzinfo=TIMEZONE),
