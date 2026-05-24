@@ -424,7 +424,12 @@ async def cinema_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def movies_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MY_CHAT_ID:
         return
-    await send_movies(context.bot, MY_CHAT_ID, "этой недели")
+    try:
+        await update.message.reply_text("🎬 Запрашиваю новинки... ⏳")
+        await send_movies(context.bot, MY_CHAT_ID, "этой недели")
+    except Exception as e:
+        logger.error(f"movies_command error: {e}")
+        await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
 async def weekly_movies(context: ContextTypes.DEFAULT_TYPE):
