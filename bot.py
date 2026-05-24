@@ -8,8 +8,6 @@ import requests
 from datetime import datetime, time as dtime
 import pytz
 import asyncio
-import re
-from collections import Counter
 
 from telegram import Update
 from telegram.ext import (
@@ -79,11 +77,6 @@ def get_yesterday_plan():
     return None, None
 
 
-def get_today_plan():
-    """Возвращает план на сегодня — из вчерашней записи."""
-    return get_yesterday_plan()
-
-
 def get_monthly_gratitude_summary():
     journal = load_journal()
     now = datetime.now(TIMEZONE)
@@ -138,7 +131,6 @@ def make_gratitude_summary(entries, month_name):
         except Exception as e:
             logger.error(f"Claude API error: {e}")
 
-    # Простая сводка если ключа нет
     text = f"🙏 *Благодарности за {month_name}*\n\n"
     text += f"Всего записей: {len(entries)}\n\n"
     text += "*Последние записи:*\n"
@@ -157,10 +149,10 @@ async def start_reflection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Каждый вечер в 23:00 — вопросы для рефлексии.\n\n"
         "Команды:\n"
         "/ask — начать рефлексию прямо сейчас\n"
+        "/plan — план на сегодня\n"
         "/history — последние 7 записей\n"
         "/gratitude — сводка благодарностей за месяц\n"
-        "/plan — показать план на сегодня\n"
-        "/cancel — отменить текущий диалог"
+        "/cancel — отменить диалог"
     )
 
 
@@ -231,7 +223,7 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     journal = load_journal()
     if not journal:
-        await update.message.reply_text("Дневник пока пустой. Напиши /ask чтобы начать.")
+        await update.message.reply_text("Дневник пока пустой.")
         return
     sorted_entries = sorted(journal.items(), reverse=True)[:7]
     text = "📔 *Последние записи:*\n\n"
@@ -251,14 +243,14 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MY_CHAT_ID:
         return
-    date_str, plan = get_today_plan()
+    date_str, plan = get_yesterday_plan()
     if plan:
         await update.message.reply_text(
-            f"📋 *Твой план на сегодня:*\n\n{plan}",
+            f"📋 *План на сегодня:*\n\n{plan}",
             parse_mode="Markdown"
         )
     else:
-        await update.message.reply_text("Плана на сегодня нет — вчера не было записи.")
+        await update.message.reply_text("Плана нет — вчера не было записи.")
 
 
 async def gratitude_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -272,18 +264,17 @@ async def gratitude_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def morning_reminder(context: ContextTypes.DEFAULT_TYPE):
-    """Утреннее напоминание в 10:00 — план на сегодня."""
-    date_str, plan = get_today_plan()
+    date_str, plan = get_yesterday_plan()
     if plan:
         await context.bot.send_message(
             chat_id=MY_CHAT_ID,
-            text=f"☀️ Доброе утро!\n\n*Твой план на сегодня:*\n\n{plan}",
+            text=f"☀️ Доброе утро!\n\n*План на сегодня:*\n\n{plan}",
             parse_mode="Markdown"
         )
     else:
         await context.bot.send_message(
             chat_id=MY_CHAT_ID,
-            text="☀️ Доброе утро! Плана на сегодня нет — вчера не было записи.",
+            text="☀️ Доброе утро! Плана на сегодня нет.",
         )
 
 
@@ -299,22 +290,70 @@ async def monthly_gratitude_report(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(TIMEZONE)
     month_name = now.strftime("%B %Y")
     text = make_gratitude_summary(entries, month_name)
+    await context.bot.send_message(chat_id=MY_CHAT_ID, text=text, parse_mode="Markdown")
+
+
+# =====================
+# КУРСЫ ВАЛЮТ
+# =====================
+
+def get_rates():
+    try:
+        btc_resp = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": "bitcoin", "vs_currencies": "usd"},
+            timeout=10,
+        )
+        btc_usd = btc_resp.json()["bitcoin"]["usd"]
+
+        fx_resp = requests.get("https://open.er-api.com/v6/latest/USD", timeout=10)
+        fx = fx_resp.json()["rates"]
+        rub_per_usd = fx["RUB"]
+        thb_per_usd = fx["THB"]
+        rub_per_thb = rub_per_usd / thb_per_usd
+
+        return {"btc_usd": btc_usd, "rub_per_usd": rub_per_usd, "rub_per_thb": rub_per_thb}
+    except Exception as e:
+        logger.error(f"Rates error: {e}")
+        return None
+
+
+def format_rates(rates):
+    if not rates:
+        return "❌ Не удалось получить курсы."
+    now = datetime.now(TIMEZONE).strftime("%d.%m.%Y %H:%M")
+    btc_str = f"{rates['btc_usd']:,.0f}".replace(",", " ")
+    return (
+        f"📊 *Курсы на {now}*\n\n"
+        f"₿ *Bitcoin:* `${btc_str}`\n"
+        f"💵 *Доллар:* `{rates['rub_per_usd']:.2f} ₽`\n"
+        f"🇹🇭 *Бат:* `{rates['rub_per_thb']:.2f} ₽`\n"
+    )
+
+
+async def rates_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != BYBIT_CHAT_ID:
+        return
+    text = format_rates(get_rates())
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def morning_rates(context: ContextTypes.DEFAULT_TYPE):
+    text = "☀️ *Доброе утро!*\n\n" + format_rates(get_rates())
     await context.bot.send_message(
-        chat_id=MY_CHAT_ID,
+        chat_id=BYBIT_CHAT_ID,
         text=text,
         parse_mode="Markdown",
     )
 
 
-# =====================
-# BYBIT (заглушка)
-# =====================
-
-async def bybit_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def bybit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != BYBIT_CHAT_ID:
         return
     await update.message.reply_text(
-        "Bybit трекер недоступен — API не предоставляет доступ к балансу Trading Bot аккаунта."
+        "Привет! Я слежу за курсами 📊\n\n"
+        "Каждое утро в 08:00 присылаю курсы.\n\n"
+        "/rates — курсы прямо сейчас"
     )
 
 
@@ -343,34 +382,35 @@ async def main():
     reflection_app.add_handler(CommandHandler("gratitude", gratitude_summary))
     reflection_app.add_handler(CommandHandler("plan", plan_command))
 
-    # Утреннее напоминание в 10:00
     reflection_app.job_queue.run_daily(
         morning_reminder,
         time=dtime(hour=10, minute=0, second=0, tzinfo=TIMEZONE),
     )
-
-    # Вечерние вопросы в 23:00
     reflection_app.job_queue.run_daily(
         evening_questions,
         time=dtime(hour=23, minute=0, second=0, tzinfo=TIMEZONE),
     )
-
-    # Ежемесячная сводка благодарностей — 1-го числа в 09:00
     reflection_app.job_queue.run_monthly(
         monthly_gratitude_report,
         when=dtime(hour=9, minute=0, second=0, tzinfo=TIMEZONE),
         day=1,
     )
 
-    bybit_app = Application.builder().token(BYBIT_BOT_TOKEN).build()
-    bybit_app.add_handler(CommandHandler("status", bybit_status))
+    # Бот курсов (используем Bybit токен)
+    rates_app = Application.builder().token(BYBIT_BOT_TOKEN).build()
+    rates_app.add_handler(CommandHandler("start", bybit_start))
+    rates_app.add_handler(CommandHandler("rates", rates_command))
+    rates_app.job_queue.run_daily(
+        morning_rates,
+        time=dtime(hour=8, minute=0, second=0, tzinfo=TIMEZONE),
+    )
 
-    async with reflection_app, bybit_app:
+    async with reflection_app, rates_app:
         await reflection_app.start()
-        await bybit_app.start()
+        await rates_app.start()
         await reflection_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        await bybit_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        logger.info("Оба бота запущены.")
+        await rates_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        logger.info("Все боты запущены.")
         await asyncio.Event().wait()
 
 
