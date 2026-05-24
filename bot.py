@@ -463,12 +463,9 @@ async def main():
     reflection_app.add_handler(CommandHandler("history", history))
     reflection_app.add_handler(CommandHandler("gratitude", gratitude_summary))
     reflection_app.add_handler(CommandHandler("plan", plan_command))
-    reflection_app.add_handler(CommandHandler("movies", movies_command))
     reflection_app.job_queue.run_daily(morning_reminder, time=dtime(hour=10, minute=0, tzinfo=TIMEZONE))
     reflection_app.job_queue.run_daily(evening_questions, time=dtime(hour=23, minute=0, tzinfo=TIMEZONE))
     reflection_app.job_queue.run_monthly(monthly_gratitude_report, when=dtime(hour=9, tzinfo=TIMEZONE), day=1)
-    reflection_app.job_queue.run_daily(weekly_movies, time=dtime(hour=22, minute=0, tzinfo=TIMEZONE), days=(5,))
-    reflection_app.job_queue.run_monthly(monthly_movies, when=dtime(hour=20, tzinfo=TIMEZONE), day=1)
 
     # Бот курсов (Bybit токен)
     rates_app = Application.builder().token(BYBIT_BOT_TOKEN).build()
@@ -476,11 +473,21 @@ async def main():
     rates_app.add_handler(CommandHandler("rates", rates_command))
     rates_app.job_queue.run_daily(morning_rates, time=dtime(hour=8, minute=0, tzinfo=TIMEZONE))
 
-    async with reflection_app, rates_app:
+    # Бот кино
+    cinema_app = Application.builder().token(CINEMA_BOT_TOKEN).build()
+    cinema_app.add_handler(CommandHandler("start", cinema_start))
+    cinema_app.add_handler(CommandHandler("movies", movies_command))
+    cinema_app.job_queue.run_daily(weekly_movies, time=dtime(hour=22, minute=0, tzinfo=TIMEZONE), days=(5,))
+    cinema_app.job_queue.run_monthly(monthly_movies, when=dtime(hour=20, tzinfo=TIMEZONE), day=1)
+
+    # Убираем кино из бота саморефлексии
+    async with reflection_app, rates_app, cinema_app:
         await reflection_app.start()
         await rates_app.start()
+        await cinema_app.start()
         await reflection_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         await rates_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        await cinema_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         logger.info("Все боты запущены.")
         await asyncio.Event().wait()
 
