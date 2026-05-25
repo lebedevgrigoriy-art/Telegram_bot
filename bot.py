@@ -5,7 +5,7 @@ import time
 import hmac
 import hashlib
 import requests
-from datetime import datetime, time as dtime
+from datetime import datetime, timedelta, time as dtime
 import pytz
 import asyncio
 
@@ -40,6 +40,169 @@ TMDB_BASE = "https://api.themoviedb.org/3"
 TMDB_IMG = "https://image.tmdb.org/t/p/w500"
 
 JOURNAL_FILE = "journal.json"
+VISA_FILE = "visa.json"
+ENTER_DATE, ENTER_DAYS = range(2)
+
+
+# =====================
+# ВИЗОВЫЙ БУДИЛЬНИК
+# =====================
+
+def load_visa():
+    if not os.path.exists(VISA_FILE):
+        return None
+    with open(VISA_FILE, "r") as f:
+        return json.load(f)
+
+
+def save_visa(entry_date, days):
+    data = {
+        "entry_date": entry_date,
+        "days": days,
+        "expiry_date": (datetime.strptime(entry_date, "%d.%m.%Y") + timedelta(days=days)).strftime("%d.%m.%Y"),
+    }
+    with open(VISA_FILE, "w") as f:
+        json.dump(data, f)
+    return data
+
+
+def days_left(expiry_date_str):
+    expiry = datetime.strptime(expiry_date_str, "%d.%m.%Y")
+    today = datetime.now(TIMEZONE).replace(tzinfo=None)
+    return (expiry - today).days
+
+
+async def visa_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+    visa = load_visa()
+    text = (
+        "🇹🇭 *Визовый будильник*\n\n"
+        "Команды:\n"
+        "/set — задать дату въезда и срок визы\n"
+        "/status — сколько дней осталось\n"
+    )
+    if visa:
+        left = days_left(visa["expiry_date"])
+        text += f"\n📅 Текущая виза истекает: *{visa['expiry_date']}*\nОсталось: *{left} дн.*"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def set_visa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+    await update.message.reply_text(
+        "📅 Введи дату въезда в формате ДД.ММ.ГГГГ\nНапример: `15.05.2026`",
+        parse_mode="Markdown"
+    )
+    return ENTER_DATE
+
+
+async def enter_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    try:
+        datetime.strptime(text, "%d.%m.%Y")
+        context.user_data["entry_date"] = text
+        await update.message.reply_text(
+            "✅ Дата принята.\n\nТеперь введи количество дней разрешённого пребывания.\nНапример: `30` или `60`",
+            parse_mode="Markdown"
+        )
+        return ENTER_DAYS
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат. Введи дату в формате ДД.ММ.ГГГГ")
+        return ENTER_DATE
+
+
+async def enter_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    try:
+        days = int(text)
+        if days <= 0 or days > 365:
+            raise ValueError
+        entry_date = context.user_data["entry_date"]
+        visa = save_visa(entry_date, days)
+        left = days_left(visa["expiry_date"])
+        await update.message.reply_text(
+            f"✅ *Виза сохранена!*\n\n"
+            f"📅 Въезд: {entry_date}\n"
+            f"⏳ Срок: {days} дней\n"
+            f"🔴 Истекает: *{visa['expiry_date']}*\n"
+            f"📊 Осталось: *{left} дн.*\n\n"
+            f"Буду напоминать за 14, 7, 3 и 1 день до окончания.",
+            parse_mode="Markdown"
+        )
+        return ConversationHandler.END
+    except ValueError:
+        await update.message.reply_text("❌ Введи целое число от 1 до 365")
+        return ENTER_DAYS
+
+
+async def visa_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+    visa = load_visa()
+    if not visa:
+        await update.message.reply_text("Виза не задана. Используй /set")
+        return
+    left = days_left(visa["expiry_date"])
+    if left < 0:
+        emoji = "🚨"
+        status_text = f"ПРОСРОЧЕНА на {abs(left)} дней!"
+    elif left == 0:
+        emoji = "🚨"
+        status_text = "истекает СЕГОДНЯ!"
+    elif left <= 3:
+        emoji = "🔴"
+        status_text = f"осталось *{left} дн.* — срочно!"
+    elif left <= 7:
+        emoji = "🟠"
+        status_text = f"осталось *{left} дн.*"
+    elif left <= 14:
+        emoji = "🟡"
+        status_text = f"осталось *{left} дн.*"
+    else:
+        emoji = "🟢"
+        status_text = f"осталось *{left} дн.*"
+    total = visa["days"]
+    used = total - max(0, left)
+    pct = max(0, min(100, int(used / total * 100)))
+    filled = int(pct / 10)
+    bar = "█" * filled + "░" * (10 - filled)
+    await update.message.reply_text(
+        f"{emoji} *Статус визы*\n\n"
+        f"📅 Въезд: {visa['entry_date']}\n"
+        f"🔴 Истекает: {visa['expiry_date']}\n"
+        f"⏳ {status_text}\n\n"
+        f"`[{bar}]` {pct}% использовано",
+        parse_mode="Markdown"
+    )
+
+
+async def check_visa_reminders(context: ContextTypes.DEFAULT_TYPE):
+    visa = load_visa()
+    if not visa:
+        return
+    left = days_left(visa["expiry_date"])
+    if left in [14, 7, 3, 1]:
+        msgs = {
+            14: "🟡 *Напоминание о визе*\n\nДо конца визы осталось *14 дней*. Начинай думать о продлении.",
+            7: "🟠 *Эй, пора планировать бордер ран!*\n\nДо конца визы осталось *7 дней*.",
+            3: "🔴 *Виза истекает через 3 дня!*\n\nПора планировать бордер ран!",
+            1: "🚨 *Завтра истекает виза!*\n\nОстался *1 день*. Срочно планируй бордер ран или продление!",
+        }
+        await context.bot.send_message(
+            chat_id=MY_CHAT_ID,
+            text=msgs[left] + f"\n\n📅 Истекает: {visa['expiry_date']}",
+            parse_mode="Markdown"
+        )
+    elif left < 0:
+        await context.bot.send_message(
+            chat_id=MY_CHAT_ID,
+            text=f"🚨 *ВИЗА ПРОСРОЧЕНА!*\n\nПросрочка: {abs(left)} дней.\nНемедленно займись легализацией!",
+            parse_mode="Markdown"
+        )
+
+
 
 Q1, Q2, Q3, Q4, Q5 = range(5)
 
@@ -481,13 +644,30 @@ async def main():
     cinema_app.job_queue.run_monthly(monthly_movies, when=dtime(hour=20, tzinfo=TIMEZONE), day=1)
 
     # Убираем кино из бота саморефлексии
-    async with reflection_app, rates_app, cinema_app:
+    # Визовый бот
+    visa_app = Application.builder().token(os.environ.get("VISA_BOT_TOKEN")).build()
+    visa_conv = ConversationHandler(
+        entry_points=[CommandHandler("set", set_visa)],
+        states={
+            ENTER_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_date)],
+            ENTER_DAYS: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_days)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    visa_app.add_handler(CommandHandler("start", visa_start))
+    visa_app.add_handler(CommandHandler("status", visa_status))
+    visa_app.add_handler(visa_conv)
+    visa_app.job_queue.run_daily(check_visa_reminders, time=dtime(hour=10, minute=0, tzinfo=TIMEZONE))
+
+    async with reflection_app, rates_app, cinema_app, visa_app:
         await reflection_app.start()
         await rates_app.start()
         await cinema_app.start()
+        await visa_app.start()
         await reflection_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         await rates_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         await cinema_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        await visa_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         logger.info("Все боты запущены.")
         await asyncio.Event().wait()
 
