@@ -464,7 +464,7 @@ async def main():
     reflection_app.add_handler(CommandHandler("gratitude", gratitude_summary))
     reflection_app.add_handler(CommandHandler("plan", plan_command))
     reflection_app.job_queue.run_daily(morning_reminder, time=dtime(hour=10, minute=0, tzinfo=TIMEZONE))
-    reflection_app.job_queue.run_daily(evening_questions, time=dtime(hour=23, minute=0, tzinfo=TIMEZONE))
+    reflection_app.job_queue.run_daily(evening_questions, time=dtime(hour=21, minute=0, tzinfo=TIMEZONE))
     reflection_app.job_queue.run_monthly(monthly_gratitude_report, when=dtime(hour=9, tzinfo=TIMEZONE), day=1)
 
     # Бот курсов (Bybit токен)
