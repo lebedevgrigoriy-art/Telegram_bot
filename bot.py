@@ -33,6 +33,8 @@ VISA_BOT_TOKEN = os.environ.get("VISA_BOT_TOKEN")
 TODOIST_BOT_TOKEN = os.environ.get("TODOIST_BOT_TOKEN")
 TODOIST_TOKEN = os.environ.get("TODOIST_TOKEN")
 SAVINGS_BOT_TOKEN = os.environ.get("SAVINGS_BOT_TOKEN")
+BOOKS_BOT_TOKEN = os.environ.get("BOOKS_BOT_TOKEN")
+GOOGLE_BOOKS_API_KEY = os.environ.get("GOOGLE_BOOKS_API_KEY", "")
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY")
 OMDB_API_KEY = os.environ.get("OMDB_API_KEY")
 KP_API_KEY = os.environ.get("KP_API_KEY")
@@ -790,6 +792,252 @@ async def weekly_savings_report(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=MY_CHAT_ID, text=text, parse_mode="Markdown")
 
 
+
+# =====================
+# КНИЖНЫЙ БОТ
+# =====================
+
+BOOKS_GENRES = [
+    "бизнес",
+    "нон-фикшн",
+    "психология",
+    "саморазвитие",
+    "финансы",
+    "инвестиции",
+    "ресторанный бизнес",
+]
+
+BOOKS_GENRE_QUERIES = [
+    "бизнес литература",
+    "психология успех",
+    "личные финансы инвестиции",
+    "нон-фикшн",
+    "ресторанный бизнес",
+]
+
+MONTHLY_QUESTION_FILE = "books_monthly.json"
+
+
+def load_monthly_topic():
+    if not os.path.exists(MONTHLY_QUESTION_FILE):
+        return None
+    with open(MONTHLY_QUESTION_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_monthly_topic(topic):
+    with open(MONTHLY_QUESTION_FILE, "w", encoding="utf-8") as f:
+        json.dump({"topic": topic, "month": datetime.now(TIMEZONE).strftime("%Y-%m")}, f)
+
+
+def get_new_books(query, max_results=5):
+    try:
+        params = {
+            "q": query + " subject:nonfiction",
+            "langRestrict": "ru",
+            "orderBy": "newest",
+            "maxResults": max_results,
+            "printType": "books",
+        }
+        if GOOGLE_BOOKS_API_KEY:
+            params["key"] = GOOGLE_BOOKS_API_KEY
+
+        resp = requests.get(
+            "https://www.googleapis.com/books/v1/volumes",
+            params=params,
+            timeout=10,
+        )
+        items = resp.json().get("items", [])
+        books = []
+        for item in items:
+            info = item.get("volumeInfo", {})
+            title = info.get("title", "—")
+            authors = ", ".join(info.get("authors", ["—"]))
+            description = info.get("description", "")
+            if description and len(description) > 150:
+                description = description[:150] + "..."
+            rating = info.get("averageRating")
+            ratings_count = info.get("ratingsCount", 0)
+            published = info.get("publishedDate", "")[:4]
+            link = info.get("infoLink", "")
+            thumbnail = info.get("imageLinks", {}).get("thumbnail", "")
+
+            books.append({
+                "title": title,
+                "authors": authors,
+                "description": description,
+                "rating": rating,
+                "ratings_count": ratings_count,
+                "published": published,
+                "link": link,
+                "thumbnail": thumbnail,
+            })
+        return books
+    except Exception as e:
+        logger.error(f"Google Books error: {e}")
+        return []
+
+
+def format_book(book, num):
+    text = f"*{num}. {book['title']}*\n"
+    text += f"✍️ {book['authors']}\n"
+    if book.get("published"):
+        text += f"📅 {book['published']}\n"
+    if book.get("description"):
+        text += f"📝 {book['description']}\n"
+    if book.get("rating"):
+        text += f"⭐ {book['rating']}/5 ({book['ratings_count']} оценок)\n"
+    if book.get("link"):
+        text += f"🔗 [Подробнее]({book['link']})\n"
+    return text
+
+
+async def books_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+    await update.message.reply_text(
+        "📚 *Книжный бот*\n\n"
+        "Каждый понедельник в 09:00 — новинки по твоим жанрам.\n"
+        "Каждое 1-е число — я спрошу о теме месяца.\n\n"
+        "/books — получить подборку прямо сейчас\n"
+        "/recommend [тема] — лучшие книги по теме",
+        parse_mode="Markdown"
+    )
+
+
+async def books_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+    await update.message.reply_text("📚 Ищу книжные новинки... ⏳")
+    await send_weekly_books(context.bot, MY_CHAT_ID)
+
+
+async def recommend_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+    topic = " ".join(context.args) if context.args else None
+    if not topic:
+        await update.message.reply_text("Напиши тему: `/recommend финансы` или `/recommend психология`", parse_mode="Markdown")
+        return
+    await update.message.reply_text(f"🔍 Ищу лучшие книги по теме: *{topic}*...", parse_mode="Markdown")
+    await send_recommendations(context.bot, MY_CHAT_ID, topic)
+
+
+async def books_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+    monthly = load_monthly_topic()
+    if monthly and monthly.get("month") == datetime.now(TIMEZONE).strftime("%Y-%m") and "waiting_topic" in context.user_data:
+        topic = update.message.text.strip()
+        save_monthly_topic(topic)
+        context.user_data.pop("waiting_topic", None)
+        await update.message.reply_text(f"✅ Тема месяца: *{topic}*\n\nИщу лучшие книги...", parse_mode="Markdown")
+        await send_recommendations(context.bot, MY_CHAT_ID, topic)
+    else:
+        await update.message.reply_text("Используй /books для новинок или /recommend [тема] для рекомендаций.")
+
+
+async def send_weekly_books(bot, chat_id):
+    all_books = []
+    seen_titles = set()
+    for query in BOOKS_GENRE_QUERIES:
+        books = get_new_books(query, max_results=3)
+        for book in books:
+            if book["title"] not in seen_titles:
+                seen_titles.add(book["title"])
+                all_books.append(book)
+        if len(all_books) >= 10:
+            break
+
+    if not all_books:
+        await bot.send_message(chat_id=chat_id, text="❌ Не удалось получить книги. Попробуй позже.")
+        return
+
+    now = datetime.now(TIMEZONE).strftime("%d.%m.%Y")
+    await bot.send_message(
+        chat_id=chat_id,
+        text=f"📚 *Книжные новинки на {now}*\n\nБизнес, психология, финансы, нон-фикшн",
+        parse_mode="Markdown"
+    )
+
+    for i, book in enumerate(all_books[:10], 1):
+        text = format_book(book, i)
+        try:
+            thumbnail = book.get("thumbnail", "")
+            if thumbnail:
+                # Меняем http на https и увеличиваем размер обложки
+                thumbnail = thumbnail.replace("http://", "https://").replace("zoom=1", "zoom=3")
+                await bot.send_photo(chat_id=chat_id, photo=thumbnail, caption=text, parse_mode="Markdown")
+            else:
+                await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Error sending book: {e}")
+            try:
+                await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+            except Exception:
+                pass
+        await asyncio.sleep(0.5)
+
+
+async def send_recommendations(bot, chat_id, topic):
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if anthropic_key:
+        try:
+            response = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": anthropic_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 1000,
+                    "messages": [{
+                        "role": "user",
+                        "content": f"Порекомендуй 5 лучших книг по теме: {topic}. Для каждой книги напиши: название, автор, год, краткое описание (2-3 предложения) почему именно эта книга лучшая. Формат ответа - простой текст, без markdown."
+                    }]
+                },
+                timeout=30,
+            )
+            text = response.json()["content"][0]["text"]
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"📚 *Лучшие книги по теме: {topic}*\n\n{text}",
+                parse_mode="Markdown"
+            )
+            return
+        except Exception as e:
+            logger.error(f"Claude API error: {e}")
+
+    # Если нет Claude API — ищем через Google Books
+    books = get_new_books(topic, max_results=5)
+    if not books:
+        await bot.send_message(chat_id=chat_id, text=f"❌ Не удалось найти книги по теме: {topic}")
+        return
+    await bot.send_message(chat_id=chat_id, text=f"📚 *Книги по теме: {topic}*", parse_mode="Markdown")
+    for i, book in enumerate(books, 1):
+        text = format_book(book, i)
+        try:
+            thumbnail = book.get("thumbnail", "")
+            if thumbnail:
+                thumbnail = thumbnail.replace("http://", "https://").replace("zoom=1", "zoom=3")
+                await bot.send_photo(chat_id=chat_id, photo=thumbnail, caption=text, parse_mode="Markdown")
+            else:
+                await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+        except Exception as e:
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+        await asyncio.sleep(0.5)
+
+
+async def weekly_books_report(context: ContextTypes.DEFAULT_TYPE):
+    await send_weekly_books(context.bot, MY_CHAT_ID)
+
+
+async def monthly_books_question(context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["waiting_topic"] = True
+    await context.bot.send_message(
+        chat_id=MY_CHAT_ID,
+        text="📚 *Книжный вопрос месяца*\n\nНа какую тему ты хотел бы почитать книгу в этом месяце?\n\nНапример: психология влияния, управление командой, инвестиции в акции...\n\nПросто напиши тему в ответ.",
+        parse_mode="Markdown"
+    )
+
 # =====================
 # ЗАПУСК
 # =====================
@@ -864,19 +1112,38 @@ async def main():
         days=(6,),
     )
 
-    async with reflection_app, rates_app, cinema_app, visa_app, todoist_app, savings_app:
+    # Книжный бот
+    books_app = Application.builder().token(BOOKS_BOT_TOKEN).build()
+    books_app.add_handler(CommandHandler("start", books_start))
+    books_app.add_handler(CommandHandler("books", books_command))
+    books_app.add_handler(CommandHandler("recommend", recommend_command))
+    books_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, books_handle_message))
+    books_app.job_queue.run_daily(
+        weekly_books_report,
+        time=dtime(hour=9, minute=0, tzinfo=TIMEZONE),
+        days=(0,),  # 0 = понедельник
+    )
+    books_app.job_queue.run_monthly(
+        monthly_books_question,
+        when=dtime(hour=10, minute=0, tzinfo=TIMEZONE),
+        day=1,
+    )
+
+    async with reflection_app, rates_app, cinema_app, visa_app, todoist_app, savings_app, books_app:
         await reflection_app.start()
         await rates_app.start()
         await cinema_app.start()
         await visa_app.start()
         await todoist_app.start()
         await savings_app.start()
+        await books_app.start()
         await reflection_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         await rates_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         await cinema_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         await visa_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         await todoist_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         await savings_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        await books_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         logger.info("Все боты запущены.")
         await asyncio.Event().wait()
 
