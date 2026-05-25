@@ -596,6 +596,7 @@ def add_task(text):
         json={"content": text},
         timeout=10,
     )
+    logger.error(f"Todoist add_task: {resp.status_code} {resp.text}")
     return resp.status_code == 200
 
 
@@ -664,11 +665,17 @@ async def todoist_handle_message(update: Update, context: ContextTypes.DEFAULT_T
     text = update.message.text.strip()
     if not text:
         return
-    success = add_task(text)
-    if success:
+    resp = requests.post(
+        f"{TODOIST_API}/tasks",
+        headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
+        json={"content": text},
+        timeout=10,
+    )
+    logger.error(f"Todoist response: {resp.status_code} {resp.text}")
+    if resp.status_code == 200:
         await update.message.reply_text(f"✅ Добавлено в Inbox:\n_{text}_", parse_mode="Markdown")
     else:
-        await update.message.reply_text("❌ Не удалось добавить задачу.")
+        await update.message.reply_text(f"❌ Ошибка {resp.status_code}: {resp.text[:200]}")
 
 
 async def morning_tasks(context: ContextTypes.DEFAULT_TYPE):
