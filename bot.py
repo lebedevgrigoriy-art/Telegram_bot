@@ -30,6 +30,8 @@ BYBIT_BOT_TOKEN = os.environ.get("BYBIT_BOT_TOKEN")
 BYBIT_CHAT_ID = int(os.environ.get("BYBIT_CHAT_ID"))
 CINEMA_BOT_TOKEN = os.environ.get("CINEMA_BOT_TOKEN")
 VISA_BOT_TOKEN = os.environ.get("VISA_BOT_TOKEN")
+TODOIST_BOT_TOKEN = os.environ.get("TODOIST_BOT_TOKEN")
+TODOIST_TOKEN = os.environ.get("TODOIST_TOKEN")
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY")
 OMDB_API_KEY = os.environ.get("OMDB_API_KEY")
 KP_API_KEY = os.environ.get("KP_API_KEY")
@@ -579,6 +581,102 @@ async def check_visa_reminders(context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+
+# =====================
+# TODOIST INBOX
+# =====================
+
+TODOIST_API = "https://api.todoist.com/rest/v2"
+
+
+def add_task(text):
+    resp = requests.post(
+        f"{TODOIST_API}/tasks",
+        headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
+        json={"content": text},
+        timeout=10,
+    )
+    return resp.status_code == 200
+
+
+def get_today_tasks():
+    resp = requests.get(
+        f"{TODOIST_API}/tasks",
+        headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
+        params={"filter": "today | overdue"},
+        timeout=10,
+    )
+    if resp.status_code == 200:
+        return resp.json()
+    return []
+
+
+def format_tasks(tasks):
+    if not tasks:
+        return "✅ На сегодня задач нет!"
+    text = f"📋 *Задачи на сегодня ({len(tasks)}):*\n\n"
+    for i, task in enumerate(tasks, 1):
+        priority_emoji = {1: "", 2: "🔵", 3: "🟡", 4: "🔴"}.get(task.get("priority", 1), "")
+        text += f"{i}. {priority_emoji} {task['content']}\n"
+    return text
+
+
+async def todoist_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+    await update.message.reply_text(
+        "Привет! Я твой Todoist-помощник 📋\n\n"
+        "Просто напиши мне задачу — я добавлю её в Inbox.\n\n"
+        "/tasks — задачи на сегодня\n"
+        "/inbox — что в Inbox"
+    )
+
+
+async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+    tasks = get_today_tasks()
+    await update.message.reply_text(format_tasks(tasks), parse_mode="Markdown")
+
+
+async def inbox_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+    resp = requests.get(
+        f"{TODOIST_API}/tasks",
+        headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
+        params={"filter": "#Inbox"},
+        timeout=10,
+    )
+    tasks = resp.json() if resp.status_code == 200 else []
+    if not tasks:
+        await update.message.reply_text("📥 Inbox пуст!")
+        return
+    text = f"📥 *Inbox ({len(tasks)}):*\n\n"
+    for i, task in enumerate(tasks[:20], 1):
+        text += f"{i}. {task['content']}\n"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def todoist_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+    text = update.message.text.strip()
+    if not text:
+        return
+    success = add_task(text)
+    if success:
+        await update.message.reply_text(f"✅ Добавлено в Inbox:\n_{text}_", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌ Не удалось добавить задачу.")
+
+
+async def morning_tasks(context: ContextTypes.DEFAULT_TYPE):
+    tasks = get_today_tasks()
+    text = "☀️ *Доброе утро!*\n\n" + format_tasks(tasks)
+    await context.bot.send_message(chat_id=MY_CHAT_ID, text=text, parse_mode="Markdown")
+
+
 # =====================
 # ЗАПУСК
 # =====================
@@ -634,15 +732,25 @@ async def main():
     visa_app.add_handler(visa_conv)
     visa_app.job_queue.run_daily(check_visa_reminders, time=dtime(hour=10, minute=0, tzinfo=TIMEZONE))
 
-    async with reflection_app, rates_app, cinema_app, visa_app:
+    # Todoist бот
+    todoist_app = Application.builder().token(TODOIST_BOT_TOKEN).build()
+    todoist_app.add_handler(CommandHandler("start", todoist_start))
+    todoist_app.add_handler(CommandHandler("tasks", tasks_command))
+    todoist_app.add_handler(CommandHandler("inbox", inbox_command))
+    todoist_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, todoist_handle_message))
+    todoist_app.job_queue.run_daily(morning_tasks, time=dtime(hour=9, minute=0, tzinfo=TIMEZONE))
+
+    async with reflection_app, rates_app, cinema_app, visa_app, todoist_app:
         await reflection_app.start()
         await rates_app.start()
         await cinema_app.start()
         await visa_app.start()
+        await todoist_app.start()
         await reflection_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         await rates_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         await cinema_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         await visa_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        await todoist_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         logger.info("Все боты запущены.")
         await asyncio.Event().wait()
 
