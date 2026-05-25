@@ -32,6 +32,7 @@ CINEMA_BOT_TOKEN = os.environ.get("CINEMA_BOT_TOKEN")
 VISA_BOT_TOKEN = os.environ.get("VISA_BOT_TOKEN")
 TODOIST_BOT_TOKEN = os.environ.get("TODOIST_BOT_TOKEN")
 TODOIST_TOKEN = os.environ.get("TODOIST_TOKEN")
+SAVINGS_BOT_TOKEN = os.environ.get("SAVINGS_BOT_TOKEN")
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY")
 OMDB_API_KEY = os.environ.get("OMDB_API_KEY")
 KP_API_KEY = os.environ.get("KP_API_KEY")
@@ -684,6 +685,153 @@ async def morning_tasks(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=MY_CHAT_ID, text=text, parse_mode="Markdown")
 
 
+
+# =====================
+# ТРЕКЕР НАКОПЛЕНИЙ
+# =====================
+
+SAVINGS_FILE = "savings.json"
+SAVINGS_GOAL = 10000
+
+
+def load_savings():
+    if not os.path.exists(SAVINGS_FILE):
+        return {"balance": 0}
+    with open(SAVINGS_FILE, "r") as f:
+        return json.load(f)
+
+
+def save_savings(balance):
+    with open(SAVINGS_FILE, "w") as f:
+        json.dump({"balance": balance}, f)
+
+
+def format_progress(balance, goal=SAVINGS_GOAL):
+    pct = min(100, int(balance / goal * 100))
+    filled = int(pct / 5)
+    bar = "█" * filled + "░" * (20 - filled)
+    remaining = max(0, goal - balance)
+    return (
+        f"💰 *Накопления*
+
+"
+        f"`[{bar}]`
+"
+        f"📊 {pct}% выполнено
+"
+        f"💵 Накоплено: `{balance:.2f} USDT`
+"
+        f"🎯 Цель: `{goal} USDT`
+"
+        f"⏳ Осталось: `{remaining:.2f} USDT`"
+    )
+
+
+MOTIVATIONS = [
+    "Каждый доллар приближает тебя к цели. Так держать! 💪",
+    "Дисциплина сегодня — свобода завтра. Ты молодец! 🔥",
+    "Маленькие шаги ведут к большим результатам. Продолжай! 🚀",
+    "Ты уже ближе к цели, чем вчера. Не останавливайся! ⚡",
+    "Богатство строится по кирпичику. Ты кладёшь свой! 🏆",
+]
+
+
+async def savings_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+    data = load_savings()
+    text = (
+        "💰 *Трекер накоплений*
+
+"
+        "Команды:
+"
+        "/balance — текущий баланс
+
+"
+        "Пополнение: напиши `+100`
+"
+        "Списание: напиши `-50`
+
+"
+    ) + format_progress(data["balance"])
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+    data = load_savings()
+    await update.message.reply_text(format_progress(data["balance"]), parse_mode="Markdown")
+
+
+async def savings_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+    text = update.message.text.strip()
+    
+    # Проверяем формат +100 или -50
+    if not (text.startswith("+") or text.startswith("-")):
+        await update.message.reply_text("Напиши `+100` чтобы пополнить или `-50` чтобы списать.", parse_mode="Markdown")
+        return
+    
+    try:
+        amount = float(text)
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат. Напиши `+100` или `-50`", parse_mode="Markdown")
+        return
+
+    data = load_savings()
+    old_balance = data["balance"]
+    new_balance = old_balance + amount
+    
+    if new_balance < 0:
+        await update.message.reply_text("❌ Баланс не может быть отрицательным.")
+        return
+    
+    save_savings(new_balance)
+    
+    # Проверяем достижение цели
+    if old_balance < SAVINGS_GOAL and new_balance >= SAVINGS_GOAL:
+        await update.message.reply_text(
+            f"🎉🏆 *ЦЕЛЬ ДОСТИГНУТА!* 🏆🎉
+
+"
+            f"Ты накопил `{new_balance:.2f} USDT` из `{SAVINGS_GOAL} USDT`!
+
+"
+            f"Это невероятно! Ты доказал себе, что дисциплина и терпение работают. "
+            f"Ты заслужил это! 🚀💪",
+            parse_mode="Markdown"
+        )
+        return
+
+    import random
+    motivation = random.choice(MOTIVATIONS)
+    action = "пополнено" if amount > 0 else "списано"
+    
+    text = (
+        f"{'✅' if amount > 0 else '📤'} {action.capitalize()} `{abs(amount):.2f} USDT`
+
+"
+        + format_progress(new_balance) + f"
+
+_{motivation}_"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def weekly_savings_report(context: ContextTypes.DEFAULT_TYPE):
+    import random
+    data = load_savings()
+    motivation = random.choice(MOTIVATIONS)
+    text = "📅 *Еженедельный отчёт по накоплениям*
+
+" + format_progress(data["balance"]) + f"
+
+_{motivation}_"
+    await context.bot.send_message(chat_id=MY_CHAT_ID, text=text, parse_mode="Markdown")
+
 # =====================
 # ЗАПУСК
 # =====================
@@ -747,17 +895,30 @@ async def main():
     todoist_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, todoist_handle_message))
     todoist_app.job_queue.run_daily(morning_tasks, time=dtime(hour=9, minute=0, tzinfo=TIMEZONE))
 
-    async with reflection_app, rates_app, cinema_app, visa_app, todoist_app:
+    # Бот накоплений
+    savings_app = Application.builder().token(SAVINGS_BOT_TOKEN).build()
+    savings_app.add_handler(CommandHandler("start", savings_start))
+    savings_app.add_handler(CommandHandler("balance", balance_command))
+    savings_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, savings_handle_message))
+    savings_app.job_queue.run_daily(
+        weekly_savings_report,
+        time=dtime(hour=20, minute=0, tzinfo=TIMEZONE),
+        days=(6,),
+    )
+
+    async with reflection_app, rates_app, cinema_app, visa_app, todoist_app, savings_app:
         await reflection_app.start()
         await rates_app.start()
         await cinema_app.start()
         await visa_app.start()
         await todoist_app.start()
+        await savings_app.start()
         await reflection_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         await rates_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         await cinema_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         await visa_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         await todoist_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        await savings_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         logger.info("Все боты запущены.")
         await asyncio.Event().wait()
 
