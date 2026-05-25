@@ -1,9 +1,6 @@
 import os
 import json
 import logging
-import time
-import hmac
-import hashlib
 import requests
 from datetime import datetime, timedelta, time as dtime
 import pytz
@@ -32,182 +29,19 @@ MY_CHAT_ID = int(os.environ.get("MY_CHAT_ID"))
 BYBIT_BOT_TOKEN = os.environ.get("BYBIT_BOT_TOKEN")
 BYBIT_CHAT_ID = int(os.environ.get("BYBIT_CHAT_ID"))
 CINEMA_BOT_TOKEN = os.environ.get("CINEMA_BOT_TOKEN")
+VISA_BOT_TOKEN = os.environ.get("VISA_BOT_TOKEN")
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY")
 OMDB_API_KEY = os.environ.get("OMDB_API_KEY")
 KP_API_KEY = os.environ.get("KP_API_KEY")
 
 TMDB_BASE = "https://api.themoviedb.org/3"
 TMDB_IMG = "https://image.tmdb.org/t/p/w500"
-
 JOURNAL_FILE = "journal.json"
 VISA_FILE = "visa.json"
-ENTER_DATE, ENTER_DAYS = range(2)
 
-
-# =====================
-# ВИЗОВЫЙ БУДИЛЬНИК
-# =====================
-
-def load_visa():
-    if not os.path.exists(VISA_FILE):
-        return None
-    with open(VISA_FILE, "r") as f:
-        return json.load(f)
-
-
-def save_visa(entry_date, expiry_date):
-    entry = datetime.strptime(entry_date, "%d.%m.%Y")
-    expiry = datetime.strptime(expiry_date, "%d.%m.%Y")
-    days = (expiry - entry).days
-    data = {
-        "entry_date": entry_date,
-        "days": days,
-        "expiry_date": expiry_date,
-    }
-    with open(VISA_FILE, "w") as f:
-        json.dump(data, f)
-    return data
-
-
-def days_left(expiry_date_str):
-    expiry = datetime.strptime(expiry_date_str, "%d.%m.%Y")
-    today = datetime.now(TIMEZONE).replace(tzinfo=None)
-    return (expiry - today).days
-
-
-async def visa_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != MY_CHAT_ID:
-        return
-    visa = load_visa()
-    text = (
-        "🇹🇭 *Визовый будильник*\n\n"
-        "Команды:\n"
-        "/set — задать дату въезда и срок визы\n"
-        "/status — сколько дней осталось\n"
-    )
-    if visa:
-        left = days_left(visa["expiry_date"])
-        text += f"\n📅 Текущая виза истекает: *{visa['expiry_date']}*\nОсталось: *{left} дн.*"
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-
-async def set_visa(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != MY_CHAT_ID:
-        return
-    await update.message.reply_text(
-        "📅 Введи дату въезда в формате ДД.ММ.ГГГГ\nНапример: `15.05.2026`",
-        parse_mode="Markdown"
-    )
-    return ENTER_DATE
-
-
-async def enter_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    try:
-        datetime.strptime(text, "%d.%m.%Y")
-        context.user_data["entry_date"] = text
-        await update.message.reply_text(
-            "✅ Дата принята.\n\nТеперь введи количество дней разрешённого пребывания.\nНапример: `30` или `60`",
-            parse_mode="Markdown"
-        )
-        return ENTER_DAYS
-    except ValueError:
-        await update.message.reply_text("❌ Неверный формат. Введи дату в формате ДД.ММ.ГГГГ")
-        return ENTER_DATE
-
-
-async def enter_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    try:
-        days = int(text)
-        if days <= 0 or days > 365:
-            raise ValueError
-        entry_date = context.user_data["entry_date"]
-        visa = save_visa(entry_date, days)
-        left = days_left(visa["expiry_date"])
-        await update.message.reply_text(
-            f"✅ *Виза сохранена!*\n\n"
-            f"📅 Въезд: {entry_date}\n"
-            f"⏳ Срок: {days} дней\n"
-            f"🔴 Истекает: *{visa['expiry_date']}*\n"
-            f"📊 Осталось: *{left} дн.*\n\n"
-            f"Буду напоминать за 14, 7, 3 и 1 день до окончания.",
-            parse_mode="Markdown"
-        )
-        return ConversationHandler.END
-    except ValueError:
-        await update.message.reply_text("❌ Введи целое число от 1 до 365")
-        return ENTER_DAYS
-
-
-async def visa_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != MY_CHAT_ID:
-        return
-    visa = load_visa()
-    if not visa:
-        await update.message.reply_text("Виза не задана. Используй /set")
-        return
-    left = days_left(visa["expiry_date"])
-    if left < 0:
-        emoji = "🚨"
-        status_text = f"ПРОСРОЧЕНА на {abs(left)} дней!"
-    elif left == 0:
-        emoji = "🚨"
-        status_text = "истекает СЕГОДНЯ!"
-    elif left <= 3:
-        emoji = "🔴"
-        status_text = f"осталось *{left} дн.* — срочно!"
-    elif left <= 7:
-        emoji = "🟠"
-        status_text = f"осталось *{left} дн.*"
-    elif left <= 14:
-        emoji = "🟡"
-        status_text = f"осталось *{left} дн.*"
-    else:
-        emoji = "🟢"
-        status_text = f"осталось *{left} дн.*"
-    total = visa["days"]
-    used = total - max(0, left)
-    pct = max(0, min(100, int(used / total * 100)))
-    filled = int(pct / 10)
-    bar = "█" * filled + "░" * (10 - filled)
-    await update.message.reply_text(
-        f"{emoji} *Статус визы*\n\n"
-        f"📅 Въезд: {visa['entry_date']}\n"
-        f"🔴 Истекает: {visa['expiry_date']}\n"
-        f"⏳ {status_text}\n\n"
-        f"`[{bar}]` {pct}% использовано",
-        parse_mode="Markdown"
-    )
-
-
-async def check_visa_reminders(context: ContextTypes.DEFAULT_TYPE):
-    visa = load_visa()
-    if not visa:
-        return
-    left = days_left(visa["expiry_date"])
-    if left in [14, 7, 3, 1]:
-        msgs = {
-            14: "🟡 *Напоминание о визе*\n\nДо конца визы осталось *14 дней*. Начинай думать о продлении.",
-            7: "🟠 *Эй, пора планировать бордер ран!*\n\nДо конца визы осталось *7 дней*.",
-            3: "🔴 *Виза истекает через 3 дня!*\n\nПора планировать бордер ран!",
-            1: "🚨 *Завтра истекает виза!*\n\nОстался *1 день*. Срочно планируй бордер ран или продление!",
-        }
-        await context.bot.send_message(
-            chat_id=MY_CHAT_ID,
-            text=msgs[left] + f"\n\n📅 Истекает: {visa['expiry_date']}",
-            parse_mode="Markdown"
-        )
-    elif left < 0:
-        await context.bot.send_message(
-            chat_id=MY_CHAT_ID,
-            text=f"🚨 *ВИЗА ПРОСРОЧЕНА!*\n\nПросрочка: {abs(left)} дней.\nНемедленно займись легализацией!",
-            parse_mode="Markdown"
-        )
-
-
-
+# Состояния диалогов
 Q1, Q2, Q3, Q4, Q5 = range(5)
+ENTER_DATE, ENTER_EXPIRY = range(2)
 
 QUESTIONS = [
     "🌙 Как прошёл сегодняшний день? Что запомнилось больше всего?",
@@ -252,8 +86,7 @@ def get_yesterday_plan():
 
 def get_monthly_gratitude_summary():
     journal = load_journal()
-    now = datetime.now(TIMEZONE)
-    current_month = now.strftime("%Y-%m")
+    current_month = datetime.now(TIMEZONE).strftime("%Y-%m")
     entries = []
     for date_str, entry in journal.items():
         if date_str.startswith(current_month):
@@ -272,16 +105,8 @@ def make_gratitude_summary(entries, month_name):
         try:
             response = requests.post(
                 "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": anthropic_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": "claude-haiku-4-5-20251001",
-                    "max_tokens": 500,
-                    "messages": [{"role": "user", "content": f"Вот записи благодарности за {month_name}:\n{all_text}\n\nСделай тезисную сводку: кому благодарил чаще всего, за что, общий тон. 5-8 предложений."}]
-                },
+                headers={"x-api-key": anthropic_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={"model": "claude-haiku-4-5-20251001", "max_tokens": 500, "messages": [{"role": "user", "content": f"Записи благодарности за {month_name}:\n{all_text}\n\nТезисная сводка: кому благодарил чаще, за что, общий тон. 5-8 предложений."}]},
                 timeout=30,
             )
             summary = response.json()["content"][0]["text"]
@@ -357,7 +182,7 @@ async def answer_plan_review(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Диалог отменён.")
+    await update.message.reply_text("Отменено.")
     return ConversationHandler.END
 
 
@@ -442,7 +267,7 @@ def format_rates(rates):
         return "❌ Не удалось получить курсы."
     now = datetime.now(TIMEZONE).strftime("%d.%m.%Y %H:%M")
     btc_str = f"{rates['btc_usd']:,.0f}".replace(",", " ")
-    return (f"📊 *Курсы на {now}*\n\n₿ *Bitcoin:* `${btc_str}`\n💵 *Доллар:* `{rates['rub_per_usd']:.2f} ₽`\n🇹🇭 *Бат:* `{rates['rub_per_thb']:.2f} ₽`\n")
+    return f"📊 *Курсы на {now}*\n\n₿ *Bitcoin:* `${btc_str}`\n💵 *Доллар:* `{rates['rub_per_usd']:.2f} ₽`\n🇹🇭 *Бат:* `{rates['rub_per_thb']:.2f} ₽`\n"
 
 
 async def rates_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -607,6 +432,154 @@ async def monthly_movies(context: ContextTypes.DEFAULT_TYPE):
 
 
 # =====================
+# ВИЗОВЫЙ БУДИЛЬНИК
+# =====================
+
+def load_visa():
+    if not os.path.exists(VISA_FILE):
+        return None
+    with open(VISA_FILE, "r") as f:
+        return json.load(f)
+
+
+def save_visa(entry_date, expiry_date):
+    entry = datetime.strptime(entry_date, "%d.%m.%Y")
+    expiry = datetime.strptime(expiry_date, "%d.%m.%Y")
+    days = (expiry - entry).days
+    data = {"entry_date": entry_date, "expiry_date": expiry_date, "days": days}
+    with open(VISA_FILE, "w") as f:
+        json.dump(data, f)
+    return data
+
+
+def days_left(expiry_date_str):
+    expiry = datetime.strptime(expiry_date_str, "%d.%m.%Y")
+    today = datetime.now(TIMEZONE).replace(tzinfo=None)
+    return (expiry - today).days
+
+
+async def visa_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+    visa = load_visa()
+    text = "🇹🇭 *Визовый будильник*\n\n/set — задать визу\n/vstatus — статус визы\n"
+    if visa:
+        left = days_left(visa["expiry_date"])
+        text += f"\n📅 Виза истекает: *{visa['expiry_date']}*\nОсталось: *{left} дн.*"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def set_visa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+    await update.message.reply_text(
+        "📅 Введи дату въезда в формате ДД.ММ.ГГГГ\nНапример: `15.05.2026`",
+        parse_mode="Markdown"
+    )
+    return ENTER_DATE
+
+
+async def enter_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    try:
+        datetime.strptime(text, "%d.%m.%Y")
+        context.user_data["entry_date"] = text
+        await update.message.reply_text(
+            "✅ Дата въезда принята.\n\nТеперь введи дату окончания штампа в формате ДД.ММ.ГГГГ\nНапример: `14.06.2026`",
+            parse_mode="Markdown"
+        )
+        return ENTER_EXPIRY
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат. Введи дату в формате ДД.ММ.ГГГГ")
+        return ENTER_DATE
+
+
+async def enter_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    try:
+        expiry = datetime.strptime(text, "%d.%m.%Y")
+        entry_date = context.user_data["entry_date"]
+        entry = datetime.strptime(entry_date, "%d.%m.%Y")
+        if expiry <= entry:
+            await update.message.reply_text("❌ Дата окончания должна быть позже даты въезда.")
+            return ENTER_EXPIRY
+        visa = save_visa(entry_date, text)
+        left = days_left(visa["expiry_date"])
+        await update.message.reply_text(
+            f"✅ *Виза сохранена!*\n\n"
+            f"📅 Въезд: {entry_date}\n"
+            f"🔴 Истекает: *{text}*\n"
+            f"⏳ Срок: {visa['days']} дней\n"
+            f"📊 Осталось: *{left} дн.*\n\n"
+            f"Буду напоминать за 14, 7, 3 и 1 день до окончания.",
+            parse_mode="Markdown"
+        )
+        return ConversationHandler.END
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат. Введи дату в формате ДД.ММ.ГГГГ")
+        return ENTER_EXPIRY
+
+
+async def vstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+    visa = load_visa()
+    if not visa:
+        await update.message.reply_text("Виза не задана. Используй /set")
+        return
+    left = days_left(visa["expiry_date"])
+    if left < 0:
+        emoji, status_text = "🚨", f"ПРОСРОЧЕНА на {abs(left)} дней!"
+    elif left == 0:
+        emoji, status_text = "🚨", "истекает СЕГОДНЯ!"
+    elif left <= 3:
+        emoji, status_text = "🔴", f"осталось *{left} дн.* — срочно!"
+    elif left <= 7:
+        emoji, status_text = "🟠", f"осталось *{left} дн.*"
+    elif left <= 14:
+        emoji, status_text = "🟡", f"осталось *{left} дн.*"
+    else:
+        emoji, status_text = "🟢", f"осталось *{left} дн.*"
+    total = visa["days"]
+    used = total - max(0, left)
+    pct = max(0, min(100, int(used / total * 100)))
+    bar = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
+    await update.message.reply_text(
+        f"{emoji} *Статус визы*\n\n"
+        f"📅 Въезд: {visa['entry_date']}\n"
+        f"🔴 Истекает: {visa['expiry_date']}\n"
+        f"⏳ {status_text}\n\n"
+        f"`[{bar}]` {pct}% использовано",
+        parse_mode="Markdown"
+    )
+
+
+async def check_visa_reminders(context: ContextTypes.DEFAULT_TYPE):
+    visa = load_visa()
+    if not visa:
+        return
+    left = days_left(visa["expiry_date"])
+    msgs = {
+        14: "🟡 *Напоминание о визе*\n\nДо конца визы осталось *14 дней*. Начинай думать о продлении.",
+        7: "🟠 *Эй, пора планировать бордер ран!*\n\nДо конца визы осталось *7 дней*.",
+        3: "🔴 *Виза истекает через 3 дня!*\n\nПора планировать бордер ран!",
+        1: "🚨 *Завтра истекает виза!*\n\nОстался *1 день*. Срочно планируй бордер ран или продление!",
+    }
+    if left in msgs:
+        await context.bot.send_message(
+            chat_id=MY_CHAT_ID,
+            text=msgs[left] + f"\n\n📅 Истекает: {visa['expiry_date']}",
+            parse_mode="Markdown"
+        )
+    elif left < 0:
+        await context.bot.send_message(
+            chat_id=MY_CHAT_ID,
+            text=f"🚨 *ВИЗА ПРОСРОЧЕНА!*\n\nПросрочка: {abs(left)} дней.",
+            parse_mode="Markdown"
+        )
+
+
+# =====================
 # ЗАПУСК
 # =====================
 
@@ -633,7 +606,7 @@ async def main():
     reflection_app.job_queue.run_daily(evening_questions, time=dtime(hour=21, minute=0, tzinfo=TIMEZONE))
     reflection_app.job_queue.run_monthly(monthly_gratitude_report, when=dtime(hour=9, tzinfo=TIMEZONE), day=1)
 
-    # Бот курсов (Bybit токен)
+    # Бот курсов
     rates_app = Application.builder().token(BYBIT_BOT_TOKEN).build()
     rates_app.add_handler(CommandHandler("start", bybit_start))
     rates_app.add_handler(CommandHandler("rates", rates_command))
@@ -646,19 +619,18 @@ async def main():
     cinema_app.job_queue.run_daily(weekly_movies, time=dtime(hour=22, minute=0, tzinfo=TIMEZONE), days=(5,))
     cinema_app.job_queue.run_monthly(monthly_movies, when=dtime(hour=20, tzinfo=TIMEZONE), day=1)
 
-    # Убираем кино из бота саморефлексии
     # Визовый бот
-    visa_app = Application.builder().token(os.environ.get("VISA_BOT_TOKEN")).build()
+    visa_app = Application.builder().token(VISA_BOT_TOKEN).build()
     visa_conv = ConversationHandler(
         entry_points=[CommandHandler("set", set_visa)],
         states={
             ENTER_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_date)],
-            ENTER_DAYS: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_days)],
+            ENTER_EXPIRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_expiry)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     visa_app.add_handler(CommandHandler("start", visa_start))
-    visa_app.add_handler(CommandHandler("status", visa_status))
+    visa_app.add_handler(CommandHandler("vstatus", vstatus))
     visa_app.add_handler(visa_conv)
     visa_app.job_queue.run_daily(check_visa_reminders, time=dtime(hour=10, minute=0, tzinfo=TIMEZONE))
 
