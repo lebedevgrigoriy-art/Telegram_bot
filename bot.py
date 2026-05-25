@@ -586,7 +586,7 @@ async def check_visa_reminders(context: ContextTypes.DEFAULT_TYPE):
 # TODOIST INBOX
 # =====================
 
-TODOIST_API = "https://api.todoist.com/rest/v2"
+TODOIST_API = "https://api.todoist.com/rest/v1"
 
 
 def add_task(text):
