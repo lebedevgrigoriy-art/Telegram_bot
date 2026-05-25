@@ -686,12 +686,22 @@ async def morning_tasks(context: ContextTypes.DEFAULT_TYPE):
 
 
 
+
+
 # =====================
 # ТРЕКЕР НАКОПЛЕНИЙ
 # =====================
 
 SAVINGS_FILE = "savings.json"
 SAVINGS_GOAL = 10000
+
+MOTIVATIONS = [
+    "Каждый доллар приближает тебя к цели. Так держать! 💪",
+    "Дисциплина сегодня — свобода завтра. Ты молодец! 🔥",
+    "Маленькие шаги ведут к большим результатам. Продолжай! 🚀",
+    "Ты уже ближе к цели, чем вчера. Не останавливайся! ⚡",
+    "Богатство строится по кирпичику. Ты кладёшь свой! 🏆",
+]
 
 
 def load_savings():
@@ -712,49 +722,21 @@ def format_progress(balance, goal=SAVINGS_GOAL):
     bar = "█" * filled + "░" * (20 - filled)
     remaining = max(0, goal - balance)
     return (
-        f"💰 *Накопления*
-
-"
-        f"`[{bar}]`
-"
-        f"📊 {pct}% выполнено
-"
-        f"💵 Накоплено: `{balance:.2f} USDT`
-"
-        f"🎯 Цель: `{goal} USDT`
-"
+        "💰 *Накопления*\n\n"
+        f"`[{bar}]`\n"
+        f"📊 {pct}% выполнено\n"
+        f"💵 Накоплено: `{balance:.2f} USDT`\n"
+        f"🎯 Цель: `{goal} USDT`\n"
         f"⏳ Осталось: `{remaining:.2f} USDT`"
     )
-
-
-MOTIVATIONS = [
-    "Каждый доллар приближает тебя к цели. Так держать! 💪",
-    "Дисциплина сегодня — свобода завтра. Ты молодец! 🔥",
-    "Маленькие шаги ведут к большим результатам. Продолжай! 🚀",
-    "Ты уже ближе к цели, чем вчера. Не останавливайся! ⚡",
-    "Богатство строится по кирпичику. Ты кладёшь свой! 🏆",
-]
 
 
 async def savings_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MY_CHAT_ID:
         return
     data = load_savings()
-    text = (
-        "💰 *Трекер накоплений*
-
-"
-        "Команды:
-"
-        "/balance — текущий баланс
-
-"
-        "Пополнение: напиши `+100`
-"
-        "Списание: напиши `-50`
-
-"
-    ) + format_progress(data["balance"])
+    text = "💰 *Трекер накоплений*\n\nКоманды:\n/balance — текущий баланс\n\nПополнение: напиши `+100`\nСписание: напиши `-50`\n\n"
+    text += format_progress(data["balance"])
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
@@ -769,68 +751,44 @@ async def savings_handle_message(update: Update, context: ContextTypes.DEFAULT_T
     if update.effective_chat.id != MY_CHAT_ID:
         return
     text = update.message.text.strip()
-    
-    # Проверяем формат +100 или -50
     if not (text.startswith("+") or text.startswith("-")):
         await update.message.reply_text("Напиши `+100` чтобы пополнить или `-50` чтобы списать.", parse_mode="Markdown")
         return
-    
     try:
         amount = float(text)
     except ValueError:
         await update.message.reply_text("❌ Неверный формат. Напиши `+100` или `-50`", parse_mode="Markdown")
         return
-
     data = load_savings()
     old_balance = data["balance"]
     new_balance = old_balance + amount
-    
     if new_balance < 0:
         await update.message.reply_text("❌ Баланс не может быть отрицательным.")
         return
-    
     save_savings(new_balance)
-    
-    # Проверяем достижение цели
     if old_balance < SAVINGS_GOAL and new_balance >= SAVINGS_GOAL:
-        await update.message.reply_text(
-            f"🎉🏆 *ЦЕЛЬ ДОСТИГНУТА!* 🏆🎉
-
-"
-            f"Ты накопил `{new_balance:.2f} USDT` из `{SAVINGS_GOAL} USDT`!
-
-"
-            f"Это невероятно! Ты доказал себе, что дисциплина и терпение работают. "
-            f"Ты заслужил это! 🚀💪",
-            parse_mode="Markdown"
+        msg = (
+            "🎉🏆 *ЦЕЛЬ ДОСТИГНУТА!* 🏆🎉\n\n"
+            f"Ты накопил `{new_balance:.2f} USDT` из `{SAVINGS_GOAL} USDT`!\n\n"
+            "Это невероятно! Ты доказал себе, что дисциплина и терпение работают. Ты заслужил это! 🚀💪"
         )
+        await update.message.reply_text(msg, parse_mode="Markdown")
         return
-
     import random
     motivation = random.choice(MOTIVATIONS)
-    action = "пополнено" if amount > 0 else "списано"
-    
-    text = (
-        f"{'✅' if amount > 0 else '📤'} {action.capitalize()} `{abs(amount):.2f} USDT`
-
-"
-        + format_progress(new_balance) + f"
-
-_{motivation}_"
-    )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    action = "Пополнено" if amount > 0 else "Списано"
+    emoji = "✅" if amount > 0 else "📤"
+    msg = f"{emoji} {action} `{abs(amount):.2f} USDT`\n\n" + format_progress(new_balance) + f"\n\n_{motivation}_"
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 async def weekly_savings_report(context: ContextTypes.DEFAULT_TYPE):
     import random
     data = load_savings()
     motivation = random.choice(MOTIVATIONS)
-    text = "📅 *Еженедельный отчёт по накоплениям*
-
-" + format_progress(data["balance"]) + f"
-
-_{motivation}_"
+    text = "📅 *Еженедельный отчёт по накоплениям*\n\n" + format_progress(data["balance"]) + f"\n\n_{motivation}_"
     await context.bot.send_message(chat_id=MY_CHAT_ID, text=text, parse_mode="Markdown")
+
 
 # =====================
 # ЗАПУСК
