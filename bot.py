@@ -55,11 +55,14 @@ def load_visa():
         return json.load(f)
 
 
-def save_visa(entry_date, days):
+def save_visa(entry_date, expiry_date):
+    entry = datetime.strptime(entry_date, "%d.%m.%Y")
+    expiry = datetime.strptime(expiry_date, "%d.%m.%Y")
+    days = (expiry - entry).days
     data = {
         "entry_date": entry_date,
         "days": days,
-        "expiry_date": (datetime.strptime(entry_date, "%d.%m.%Y") + timedelta(days=days)).strftime("%d.%m.%Y"),
+        "expiry_date": expiry_date,
     }
     with open(VISA_FILE, "w") as f:
         json.dump(data, f)
