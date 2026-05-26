@@ -2,9 +2,12 @@ import os
 import json
 import logging
 import requests
+import random
 from datetime import datetime, timedelta, time as dtime
 import pytz
 import asyncio
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 from telegram import Update
 from telegram.ext import (
@@ -24,6 +27,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Токены ботов
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 MY_CHAT_ID = int(os.environ.get("MY_CHAT_ID"))
 BYBIT_BOT_TOKEN = os.environ.get("BYBIT_BOT_TOKEN")
@@ -35,16 +39,17 @@ TODOIST_TOKEN = os.environ.get("TODOIST_TOKEN")
 SAVINGS_BOT_TOKEN = os.environ.get("SAVINGS_BOT_TOKEN")
 BOOKS_BOT_TOKEN = os.environ.get("BOOKS_BOT_TOKEN")
 GOOGLE_BOOKS_API_KEY = os.environ.get("GOOGLE_BOOKS_API_KEY", "")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+TMDB_BASE = "https://api.themoviedb.org/3"
+TMDB_IMG = "https://image.tmdb.org/t/p/w500"
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY")
 OMDB_API_KEY = os.environ.get("OMDB_API_KEY")
 KP_API_KEY = os.environ.get("KP_API_KEY")
 
-TMDB_BASE = "https://api.themoviedb.org/3"
-TMDB_IMG = "https://image.tmdb.org/t/p/w500"
-JOURNAL_FILE = "journal.json"
-VISA_FILE = "visa.json"
+SAVINGS_GOAL = 10000
+TODOIST_API = "https://api.todoist.com/api/v1"
 
-# Состояния диалогов
 Q1, Q2, Q3, Q4, Q5 = range(5)
 ENTER_DATE, ENTER_EXPIRY = range(2)
 
@@ -55,50 +60,366 @@ QUESTIONS = [
     "🗓 Какой у тебя план на завтра? Три главных дела.",
 ]
 
+MOTIVATIONS = [
+    "Каждый доллар приближает тебя к цели. Так держать! 💪",
+    "Дисциплина сегодня — свобода завтра. Ты молодец! 🔥",
+    "Маленькие шаги ведут к большим результатам. Продолжай! 🚀",
+    "Ты уже ближе к цели, чем вчера. Не останавливайся! ⚡",
+    "Богатство строится по кирпичику. Ты кладёшь свой! 🏆",
+]
+
+BOOKS_GENRE_QUERIES = [
+    "бизнес литература",
+    "психология успех",
+    "личные финансы инвестиции",
+    "нон-фикшн",
+    "ресторанный бизнес",
+]
+
+
+# =====================
+# БАЗА ДАННЫХ
+# =====================
+
+def get_db():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+
+
+def init_db():
+    """Создаём таблицы если не существуют."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS journal (
+            date TEXT PRIMARY KEY,
+            saved_at TEXT,
+            day_text TEXT,
+            gratitude TEXT,
+            lesson TEXT,
+            plan TEXT,
+            plan_review TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS visa (
+            id INTEGER PRIMARY KEY DEFAULT 1,
+            entry_date TEXT,
+            expiry_date TEXT,
+            days INTEGER
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS savings (
+            id INTEGER PRIMARY KEY DEFAULT 1,
+            balance REAL DEFAULT 0
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS books_topic (
+            month TEXT PRIMARY KEY,
+            topic TEXT
+        )
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
+    logger.info("База данных инициализирована.")
+
 
 # =====================
 # ЖУРНАЛ РЕФЛЕКСИИ
 # =====================
 
-def load_journal():
-    if not os.path.exists(JOURNAL_FILE):
-        return {}
-    with open(JOURNAL_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
 def save_entry(date_str, answers):
-    journal = load_journal()
-    journal[date_str] = {
-        "date": date_str,
-        "saved_at": datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M"),
-        "answers": answers,
-    }
-    with open(JOURNAL_FILE, "w", encoding="utf-8") as f:
-        json.dump(journal, f, ensure_ascii=False, indent=2)
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO journal (date, saved_at, day_text, gratitude, lesson, plan, plan_review)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (date) DO UPDATE SET
+            saved_at = EXCLUDED.saved_at,
+            day_text = EXCLUDED.day_text,
+            gratitude = EXCLUDED.gratitude,
+            lesson = EXCLUDED.lesson,
+            plan = EXCLUDED.plan,
+            plan_review = EXCLUDED.plan_review
+    """, (
+        date_str,
+        datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M"),
+        answers.get("day", ""),
+        answers.get("gratitude", ""),
+        answers.get("lesson", ""),
+        answers.get("plan", ""),
+        answers.get("plan_review", ""),
+    ))
+    conn.commit()
+    cur.close()
+    conn.close()
 
 
 def get_yesterday_plan():
-    journal = load_journal()
+    conn = get_db()
+    cur = conn.cursor()
     today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
-    for date_str in sorted(journal.keys(), reverse=True):
-        if date_str < today:
-            plan = journal[date_str].get("answers", {}).get("plan", "")
-            if plan:
-                return date_str, plan
+    cur.execute("SELECT date, plan FROM journal WHERE date < %s AND plan != '' ORDER BY date DESC LIMIT 1", (today,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    if row:
+        return row["date"], row["plan"]
     return None, None
 
 
-def get_monthly_gratitude_summary():
-    journal = load_journal()
-    current_month = datetime.now(TIMEZONE).strftime("%Y-%m")
-    entries = []
-    for date_str, entry in journal.items():
-        if date_str.startswith(current_month):
-            g = entry.get("answers", {}).get("gratitude", "")
-            if g:
-                entries.append((date_str, g))
-    return entries
+def get_monthly_gratitude():
+    conn = get_db()
+    cur = conn.cursor()
+    month = datetime.now(TIMEZONE).strftime("%Y-%m")
+    cur.execute("SELECT date, gratitude FROM journal WHERE date LIKE %s AND gratitude != '' ORDER BY date", (f"{month}%",))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [(r["date"], r["gratitude"]) for r in rows]
+
+
+def get_journal_history():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM journal ORDER BY date DESC LIMIT 7")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
+
+
+# =====================
+# ВИЗА
+# =====================
+
+def save_visa(entry_date, expiry_date):
+    entry = datetime.strptime(entry_date, "%d.%m.%Y")
+    expiry = datetime.strptime(expiry_date, "%d.%m.%Y")
+    days = (expiry - entry).days
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO visa (id, entry_date, expiry_date, days) VALUES (1, %s, %s, %s)
+        ON CONFLICT (id) DO UPDATE SET entry_date=EXCLUDED.entry_date, expiry_date=EXCLUDED.expiry_date, days=EXCLUDED.days
+    """, (entry_date, expiry_date, days))
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"entry_date": entry_date, "expiry_date": expiry_date, "days": days}
+
+
+def load_visa():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM visa WHERE id = 1")
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return dict(row) if row else None
+
+
+def days_left(expiry_date_str):
+    expiry = datetime.strptime(expiry_date_str, "%d.%m.%Y")
+    today = datetime.now(TIMEZONE).replace(tzinfo=None)
+    return (expiry - today).days
+
+
+# =====================
+# НАКОПЛЕНИЯ
+# =====================
+
+def load_savings():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT balance FROM savings WHERE id = 1")
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row["balance"] if row else 0
+
+
+def save_savings_balance(balance):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO savings (id, balance) VALUES (1, %s)
+        ON CONFLICT (id) DO UPDATE SET balance = EXCLUDED.balance
+    """, (balance,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def format_progress(balance, goal=SAVINGS_GOAL):
+    pct = min(100, int(balance / goal * 100))
+    filled = int(pct / 5)
+    bar = "█" * filled + "░" * (20 - filled)
+    remaining = max(0, goal - balance)
+    return "\n".join([
+        "💰 *Накопления*",
+        "",
+        f"`[{bar}]`",
+        f"📊 {pct}% выполнено",
+        f"💵 Накоплено: `{balance:.2f} USDT`",
+        f"🎯 Цель: `{goal} USDT`",
+        f"⏳ Осталось: `{remaining:.2f} USDT`",
+    ])
+
+
+# =====================
+# КНИГИ
+# =====================
+
+def load_monthly_topic():
+    conn = get_db()
+    cur = conn.cursor()
+    month = datetime.now(TIMEZONE).strftime("%Y-%m")
+    cur.execute("SELECT topic FROM books_topic WHERE month = %s", (month,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row["topic"] if row else None
+
+
+def save_monthly_topic(topic):
+    conn = get_db()
+    cur = conn.cursor()
+    month = datetime.now(TIMEZONE).strftime("%Y-%m")
+    cur.execute("""
+        INSERT INTO books_topic (month, topic) VALUES (%s, %s)
+        ON CONFLICT (month) DO UPDATE SET topic = EXCLUDED.topic
+    """, (month, topic))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def get_new_books(query, max_results=5):
+    try:
+        params = {
+            "q": query,
+            "langRestrict": "ru",
+            "orderBy": "newest",
+            "maxResults": max_results,
+            "printType": "books",
+        }
+        if GOOGLE_BOOKS_API_KEY:
+            params["key"] = GOOGLE_BOOKS_API_KEY
+        resp = requests.get("https://www.googleapis.com/books/v1/volumes", params=params, timeout=10)
+        items = resp.json().get("items", [])
+        books = []
+        for item in items:
+            info = item.get("volumeInfo", {})
+            description = info.get("description", "")
+            if description and len(description) > 150:
+                description = description[:150] + "..."
+            books.append({
+                "title": info.get("title", "—"),
+                "authors": ", ".join(info.get("authors", ["—"])),
+                "description": description,
+                "rating": info.get("averageRating"),
+                "ratings_count": info.get("ratingsCount", 0),
+                "published": info.get("publishedDate", "")[:4],
+                "link": info.get("infoLink", ""),
+                "thumbnail": info.get("imageLinks", {}).get("thumbnail", ""),
+            })
+        return books
+    except Exception as e:
+        logger.error(f"Google Books error: {e}")
+        return []
+
+
+def format_book(book, num):
+    text = f"*{num}. {book['title']}*\n"
+    text += f"✍️ {book['authors']}\n"
+    if book.get("published"):
+        text += f"📅 {book['published']}\n"
+    if book.get("description"):
+        text += f"📝 {book['description']}\n"
+    if book.get("rating"):
+        text += f"⭐ {book['rating']}/5 ({book['ratings_count']} оценок)\n"
+    if book.get("link"):
+        text += f"🔗 [Подробнее]({book['link']})\n"
+    return text
+
+
+async def send_weekly_books(bot, chat_id):
+    all_books = []
+    seen_titles = set()
+    for query in BOOKS_GENRE_QUERIES:
+        books = get_new_books(query, max_results=3)
+        for book in books:
+            if book["title"] not in seen_titles:
+                seen_titles.add(book["title"])
+                all_books.append(book)
+        if len(all_books) >= 10:
+            break
+
+    if not all_books:
+        await bot.send_message(chat_id=chat_id, text="❌ Не удалось получить книги. Попробуй позже.")
+        return
+
+    now = datetime.now(TIMEZONE).strftime("%d.%m.%Y")
+    await bot.send_message(chat_id=chat_id, text=f"📚 *Книжные новинки на {now}*\n\nБизнес, психология, финансы, нон-фикшн", parse_mode="Markdown")
+
+    for i, book in enumerate(all_books[:10], 1):
+        text = format_book(book, i)
+        try:
+            thumbnail = book.get("thumbnail", "")
+            if thumbnail:
+                thumbnail = thumbnail.replace("http://", "https://").replace("zoom=1", "zoom=3")
+                await bot.send_photo(chat_id=chat_id, photo=thumbnail, caption=text, parse_mode="Markdown")
+            else:
+                await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Error sending book: {e}")
+            try:
+                await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+            except Exception:
+                pass
+        await asyncio.sleep(0.5)
+
+
+async def send_recommendations(bot, chat_id, topic):
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if anthropic_key:
+        try:
+            response = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": anthropic_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 1000,
+                    "messages": [{"role": "user", "content": f"Порекомендуй 5 лучших книг по теме: {topic}. Для каждой: название, автор, год, краткое описание почему эта книга лучшая. Простой текст без markdown."}]
+                },
+                timeout=30,
+            )
+            text = response.json()["content"][0]["text"]
+            await bot.send_message(chat_id=chat_id, text=f"📚 *Лучшие книги по теме: {topic}*\n\n{text}", parse_mode="Markdown")
+            return
+        except Exception as e:
+            logger.error(f"Claude API error: {e}")
+
+    books = get_new_books(topic, max_results=5)
+    if not books:
+        await bot.send_message(chat_id=chat_id, text=f"❌ Не удалось найти книги по теме: {topic}")
+        return
+    await bot.send_message(chat_id=chat_id, text=f"📚 *Книги по теме: {topic}*", parse_mode="Markdown")
+    for i, book in enumerate(books, 1):
+        text = format_book(book, i)
+        try:
+            thumbnail = book.get("thumbnail", "")
+            if thumbnail:
+                thumbnail = thumbnail.replace("http://", "https://").replace("zoom=1", "zoom=3")
+                await bot.send_photo(chat_id=chat_id, photo=thumbnail, caption=text, parse_mode="Markdown")
+            else:
+                await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+        except Exception:
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+        await asyncio.sleep(0.5)
 
 
 def make_gratitude_summary(entries, month_name):
@@ -122,131 +443,6 @@ def make_gratitude_summary(entries, month_name):
     for date_str, g in entries[-5:]:
         text += f"_{date_str}_: {g[:120]}\n\n"
     return text
-
-
-async def start_reflection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != MY_CHAT_ID:
-        return
-    await update.message.reply_text(
-        "Привет! Я твой бот для рефлексии 🌙\n\n"
-        "/ask — начать рефлексию\n"
-        "/plan — план на сегодня\n"
-        "/history — последние 7 записей\n"
-        "/gratitude — сводка благодарностей"
-    )
-
-
-async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != MY_CHAT_ID:
-        return
-    context.user_data["answers"] = {}
-    context.user_data["date"] = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
-    await update.message.reply_text("Время для вечерней рефлексии ✍️\n\n" + QUESTIONS[0])
-    return Q1
-
-
-async def answer_q1(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["answers"]["day"] = update.message.text
-    await update.message.reply_text(QUESTIONS[1])
-    return Q2
-
-
-async def answer_q2(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["answers"]["gratitude"] = update.message.text
-    await update.message.reply_text(QUESTIONS[2])
-    return Q3
-
-
-async def answer_q3(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["answers"]["lesson"] = update.message.text
-    await update.message.reply_text(QUESTIONS[3])
-    return Q4
-
-
-async def answer_q4(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["answers"]["plan"] = update.message.text
-    date_str, yesterday_plan = get_yesterday_plan()
-    if yesterday_plan:
-        await update.message.reply_text(
-            f"📋 *Твой план со вчера ({date_str}):*\n\n{yesterday_plan}\n\n✅ Удалось выполнить что-то из списка?",
-            parse_mode="Markdown"
-        )
-        return Q5
-    date_str = context.user_data["date"]
-    save_entry(date_str, context.user_data["answers"])
-    await update.message.reply_text(f"✅ Всё записано. Хорошего вечера!\n\nЗапись за {date_str} сохранена.")
-    return ConversationHandler.END
-
-
-async def answer_plan_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["answers"]["plan_review"] = update.message.text
-    date_str = context.user_data["date"]
-    save_entry(date_str, context.user_data["answers"])
-    await update.message.reply_text(f"✅ Всё записано. Хорошего вечера!\n\nЗапись за {date_str} сохранена.")
-    return ConversationHandler.END
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Отменено.")
-    return ConversationHandler.END
-
-
-async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != MY_CHAT_ID:
-        return
-    journal = load_journal()
-    if not journal:
-        await update.message.reply_text("Дневник пока пустой.")
-        return
-    sorted_entries = sorted(journal.items(), reverse=True)[:7]
-    text = "📔 *Последние записи:*\n\n"
-    for date_str, entry in sorted_entries:
-        answers = entry.get("answers", {})
-        text += f"*{date_str}*\n"
-        if answers.get("plan_review"):
-            text += f"✅ {answers.get('plan_review')}\n"
-        text += f"🌙 {answers.get('day', '—')}\n"
-        text += f"🙏 {answers.get('gratitude', '—')}\n"
-        text += f"📖 {answers.get('lesson', '—')}\n"
-        text += f"🗓 {answers.get('plan', '—')}\n"
-        text += "─────────────\n"
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-
-async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != MY_CHAT_ID:
-        return
-    date_str, plan = get_yesterday_plan()
-    if plan:
-        await update.message.reply_text(f"📋 *План на сегодня:*\n\n{plan}", parse_mode="Markdown")
-    else:
-        await update.message.reply_text("Плана нет — вчера не было записи.")
-
-
-async def gratitude_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != MY_CHAT_ID:
-        return
-    entries = get_monthly_gratitude_summary()
-    month_name = datetime.now(TIMEZONE).strftime("%B %Y")
-    await update.message.reply_text(make_gratitude_summary(entries, month_name), parse_mode="Markdown")
-
-
-async def morning_reminder(context: ContextTypes.DEFAULT_TYPE):
-    date_str, plan = get_yesterday_plan()
-    if plan:
-        await context.bot.send_message(chat_id=MY_CHAT_ID, text=f"☀️ Доброе утро!\n\n*План на сегодня:*\n\n{plan}", parse_mode="Markdown")
-    else:
-        await context.bot.send_message(chat_id=MY_CHAT_ID, text="☀️ Доброе утро! Плана на сегодня нет.")
-
-
-async def evening_questions(context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_message(chat_id=MY_CHAT_ID, text="Добрый вечер! Время для рефлексии 🌙\n\nНапиши /ask чтобы начать.")
-
-
-async def monthly_gratitude_report(context: ContextTypes.DEFAULT_TYPE):
-    entries = get_monthly_gratitude_summary()
-    month_name = datetime.now(TIMEZONE).strftime("%B %Y")
-    await context.bot.send_message(chat_id=MY_CHAT_ID, text=make_gratitude_summary(entries, month_name), parse_mode="Markdown")
 
 
 # =====================
@@ -275,24 +471,8 @@ def format_rates(rates):
     return f"📊 *Курсы на {now}*\n\n₿ *Bitcoin:* `${btc_str}`\n💵 *Доллар:* `{rates['rub_per_usd']:.2f} ₽`\n🇹🇭 *Бат:* `{rates['rub_per_thb']:.2f} ₽`\n"
 
 
-async def rates_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != BYBIT_CHAT_ID:
-        return
-    await update.message.reply_text(format_rates(get_rates()), parse_mode="Markdown")
-
-
-async def bybit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != BYBIT_CHAT_ID:
-        return
-    await update.message.reply_text("Привет! Я слежу за курсами 📊\n\nКаждое утро в 08:00 присылаю курсы.\n\n/rates — курсы прямо сейчас")
-
-
-async def morning_rates(context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_message(chat_id=BYBIT_CHAT_ID, text="☀️ *Доброе утро!*\n\n" + format_rates(get_rates()), parse_mode="Markdown")
-
-
 # =====================
-# КИНО БОТ
+# КИНО
 # =====================
 
 def get_new_movies(limit=8):
@@ -411,10 +591,196 @@ async def send_movies(bot, chat_id, period_label="недели"):
             continue
 
 
+# =====================
+# TODOIST
+# =====================
+
+def add_task(text):
+    resp = requests.post(
+        f"{TODOIST_API}/tasks",
+        headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
+        json={"content": text},
+        timeout=10,
+    )
+    logger.info(f"Todoist: {resp.status_code}")
+    return resp.status_code == 200
+
+
+def get_today_tasks():
+    resp = requests.get(
+        f"{TODOIST_API}/tasks",
+        headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
+        params={"filter": "today | overdue"},
+        timeout=10,
+    )
+    return resp.json() if resp.status_code == 200 else []
+
+
+def format_tasks(tasks):
+    if not tasks:
+        return "✅ На сегодня задач нет!"
+    text = f"📋 *Задачи на сегодня ({len(tasks)}):*\n\n"
+    for i, task in enumerate(tasks, 1):
+        priority_emoji = {1: "", 2: "🔵", 3: "🟡", 4: "🔴"}.get(task.get("priority", 1), "")
+        text += f"{i}. {priority_emoji} {task['content']}\n"
+    return text
+
+
+# =====================
+# ХЕНДЛЕРЫ — РЕФЛЕКСИЯ
+# =====================
+
+async def start_reflection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+    await update.message.reply_text(
+        "Привет! Я твой бот для рефлексии 🌙\n\n"
+        "/ask — начать рефлексию\n"
+        "/plan — план на сегодня\n"
+        "/history — последние 7 записей\n"
+        "/gratitude — сводка благодарностей"
+    )
+
+
+async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+    context.user_data["answers"] = {}
+    context.user_data["date"] = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
+    await update.message.reply_text("Время для вечерней рефлексии ✍️\n\n" + QUESTIONS[0])
+    return Q1
+
+
+async def answer_q1(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["answers"]["day"] = update.message.text
+    await update.message.reply_text(QUESTIONS[1])
+    return Q2
+
+
+async def answer_q2(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["answers"]["gratitude"] = update.message.text
+    await update.message.reply_text(QUESTIONS[2])
+    return Q3
+
+
+async def answer_q3(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["answers"]["lesson"] = update.message.text
+    await update.message.reply_text(QUESTIONS[3])
+    return Q4
+
+
+async def answer_q4(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["answers"]["plan"] = update.message.text
+    date_str, yesterday_plan = get_yesterday_plan()
+    if yesterday_plan:
+        await update.message.reply_text(
+            f"📋 *Твой план со вчера ({date_str}):*\n\n{yesterday_plan}\n\n✅ Удалось выполнить что-то из списка?",
+            parse_mode="Markdown"
+        )
+        return Q5
+    date_str = context.user_data["date"]
+    save_entry(date_str, context.user_data["answers"])
+    await update.message.reply_text(f"✅ Всё записано. Хорошего вечера!\n\nЗапись за {date_str} сохранена.")
+    return ConversationHandler.END
+
+
+async def answer_plan_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["answers"]["plan_review"] = update.message.text
+    date_str = context.user_data["date"]
+    save_entry(date_str, context.user_data["answers"])
+    await update.message.reply_text(f"✅ Всё записано. Хорошего вечера!\n\nЗапись за {date_str} сохранена.")
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Отменено.")
+    return ConversationHandler.END
+
+
+async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+    rows = get_journal_history()
+    if not rows:
+        await update.message.reply_text("Дневник пока пустой.")
+        return
+    text = "📔 *Последние записи:*\n\n"
+    for row in rows:
+        text += f"*{row['date']}*\n"
+        if row.get("plan_review"):
+            text += f"✅ {row['plan_review']}\n"
+        text += f"🌙 {row.get('day_text') or '—'}\n"
+        text += f"🙏 {row.get('gratitude') or '—'}\n"
+        text += f"📖 {row.get('lesson') or '—'}\n"
+        text += f"🗓 {row.get('plan') or '—'}\n"
+        text += "─────────────\n"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+    date_str, plan = get_yesterday_plan()
+    if plan:
+        await update.message.reply_text(f"📋 *План на сегодня:*\n\n{plan}", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("Плана нет — вчера не было записи.")
+
+
+async def gratitude_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+    entries = get_monthly_gratitude()
+    month_name = datetime.now(TIMEZONE).strftime("%B %Y")
+    await update.message.reply_text(make_gratitude_summary(entries, month_name), parse_mode="Markdown")
+
+
+async def morning_reminder(context: ContextTypes.DEFAULT_TYPE):
+    date_str, plan = get_yesterday_plan()
+    if plan:
+        await context.bot.send_message(chat_id=MY_CHAT_ID, text=f"☀️ Доброе утро!\n\n*План на сегодня:*\n\n{plan}", parse_mode="Markdown")
+    else:
+        await context.bot.send_message(chat_id=MY_CHAT_ID, text="☀️ Доброе утро! Плана на сегодня нет.")
+
+
+async def evening_questions(context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_message(chat_id=MY_CHAT_ID, text="Добрый вечер! Время для рефлексии 🌙\n\nНапиши /ask чтобы начать.")
+
+
+async def monthly_gratitude_report(context: ContextTypes.DEFAULT_TYPE):
+    entries = get_monthly_gratitude()
+    month_name = datetime.now(TIMEZONE).strftime("%B %Y")
+    await context.bot.send_message(chat_id=MY_CHAT_ID, text=make_gratitude_summary(entries, month_name), parse_mode="Markdown")
+
+
+# =====================
+# ХЕНДЛЕРЫ — КУРСЫ
+# =====================
+
+async def rates_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != BYBIT_CHAT_ID:
+        return
+    await update.message.reply_text(format_rates(get_rates()), parse_mode="Markdown")
+
+
+async def bybit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != BYBIT_CHAT_ID:
+        return
+    await update.message.reply_text("Привет! Я слежу за курсами 📊\n\nКаждое утро в 08:00 присылаю курсы.\n\n/rates — курсы прямо сейчас")
+
+
+async def morning_rates(context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_message(chat_id=BYBIT_CHAT_ID, text="☀️ *Доброе утро!*\n\n" + format_rates(get_rates()), parse_mode="Markdown")
+
+
+# =====================
+# ХЕНДЛЕРЫ — КИНО
+# =====================
+
 async def cinema_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MY_CHAT_ID:
         return
-    await update.message.reply_text("Привет! Я слежу за новинками кино 🎬\n\n📅 Каждую субботу в 22:00 — новинки недели\n📅 Первого числа в 20:00 — новинки месяца\n\n/movies — получить подборку прямо сейчас")
+    await update.message.reply_text("Привет! Я слежу за новинками кино 🎬\n\n/movies — получить подборку прямо сейчас")
 
 
 async def movies_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -424,7 +790,6 @@ async def movies_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🎬 Запрашиваю новинки... ⏳")
         await send_movies(context.bot, MY_CHAT_ID, "этой недели")
     except Exception as e:
-        logger.error(f"movies_command error: {e}")
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
@@ -437,31 +802,8 @@ async def monthly_movies(context: ContextTypes.DEFAULT_TYPE):
 
 
 # =====================
-# ВИЗОВЫЙ БУДИЛЬНИК
+# ХЕНДЛЕРЫ — ВИЗА
 # =====================
-
-def load_visa():
-    if not os.path.exists(VISA_FILE):
-        return None
-    with open(VISA_FILE, "r") as f:
-        return json.load(f)
-
-
-def save_visa(entry_date, expiry_date):
-    entry = datetime.strptime(entry_date, "%d.%m.%Y")
-    expiry = datetime.strptime(expiry_date, "%d.%m.%Y")
-    days = (expiry - entry).days
-    data = {"entry_date": entry_date, "expiry_date": expiry_date, "days": days}
-    with open(VISA_FILE, "w") as f:
-        json.dump(data, f)
-    return data
-
-
-def days_left(expiry_date_str):
-    expiry = datetime.strptime(expiry_date_str, "%d.%m.%Y")
-    today = datetime.now(TIMEZONE).replace(tzinfo=None)
-    return (expiry - today).days
-
 
 async def visa_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MY_CHAT_ID:
@@ -477,10 +819,7 @@ async def visa_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_visa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MY_CHAT_ID:
         return
-    await update.message.reply_text(
-        "📅 Введи дату въезда в формате ДД.ММ.ГГГГ\nНапример: `15.05.2026`",
-        parse_mode="Markdown"
-    )
+    await update.message.reply_text("📅 Введи дату въезда в формате ДД.ММ.ГГГГ\nНапример: `15.05.2026`", parse_mode="Markdown")
     return ENTER_DATE
 
 
@@ -489,10 +828,7 @@ async def enter_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         datetime.strptime(text, "%d.%m.%Y")
         context.user_data["entry_date"] = text
-        await update.message.reply_text(
-            "✅ Дата въезда принята.\n\nТеперь введи дату окончания штампа в формате ДД.ММ.ГГГГ\nНапример: `14.06.2026`",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("✅ Дата въезда принята.\n\nТеперь введи дату окончания штампа в формате ДД.ММ.ГГГГ\nНапример: `14.06.2026`", parse_mode="Markdown")
         return ENTER_EXPIRY
     except ValueError:
         await update.message.reply_text("❌ Неверный формат. Введи дату в формате ДД.ММ.ГГГГ")
@@ -511,12 +847,7 @@ async def enter_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         visa = save_visa(entry_date, text)
         left = days_left(visa["expiry_date"])
         await update.message.reply_text(
-            f"✅ *Виза сохранена!*\n\n"
-            f"📅 Въезд: {entry_date}\n"
-            f"🔴 Истекает: *{text}*\n"
-            f"⏳ Срок: {visa['days']} дней\n"
-            f"📊 Осталось: *{left} дн.*\n\n"
-            f"Буду напоминать за 14, 7, 3 и 1 день до окончания.",
+            f"✅ *Виза сохранена!*\n\n📅 Въезд: {entry_date}\n🔴 Истекает: *{text}*\n⏳ Срок: {visa['days']} дней\n📊 Осталось: *{left} дн.*\n\nБуду напоминать за 14, 7, 3 и 1 день.",
             parse_mode="Markdown"
         )
         return ConversationHandler.END
@@ -550,11 +881,7 @@ async def vstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pct = max(0, min(100, int(used / total * 100)))
     bar = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
     await update.message.reply_text(
-        f"{emoji} *Статус визы*\n\n"
-        f"📅 Въезд: {visa['entry_date']}\n"
-        f"🔴 Истекает: {visa['expiry_date']}\n"
-        f"⏳ {status_text}\n\n"
-        f"`[{bar}]` {pct}% использовано",
+        f"{emoji} *Статус визы*\n\n📅 Въезд: {visa['entry_date']}\n🔴 Истекает: {visa['expiry_date']}\n⏳ {status_text}\n\n`[{bar}]` {pct}% использовано",
         parse_mode="Markdown"
     )
 
@@ -571,69 +898,19 @@ async def check_visa_reminders(context: ContextTypes.DEFAULT_TYPE):
         1: "🚨 *Завтра истекает виза!*\n\nОстался *1 день*. Срочно планируй бордер ран или продление!",
     }
     if left in msgs:
-        await context.bot.send_message(
-            chat_id=MY_CHAT_ID,
-            text=msgs[left] + f"\n\n📅 Истекает: {visa['expiry_date']}",
-            parse_mode="Markdown"
-        )
+        await context.bot.send_message(chat_id=MY_CHAT_ID, text=msgs[left] + f"\n\n📅 Истекает: {visa['expiry_date']}", parse_mode="Markdown")
     elif left < 0:
-        await context.bot.send_message(
-            chat_id=MY_CHAT_ID,
-            text=f"🚨 *ВИЗА ПРОСРОЧЕНА!*\n\nПросрочка: {abs(left)} дней.",
-            parse_mode="Markdown"
-        )
-
+        await context.bot.send_message(chat_id=MY_CHAT_ID, text=f"🚨 *ВИЗА ПРОСРОЧЕНА!*\n\nПросрочка: {abs(left)} дней.", parse_mode="Markdown")
 
 
 # =====================
-# TODOIST INBOX
+# ХЕНДЛЕРЫ — TODOIST
 # =====================
-
-TODOIST_API = "https://api.todoist.com/api/v1"
-
-
-def add_task(text):
-    resp = requests.post(
-        f"{TODOIST_API}/tasks",
-        headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
-        json={"content": text},
-        timeout=10,
-    )
-    logger.error(f"Todoist add_task: {resp.status_code} {resp.text}")
-    return resp.status_code == 200
-
-
-def get_today_tasks():
-    resp = requests.get(
-        f"{TODOIST_API}/tasks",
-        headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
-        params={"filter": "today | overdue"},
-        timeout=10,
-    )
-    if resp.status_code == 200:
-        return resp.json()
-    return []
-
-
-def format_tasks(tasks):
-    if not tasks:
-        return "✅ На сегодня задач нет!"
-    text = f"📋 *Задачи на сегодня ({len(tasks)}):*\n\n"
-    for i, task in enumerate(tasks, 1):
-        priority_emoji = {1: "", 2: "🔵", 3: "🟡", 4: "🔴"}.get(task.get("priority", 1), "")
-        text += f"{i}. {priority_emoji} {task['content']}\n"
-    return text
-
 
 async def todoist_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MY_CHAT_ID:
         return
-    await update.message.reply_text(
-        "Привет! Я твой Todoist-помощник 📋\n\n"
-        "Просто напиши мне задачу — я добавлю её в Inbox.\n\n"
-        "/tasks — задачи на сегодня\n"
-        "/inbox — что в Inbox"
-    )
+    await update.message.reply_text("Привет! Я твой Todoist-помощник 📋\n\nПросто напиши задачу — добавлю в Inbox.\n\n/tasks — задачи на сегодня\n/inbox — что в Inbox")
 
 
 async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -646,12 +923,7 @@ async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def inbox_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MY_CHAT_ID:
         return
-    resp = requests.get(
-        f"{TODOIST_API}/tasks",
-        headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
-        params={"filter": "#Inbox"},
-        timeout=10,
-    )
+    resp = requests.get(f"{TODOIST_API}/tasks", headers={"Authorization": f"Bearer {TODOIST_TOKEN}"}, params={"filter": "#Inbox"}, timeout=10)
     tasks = resp.json() if resp.status_code == 200 else []
     if not tasks:
         await update.message.reply_text("📥 Inbox пуст!")
@@ -668,13 +940,7 @@ async def todoist_handle_message(update: Update, context: ContextTypes.DEFAULT_T
     text = update.message.text.strip()
     if not text:
         return
-    resp = requests.post(
-        f"{TODOIST_API}/tasks",
-        headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
-        json={"content": text},
-        timeout=10,
-    )
-    logger.error(f"Todoist response: {resp.status_code} {resp.text}")
+    resp = requests.post(f"{TODOIST_API}/tasks", headers={"Authorization": f"Bearer {TODOIST_TOKEN}"}, json={"content": text}, timeout=10)
     if resp.status_code == 200:
         await update.message.reply_text(f"✅ Добавлено в Inbox:\n_{text}_", parse_mode="Markdown")
     else:
@@ -683,70 +949,27 @@ async def todoist_handle_message(update: Update, context: ContextTypes.DEFAULT_T
 
 async def morning_tasks(context: ContextTypes.DEFAULT_TYPE):
     tasks = get_today_tasks()
-    text = "☀️ *Доброе утро!*\n\n" + format_tasks(tasks)
-    await context.bot.send_message(chat_id=MY_CHAT_ID, text=text, parse_mode="Markdown")
-
-
-
+    await context.bot.send_message(chat_id=MY_CHAT_ID, text="☀️ *Доброе утро!*\n\n" + format_tasks(tasks), parse_mode="Markdown")
 
 
 # =====================
-# ТРЕКЕР НАКОПЛЕНИЙ
+# ХЕНДЛЕРЫ — НАКОПЛЕНИЯ
 # =====================
-
-SAVINGS_FILE = "savings.json"
-SAVINGS_GOAL = 10000
-
-MOTIVATIONS = [
-    "Каждый доллар приближает тебя к цели. Так держать! 💪",
-    "Дисциплина сегодня — свобода завтра. Ты молодец! 🔥",
-    "Маленькие шаги ведут к большим результатам. Продолжай! 🚀",
-    "Ты уже ближе к цели, чем вчера. Не останавливайся! ⚡",
-    "Богатство строится по кирпичику. Ты кладёшь свой! 🏆",
-]
-
-
-def load_savings():
-    if not os.path.exists(SAVINGS_FILE):
-        return {"balance": 0}
-    with open(SAVINGS_FILE, "r") as f:
-        return json.load(f)
-
-
-def save_savings(balance):
-    with open(SAVINGS_FILE, "w") as f:
-        json.dump({"balance": balance}, f)
-
-
-def format_progress(balance, goal=SAVINGS_GOAL):
-    pct = min(100, int(balance / goal * 100))
-    filled = int(pct / 5)
-    bar = "█" * filled + "░" * (20 - filled)
-    remaining = max(0, goal - balance)
-    return (
-        "💰 *Накопления*\n\n"
-        f"`[{bar}]`\n"
-        f"📊 {pct}% выполнено\n"
-        f"💵 Накоплено: `{balance:.2f} USDT`\n"
-        f"🎯 Цель: `{goal} USDT`\n"
-        f"⏳ Осталось: `{remaining:.2f} USDT`"
-    )
-
 
 async def savings_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MY_CHAT_ID:
         return
-    data = load_savings()
+    balance = load_savings()
     text = "💰 *Трекер накоплений*\n\nКоманды:\n/balance — текущий баланс\n\nПополнение: напиши `+100`\nСписание: напиши `-50`\n\n"
-    text += format_progress(data["balance"])
+    text += format_progress(balance)
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MY_CHAT_ID:
         return
-    data = load_savings()
-    await update.message.reply_text(format_progress(data["balance"]), parse_mode="Markdown")
+    balance = load_savings()
+    await update.message.reply_text(format_progress(balance), parse_mode="Markdown")
 
 
 async def savings_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -761,22 +984,15 @@ async def savings_handle_message(update: Update, context: ContextTypes.DEFAULT_T
     except ValueError:
         await update.message.reply_text("❌ Неверный формат. Напиши `+100` или `-50`", parse_mode="Markdown")
         return
-    data = load_savings()
-    old_balance = data["balance"]
+    old_balance = load_savings()
     new_balance = old_balance + amount
     if new_balance < 0:
         await update.message.reply_text("❌ Баланс не может быть отрицательным.")
         return
-    save_savings(new_balance)
+    save_savings_balance(new_balance)
     if old_balance < SAVINGS_GOAL and new_balance >= SAVINGS_GOAL:
-        msg = (
-            "🎉🏆 *ЦЕЛЬ ДОСТИГНУТА!* 🏆🎉\n\n"
-            f"Ты накопил `{new_balance:.2f} USDT` из `{SAVINGS_GOAL} USDT`!\n\n"
-            "Это невероятно! Ты доказал себе, что дисциплина и терпение работают. Ты заслужил это! 🚀💪"
-        )
-        await update.message.reply_text(msg, parse_mode="Markdown")
+        await update.message.reply_text(f"🎉🏆 *ЦЕЛЬ ДОСТИГНУТА!* 🏆🎉\n\nТы накопил `{new_balance:.2f} USDT`!\n\nЭто невероятно! Дисциплина и терпение работают. Ты заслужил это! 🚀💪", parse_mode="Markdown")
         return
-    import random
     motivation = random.choice(MOTIVATIONS)
     action = "Пополнено" if amount > 0 else "Списано"
     emoji = "✅" if amount > 0 else "📤"
@@ -785,124 +1001,20 @@ async def savings_handle_message(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def weekly_savings_report(context: ContextTypes.DEFAULT_TYPE):
-    import random
-    data = load_savings()
+    balance = load_savings()
     motivation = random.choice(MOTIVATIONS)
-    text = "📅 *Еженедельный отчёт по накоплениям*\n\n" + format_progress(data["balance"]) + f"\n\n_{motivation}_"
+    text = "📅 *Еженедельный отчёт по накоплениям*\n\n" + format_progress(balance) + f"\n\n_{motivation}_"
     await context.bot.send_message(chat_id=MY_CHAT_ID, text=text, parse_mode="Markdown")
 
 
-
 # =====================
-# КНИЖНЫЙ БОТ
+# ХЕНДЛЕРЫ — КНИГИ
 # =====================
-
-BOOKS_GENRES = [
-    "бизнес",
-    "нон-фикшн",
-    "психология",
-    "саморазвитие",
-    "финансы",
-    "инвестиции",
-    "ресторанный бизнес",
-]
-
-BOOKS_GENRE_QUERIES = [
-    "бизнес литература",
-    "психология успех",
-    "личные финансы инвестиции",
-    "нон-фикшн",
-    "ресторанный бизнес",
-]
-
-MONTHLY_QUESTION_FILE = "books_monthly.json"
-
-
-def load_monthly_topic():
-    if not os.path.exists(MONTHLY_QUESTION_FILE):
-        return None
-    with open(MONTHLY_QUESTION_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def save_monthly_topic(topic):
-    with open(MONTHLY_QUESTION_FILE, "w", encoding="utf-8") as f:
-        json.dump({"topic": topic, "month": datetime.now(TIMEZONE).strftime("%Y-%m")}, f)
-
-
-def get_new_books(query, max_results=5):
-    try:
-        params = {
-            "q": query + " subject:nonfiction",
-            "langRestrict": "ru",
-            "orderBy": "newest",
-            "maxResults": max_results,
-            "printType": "books",
-        }
-        if GOOGLE_BOOKS_API_KEY:
-            params["key"] = GOOGLE_BOOKS_API_KEY
-
-        resp = requests.get(
-            "https://www.googleapis.com/books/v1/volumes",
-            params=params,
-            timeout=10,
-        )
-        items = resp.json().get("items", [])
-        books = []
-        for item in items:
-            info = item.get("volumeInfo", {})
-            title = info.get("title", "—")
-            authors = ", ".join(info.get("authors", ["—"]))
-            description = info.get("description", "")
-            if description and len(description) > 150:
-                description = description[:150] + "..."
-            rating = info.get("averageRating")
-            ratings_count = info.get("ratingsCount", 0)
-            published = info.get("publishedDate", "")[:4]
-            link = info.get("infoLink", "")
-            thumbnail = info.get("imageLinks", {}).get("thumbnail", "")
-
-            books.append({
-                "title": title,
-                "authors": authors,
-                "description": description,
-                "rating": rating,
-                "ratings_count": ratings_count,
-                "published": published,
-                "link": link,
-                "thumbnail": thumbnail,
-            })
-        return books
-    except Exception as e:
-        logger.error(f"Google Books error: {e}")
-        return []
-
-
-def format_book(book, num):
-    text = f"*{num}. {book['title']}*\n"
-    text += f"✍️ {book['authors']}\n"
-    if book.get("published"):
-        text += f"📅 {book['published']}\n"
-    if book.get("description"):
-        text += f"📝 {book['description']}\n"
-    if book.get("rating"):
-        text += f"⭐ {book['rating']}/5 ({book['ratings_count']} оценок)\n"
-    if book.get("link"):
-        text += f"🔗 [Подробнее]({book['link']})\n"
-    return text
-
 
 async def books_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MY_CHAT_ID:
         return
-    await update.message.reply_text(
-        "📚 *Книжный бот*\n\n"
-        "Каждый понедельник в 09:00 — новинки по твоим жанрам.\n"
-        "Каждое 1-е число — я спрошу о теме месяца.\n\n"
-        "/books — получить подборку прямо сейчас\n"
-        "/recommend [тема] — лучшие книги по теме",
-        parse_mode="Markdown"
-    )
+    await update.message.reply_text("📚 *Книжный бот*\n\nКаждый понедельник в 09:00 — новинки.\n1-го числа — спрошу тему месяца.\n\n/books — подборка прямо сейчас\n/recommend [тема] — лучшие книги по теме", parse_mode="Markdown")
 
 
 async def books_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -917,7 +1029,7 @@ async def recommend_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     topic = " ".join(context.args) if context.args else None
     if not topic:
-        await update.message.reply_text("Напиши тему: `/recommend финансы` или `/recommend психология`", parse_mode="Markdown")
+        await update.message.reply_text("Напиши тему: `/recommend финансы`", parse_mode="Markdown")
         return
     await update.message.reply_text(f"🔍 Ищу лучшие книги по теме: *{topic}*...", parse_mode="Markdown")
     await send_recommendations(context.bot, MY_CHAT_ID, topic)
@@ -926,8 +1038,7 @@ async def recommend_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def books_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MY_CHAT_ID:
         return
-    monthly = load_monthly_topic()
-    if monthly and monthly.get("month") == datetime.now(TIMEZONE).strftime("%Y-%m") and "waiting_topic" in context.user_data:
+    if context.user_data.get("waiting_topic"):
         topic = update.message.text.strip()
         save_monthly_topic(topic)
         context.user_data.pop("waiting_topic", None)
@@ -935,95 +1046,6 @@ async def books_handle_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await send_recommendations(context.bot, MY_CHAT_ID, topic)
     else:
         await update.message.reply_text("Используй /books для новинок или /recommend [тема] для рекомендаций.")
-
-
-async def send_weekly_books(bot, chat_id):
-    all_books = []
-    seen_titles = set()
-    for query in BOOKS_GENRE_QUERIES:
-        books = get_new_books(query, max_results=3)
-        for book in books:
-            if book["title"] not in seen_titles:
-                seen_titles.add(book["title"])
-                all_books.append(book)
-        if len(all_books) >= 10:
-            break
-
-    if not all_books:
-        await bot.send_message(chat_id=chat_id, text="❌ Не удалось получить книги. Попробуй позже.")
-        return
-
-    now = datetime.now(TIMEZONE).strftime("%d.%m.%Y")
-    await bot.send_message(
-        chat_id=chat_id,
-        text=f"📚 *Книжные новинки на {now}*\n\nБизнес, психология, финансы, нон-фикшн",
-        parse_mode="Markdown"
-    )
-
-    for i, book in enumerate(all_books[:10], 1):
-        text = format_book(book, i)
-        try:
-            thumbnail = book.get("thumbnail", "")
-            if thumbnail:
-                # Меняем http на https и увеличиваем размер обложки
-                thumbnail = thumbnail.replace("http://", "https://").replace("zoom=1", "zoom=3")
-                await bot.send_photo(chat_id=chat_id, photo=thumbnail, caption=text, parse_mode="Markdown")
-            else:
-                await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
-        except Exception as e:
-            logger.error(f"Error sending book: {e}")
-            try:
-                await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
-            except Exception:
-                pass
-        await asyncio.sleep(0.5)
-
-
-async def send_recommendations(bot, chat_id, topic):
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if anthropic_key:
-        try:
-            response = requests.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": anthropic_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                json={
-                    "model": "claude-haiku-4-5-20251001",
-                    "max_tokens": 1000,
-                    "messages": [{
-                        "role": "user",
-                        "content": f"Порекомендуй 5 лучших книг по теме: {topic}. Для каждой книги напиши: название, автор, год, краткое описание (2-3 предложения) почему именно эта книга лучшая. Формат ответа - простой текст, без markdown."
-                    }]
-                },
-                timeout=30,
-            )
-            text = response.json()["content"][0]["text"]
-            await bot.send_message(
-                chat_id=chat_id,
-                text=f"📚 *Лучшие книги по теме: {topic}*\n\n{text}",
-                parse_mode="Markdown"
-            )
-            return
-        except Exception as e:
-            logger.error(f"Claude API error: {e}")
-
-    # Если нет Claude API — ищем через Google Books
-    books = get_new_books(topic, max_results=5)
-    if not books:
-        await bot.send_message(chat_id=chat_id, text=f"❌ Не удалось найти книги по теме: {topic}")
-        return
-    await bot.send_message(chat_id=chat_id, text=f"📚 *Книги по теме: {topic}*", parse_mode="Markdown")
-    for i, book in enumerate(books, 1):
-        text = format_book(book, i)
-        try:
-            thumbnail = book.get("thumbnail", "")
-            if thumbnail:
-                thumbnail = thumbnail.replace("http://", "https://").replace("zoom=1", "zoom=3")
-                await bot.send_photo(chat_id=chat_id, photo=thumbnail, caption=text, parse_mode="Markdown")
-            else:
-                await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
-        except Exception as e:
-            await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
-        await asyncio.sleep(0.5)
 
 
 async def weekly_books_report(context: ContextTypes.DEFAULT_TYPE):
@@ -1034,15 +1056,19 @@ async def monthly_books_question(context: ContextTypes.DEFAULT_TYPE):
     context.user_data["waiting_topic"] = True
     await context.bot.send_message(
         chat_id=MY_CHAT_ID,
-        text="📚 *Книжный вопрос месяца*\n\nНа какую тему ты хотел бы почитать книгу в этом месяце?\n\nНапример: психология влияния, управление командой, инвестиции в акции...\n\nПросто напиши тему в ответ.",
+        text="📚 *Книжный вопрос месяца*\n\nНа какую тему ты хотел бы почитать книгу в этом месяце?\n\nПросто напиши тему в ответ.",
         parse_mode="Markdown"
     )
+
 
 # =====================
 # ЗАПУСК
 # =====================
 
 async def main():
+    # Инициализируем базу данных
+    init_db()
+
     # Бот саморефлексии
     reflection_app = Application.builder().token(BOT_TOKEN).build()
     conv_handler = ConversationHandler(
@@ -1106,11 +1132,7 @@ async def main():
     savings_app.add_handler(CommandHandler("start", savings_start))
     savings_app.add_handler(CommandHandler("balance", balance_command))
     savings_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, savings_handle_message))
-    savings_app.job_queue.run_daily(
-        weekly_savings_report,
-        time=dtime(hour=20, minute=0, tzinfo=TIMEZONE),
-        days=(6,),
-    )
+    savings_app.job_queue.run_daily(weekly_savings_report, time=dtime(hour=20, minute=0, tzinfo=TIMEZONE), days=(6,))
 
     # Книжный бот
     books_app = Application.builder().token(BOOKS_BOT_TOKEN).build()
@@ -1118,16 +1140,8 @@ async def main():
     books_app.add_handler(CommandHandler("books", books_command))
     books_app.add_handler(CommandHandler("recommend", recommend_command))
     books_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, books_handle_message))
-    books_app.job_queue.run_daily(
-        weekly_books_report,
-        time=dtime(hour=9, minute=0, tzinfo=TIMEZONE),
-        days=(0,),  # 0 = понедельник
-    )
-    books_app.job_queue.run_monthly(
-        monthly_books_question,
-        when=dtime(hour=10, minute=0, tzinfo=TIMEZONE),
-        day=1,
-    )
+    books_app.job_queue.run_daily(weekly_books_report, time=dtime(hour=9, minute=0, tzinfo=TIMEZONE), days=(0,))
+    books_app.job_queue.run_monthly(monthly_books_question, when=dtime(hour=10, tzinfo=TIMEZONE), day=1)
 
     async with reflection_app, rates_app, cinema_app, visa_app, todoist_app, savings_app, books_app:
         await reflection_app.start()
