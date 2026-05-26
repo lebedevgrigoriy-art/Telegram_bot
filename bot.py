@@ -6,8 +6,7 @@ import random
 from datetime import datetime, timedelta, time as dtime
 import pytz
 import asyncio
-import psycopg2
-from psycopg2.extras import RealDictCursor
+# Supabase через REST API
 
 from telegram import Update
 from telegram.ext import (
@@ -39,7 +38,8 @@ TODOIST_TOKEN = os.environ.get("TODOIST_TOKEN")
 SAVINGS_BOT_TOKEN = os.environ.get("SAVINGS_BOT_TOKEN")
 BOOKS_BOT_TOKEN = os.environ.get("BOOKS_BOT_TOKEN")
 GOOGLE_BOOKS_API_KEY = os.environ.get("GOOGLE_BOOKS_API_KEY", "")
-DATABASE_URL = os.environ.get("DATABASE_URL")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 TMDB_BASE = "https://api.themoviedb.org/3"
 TMDB_IMG = "https://image.tmdb.org/t/p/w500"
@@ -78,52 +78,40 @@ BOOKS_GENRE_QUERIES = [
 
 
 # =====================
-# БАЗА ДАННЫХ
+# БАЗА ДАННЫХ (Supabase REST API)
 # =====================
 
-def get_db():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+def sb_headers():
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+
+def sb_get(table, params=None):
+    resp = requests.get(f"{SUPABASE_URL}/rest/v1/{table}", headers=sb_headers(), params=params, timeout=10)
+    return resp.json() if resp.ok else []
+
+
+def sb_upsert(table, data):
+    headers = sb_headers()
+    headers["Prefer"] = "resolution=merge-duplicates,return=representation"
+    resp = requests.post(f"{SUPABASE_URL}/rest/v1/{table}", headers=headers, json=data, timeout=10)
+    return resp.ok
 
 
 def init_db():
-    """Создаём таблицы если не существуют."""
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS journal (
-            date TEXT PRIMARY KEY,
-            saved_at TEXT,
-            day_text TEXT,
-            gratitude TEXT,
-            lesson TEXT,
-            plan TEXT,
-            plan_review TEXT
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS visa (
-            id INTEGER PRIMARY KEY DEFAULT 1,
-            entry_date TEXT,
-            expiry_date TEXT,
-            days INTEGER
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS savings (
-            id INTEGER PRIMARY KEY DEFAULT 1,
-            balance REAL DEFAULT 0
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS books_topic (
-            month TEXT PRIMARY KEY,
-            topic TEXT
-        )
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
-    logger.info("База данных инициализирована.")
+    """Проверяем подключение к Supabase."""
+    try:
+        resp = requests.get(f"{SUPABASE_URL}/rest/v1/journal", headers=sb_headers(), params={"limit": 1}, timeout=10)
+        if resp.status_code == 404:
+            logger.warning("Таблицы не найдены — создай их в Supabase SQL Editor")
+        else:
+            logger.info("Supabase подключён успешно.")
+    except Exception as e:
+        logger.error(f"Supabase connection error: {e}")
 
 
 # =====================
@@ -131,64 +119,33 @@ def init_db():
 # =====================
 
 def save_entry(date_str, answers):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO journal (date, saved_at, day_text, gratitude, lesson, plan, plan_review)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (date) DO UPDATE SET
-            saved_at = EXCLUDED.saved_at,
-            day_text = EXCLUDED.day_text,
-            gratitude = EXCLUDED.gratitude,
-            lesson = EXCLUDED.lesson,
-            plan = EXCLUDED.plan,
-            plan_review = EXCLUDED.plan_review
-    """, (
-        date_str,
-        datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M"),
-        answers.get("day", ""),
-        answers.get("gratitude", ""),
-        answers.get("lesson", ""),
-        answers.get("plan", ""),
-        answers.get("plan_review", ""),
-    ))
-    conn.commit()
-    cur.close()
-    conn.close()
+    sb_upsert("journal", {
+        "date": date_str,
+        "saved_at": datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M"),
+        "day_text": answers.get("day", ""),
+        "gratitude": answers.get("gratitude", ""),
+        "lesson": answers.get("lesson", ""),
+        "plan": answers.get("plan", ""),
+        "plan_review": answers.get("plan_review", ""),
+    })
 
 
 def get_yesterday_plan():
-    conn = get_db()
-    cur = conn.cursor()
     today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
-    cur.execute("SELECT date, plan FROM journal WHERE date < %s AND plan != '' ORDER BY date DESC LIMIT 1", (today,))
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
-    if row:
-        return row["date"], row["plan"]
+    rows = sb_get("journal", {"date": f"lt.{today}", "plan": "neq.", "order": "date.desc", "limit": 1})
+    if rows:
+        return rows[0]["date"], rows[0]["plan"]
     return None, None
 
 
 def get_monthly_gratitude():
-    conn = get_db()
-    cur = conn.cursor()
     month = datetime.now(TIMEZONE).strftime("%Y-%m")
-    cur.execute("SELECT date, gratitude FROM journal WHERE date LIKE %s AND gratitude != '' ORDER BY date", (f"{month}%",))
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
+    rows = sb_get("journal", {"date": f"like.{month}%", "gratitude": "neq.", "order": "date.asc"})
     return [(r["date"], r["gratitude"]) for r in rows]
 
 
 def get_journal_history():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM journal ORDER BY date DESC LIMIT 7")
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    return rows
+    return sb_get("journal", {"order": "date.desc", "limit": "7"})
 
 
 # =====================
@@ -199,26 +156,13 @@ def save_visa(entry_date, expiry_date):
     entry = datetime.strptime(entry_date, "%d.%m.%Y")
     expiry = datetime.strptime(expiry_date, "%d.%m.%Y")
     days = (expiry - entry).days
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO visa (id, entry_date, expiry_date, days) VALUES (1, %s, %s, %s)
-        ON CONFLICT (id) DO UPDATE SET entry_date=EXCLUDED.entry_date, expiry_date=EXCLUDED.expiry_date, days=EXCLUDED.days
-    """, (entry_date, expiry_date, days))
-    conn.commit()
-    cur.close()
-    conn.close()
+    sb_upsert("visa", {"id": 1, "entry_date": entry_date, "expiry_date": expiry_date, "days": days})
     return {"entry_date": entry_date, "expiry_date": expiry_date, "days": days}
 
 
 def load_visa():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM visa WHERE id = 1")
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
-    return dict(row) if row else None
+    rows = sb_get("visa", {"id": "eq.1"})
+    return rows[0] if rows else None
 
 
 def days_left(expiry_date_str):
@@ -232,25 +176,12 @@ def days_left(expiry_date_str):
 # =====================
 
 def load_savings():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT balance FROM savings WHERE id = 1")
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
-    return row["balance"] if row else 0
+    rows = sb_get("savings", {"id": "eq.1"})
+    return rows[0]["balance"] if rows else 0
 
 
 def save_savings_balance(balance):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO savings (id, balance) VALUES (1, %s)
-        ON CONFLICT (id) DO UPDATE SET balance = EXCLUDED.balance
-    """, (balance,))
-    conn.commit()
-    cur.close()
-    conn.close()
+    sb_upsert("savings", {"id": 1, "balance": balance})
 
 
 def format_progress(balance, goal=SAVINGS_GOAL):
@@ -274,27 +205,14 @@ def format_progress(balance, goal=SAVINGS_GOAL):
 # =====================
 
 def load_monthly_topic():
-    conn = get_db()
-    cur = conn.cursor()
     month = datetime.now(TIMEZONE).strftime("%Y-%m")
-    cur.execute("SELECT topic FROM books_topic WHERE month = %s", (month,))
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
-    return row["topic"] if row else None
+    rows = sb_get("books_topic", {"month": f"eq.{month}"})
+    return rows[0]["topic"] if rows else None
 
 
 def save_monthly_topic(topic):
-    conn = get_db()
-    cur = conn.cursor()
     month = datetime.now(TIMEZONE).strftime("%Y-%m")
-    cur.execute("""
-        INSERT INTO books_topic (month, topic) VALUES (%s, %s)
-        ON CONFLICT (month) DO UPDATE SET topic = EXCLUDED.topic
-    """, (month, topic))
-    conn.commit()
-    cur.close()
-    conn.close()
+    sb_upsert("books_topic", {"month": month, "topic": topic})
 
 
 def get_new_books(query, max_results=5):
