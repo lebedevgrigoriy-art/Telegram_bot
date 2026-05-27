@@ -37,7 +37,7 @@ TODOIST_BOT_TOKEN = os.environ.get("TODOIST_BOT_TOKEN")
 TODOIST_TOKEN = os.environ.get("TODOIST_TOKEN")
 SAVINGS_BOT_TOKEN = os.environ.get("SAVINGS_BOT_TOKEN")
 BOOKS_BOT_TOKEN = os.environ.get("BOOKS_BOT_TOKEN")
-GOOGLE_BOOKS_API_KEY = os.environ.get("GOOGLE_BOOKS_API_KEY", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
@@ -77,13 +77,7 @@ MOTIVATIONS = [
     "Богатство строится по кирпичику. Ты кладёшь свой! 🏆",
 ]
 
-BOOKS_GENRE_QUERIES = [
-    "бизнес литература",
-    "психология успех",
-    "личные финансы инвестиции",
-    "нон-фикшн",
-    "ресторанный бизнес",
-]
+
 
 
 # =====================
@@ -266,148 +260,148 @@ def save_monthly_topic(topic):
     sb_upsert("books_topic", {"month": month, "topic": topic})
 
 
-def get_new_books(query, max_results=5):
+def _ask_claude(prompt: str, max_tokens: int = 2000) -> str:
+    """Запрос к Claude. Возвращает пустую строку если ключа нет или ошибка."""
+    if not ANTHROPIC_API_KEY:
+        return ""
     try:
-        params = {
-            "q": query,
-            "langRestrict": "ru",
-            "orderBy": "newest",
-            "maxResults": max_results,
-            "printType": "books",
-        }
-        if GOOGLE_BOOKS_API_KEY:
-            params["key"] = GOOGLE_BOOKS_API_KEY
-        resp = requests.get("https://www.googleapis.com/books/v1/volumes", params=params, timeout=10)
-        items = resp.json().get("items", [])
-        books = []
-        for item in items:
-            info = item.get("volumeInfo", {})
-            description = info.get("description", "")
-            if description and len(description) > 150:
-                description = description[:150] + "..."
-            books.append({
-                "title": info.get("title", "—"),
-                "authors": ", ".join(info.get("authors", ["—"])),
-                "description": description,
-                "rating": info.get("averageRating"),
-                "ratings_count": info.get("ratingsCount", 0),
-                "published": info.get("publishedDate", "")[:4],
-                "link": info.get("infoLink", ""),
-                "thumbnail": info.get("imageLinks", {}).get("thumbnail", ""),
-            })
-        return books
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": max_tokens,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=30,
+        )
+        return resp.json()["content"][0]["text"]
     except Exception as e:
-        logger.error(f"Google Books error: {e}")
+        logger.error(f"Claude error: {e}")
+        return ""
+
+
+def _get_books_from_claude(prompt: str) -> list:
+    """Общий парсер: просим Claude вернуть JSON-список книг."""
+    raw = _ask_claude(prompt, max_tokens=3000)
+    if not raw:
+        return []
+    try:
+        clean = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        return json.loads(clean)
+    except Exception as e:
+        logger.error(f"Books JSON parse error: {e}")
         return []
 
 
-def format_book(book, num):
-    text = f"*{num}. {book['title']}*\n"
-    text += f"✍️ {book['authors']}\n"
-    if book.get("published"):
-        text += f"📅 {book['published']}\n"
+def get_weekly_books() -> list:
+    return _get_books_from_claude(
+        """Подбери 8 актуальных книг по темам: бизнес/предпринимательство, психология/саморазвитие, финансы/инвестиции, нон-фикшн/биографии.
+Книги реальные, желательно последних 3-5 лет, разнообразие жанров.
+Ответь СТРОГО в JSON-массиве без markdown, 8 объектов:
+[{"title":"...","title_en":"...","author":"...","year":2023,"genre":"...","description":"2-3 предложения","goodreads_rating":"4.2/5","why_read":"одна причина прочитать сейчас"}]"""
+    )
+
+
+def get_books_by_topic(topic: str) -> list:
+    return _get_books_from_claude(
+        f"""Порекомендуй 5 лучших книг по теме: "{topic}".
+Ответь СТРОГО в JSON-массиве без markdown, 5 объектов:
+[{{"title":"...","title_en":"...","author":"...","year":2020,"genre":"...","description":"2-3 предложения","goodreads_rating":"4.3/5","why_read":"почему эта книга лучшая по теме"}}]"""
+    )
+
+
+def get_cover_url(title: str, author: str) -> str | None:
+    """Обложка через Open Library — бесплатно, без ключа."""
+    try:
+        resp = requests.get(
+            "https://openlibrary.org/search.json",
+            params={"q": f"{title} {author}", "limit": 1, "fields": "cover_i"},
+            timeout=8,
+        )
+        docs = resp.json().get("docs", [])
+        if docs and docs[0].get("cover_i"):
+            return f"https://covers.openlibrary.org/b/id/{docs[0]['cover_i']}-L.jpg"
+    except Exception as e:
+        logger.error(f"Open Library error: {e}")
+    return None
+
+
+def format_book(book: dict, num: int) -> str:
+    emoji_map = {"бизнес": "💼", "предпринимательство": "🚀", "финансы": "💰",
+                 "инвестиции": "📈", "психология": "🧠", "саморазвитие": "⚡",
+                 "биографии": "👤", "нон-фикшн": "📖"}
+    genre = book.get("genre", "").lower()
+    icon = next((v for k, v in emoji_map.items() if k in genre), "📚")
+
+    lines = [f"{icon} *{num}. {book.get('title', '—')}*", f"✍️ {book.get('author', '—')}"]
+    if book.get("year") or book.get("genre"):
+        lines.append(f"📅 {book.get('year', '')}  •  {book.get('genre', '')}".strip(" •"))
+    if book.get("goodreads_rating"):
+        lines.append(f"⭐ Goodreads: {book['goodreads_rating']}")
     if book.get("description"):
-        text += f"📝 {book['description']}\n"
-    if book.get("rating"):
-        text += f"⭐ {book['rating']}/5 ({book['ratings_count']} оценок)\n"
-    if book.get("link"):
-        text += f"🔗 [Подробнее]({book['link']})\n"
-    return text
+        lines.append(f"\n📝 {book['description']}")
+    if book.get("why_read"):
+        lines.append(f"\n💡 _{book['why_read']}_")
+    return "\n".join(lines)
 
 
 async def send_weekly_books(bot, chat_id):
-    all_books = []
-    seen_titles = set()
-    for query in BOOKS_GENRE_QUERIES:
-        books = get_new_books(query, max_results=3)
-        for book in books:
-            if book["title"] not in seen_titles:
-                seen_titles.add(book["title"])
-                all_books.append(book)
-        if len(all_books) >= 10:
-            break
-
-    if not all_books:
-        await bot.send_message(chat_id=chat_id, text="❌ Не удалось получить книги. Попробуй позже.")
+    books = get_weekly_books()
+    if not books:
+        await bot.send_message(chat_id=chat_id, text="📚 Книжный бот заработает после добавления ANTHROPIC_API_KEY.")
         return
-
     now = datetime.now(TIMEZONE).strftime("%d.%m.%Y")
-    await bot.send_message(chat_id=chat_id, text=f"📚 *Книжные новинки на {now}*\n\nБизнес, психология, финансы, нон-фикшн", parse_mode="Markdown")
-
-    for i, book in enumerate(all_books[:10], 1):
-        text = format_book(book, i)
+    await bot.send_message(chat_id=chat_id,
+        text=f"📚 *Книги на неделю — {now}*\nБизнес • Психология • Финансы • Нон-фикшн",
+        parse_mode="Markdown")
+    for i, book in enumerate(books, 1):
+        caption = format_book(book, i)
+        cover = get_cover_url(book.get("title_en") or book.get("title", ""), book.get("author", ""))
         try:
-            thumbnail = book.get("thumbnail", "")
-            if thumbnail:
-                thumbnail = thumbnail.replace("http://", "https://").replace("zoom=1", "zoom=3")
-                await bot.send_photo(chat_id=chat_id, photo=thumbnail, caption=text, parse_mode="Markdown")
+            if cover:
+                await bot.send_photo(chat_id=chat_id, photo=cover, caption=caption, parse_mode="Markdown")
             else:
-                await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
-        except Exception as e:
-            logger.error(f"Error sending book: {e}")
-            try:
-                await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
-            except Exception:
-                pass
-        await asyncio.sleep(0.5)
+                await bot.send_message(chat_id=chat_id, text=caption, parse_mode="Markdown")
+        except Exception:
+            await bot.send_message(chat_id=chat_id, text=caption, parse_mode="Markdown")
+        await asyncio.sleep(0.7)
 
 
 async def send_recommendations(bot, chat_id, topic):
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if anthropic_key:
-        try:
-            response = requests.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": anthropic_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                json={
-                    "model": "claude-haiku-4-5-20251001",
-                    "max_tokens": 1000,
-                    "messages": [{"role": "user", "content": f"Порекомендуй 5 лучших книг по теме: {topic}. Для каждой: название, автор, год, краткое описание почему эта книга лучшая. Простой текст без markdown."}]
-                },
-                timeout=30,
-            )
-            text = response.json()["content"][0]["text"]
-            await bot.send_message(chat_id=chat_id, text=f"📚 *Лучшие книги по теме: {topic}*\n\n{text}", parse_mode="Markdown")
-            return
-        except Exception as e:
-            logger.error(f"Claude API error: {e}")
-
-    books = get_new_books(topic, max_results=5)
+    books = get_books_by_topic(topic)
     if not books:
-        await bot.send_message(chat_id=chat_id, text=f"❌ Не удалось найти книги по теме: {topic}")
+        await bot.send_message(chat_id=chat_id, text=f"📚 Рекомендации по теме *{topic}* заработают после добавления ANTHROPIC_API_KEY.", parse_mode="Markdown")
         return
-    await bot.send_message(chat_id=chat_id, text=f"📚 *Книги по теме: {topic}*", parse_mode="Markdown")
+    await bot.send_message(chat_id=chat_id, text=f"📚 *Лучшие книги: {topic}*", parse_mode="Markdown")
     for i, book in enumerate(books, 1):
-        text = format_book(book, i)
+        caption = format_book(book, i)
+        cover = get_cover_url(book.get("title_en") or book.get("title", ""), book.get("author", ""))
         try:
-            thumbnail = book.get("thumbnail", "")
-            if thumbnail:
-                thumbnail = thumbnail.replace("http://", "https://").replace("zoom=1", "zoom=3")
-                await bot.send_photo(chat_id=chat_id, photo=thumbnail, caption=text, parse_mode="Markdown")
+            if cover:
+                await bot.send_photo(chat_id=chat_id, photo=cover, caption=caption, parse_mode="Markdown")
             else:
-                await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+                await bot.send_message(chat_id=chat_id, text=caption, parse_mode="Markdown")
         except Exception:
-            await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
-        await asyncio.sleep(0.5)
+            await bot.send_message(chat_id=chat_id, text=caption, parse_mode="Markdown")
+        await asyncio.sleep(0.7)
 
 
 def make_gratitude_summary(entries, month_name):
     if not entries:
         return "За этот месяц записей ещё нет."
     all_text = "\n".join(f"- {g}" for _, g in entries)
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if anthropic_key:
-        try:
-            response = requests.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": anthropic_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                json={"model": "claude-haiku-4-5-20251001", "max_tokens": 500, "messages": [{"role": "user", "content": f"Записи благодарности за {month_name}:\n{all_text}\n\nТезисная сводка: кому благодарил чаще, за что, общий тон. 5-8 предложений."}]},
-                timeout=30,
-            )
-            summary = response.json()["content"][0]["text"]
+    if ANTHROPIC_API_KEY:
+        summary = _ask_claude(
+            f"Записи благодарности за {month_name}:\n{all_text}\n\nТезисная сводка: кому благодарил чаще, за что, общий тон. 5-8 предложений.",
+            max_tokens=500,
+        )
+        if summary:
             return f"🙏 *Благодарности за {month_name}*\n\n{summary}"
-        except Exception as e:
-            logger.error(f"Claude API error: {e}")
     text = f"🙏 *Благодарности за {month_name}*\n\nВсего записей: {len(entries)}\n\n"
     for date_str, g in entries[-5:]:
         text += f"_{date_str}_: {g[:120]}\n\n"
