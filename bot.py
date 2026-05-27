@@ -859,8 +859,15 @@ async def todoist_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MY_CHAT_ID:
         return
-    tasks = get_today_tasks()
-    await update.message.reply_text(format_tasks(tasks), parse_mode="Markdown")
+    # Дебаг — показываем due поля первых 3 задач
+    resp = requests.get(f"{TODOIST_API}/tasks", headers={"Authorization": f"Bearer {TODOIST_TOKEN}"}, timeout=10)
+    data = resp.json()
+    all_tasks = data.get("results", []) if isinstance(data, dict) else []
+    debug = ""
+    for t in all_tasks[:3]:
+        if isinstance(t, dict):
+            debug += f"due: {t.get('due')}\n"
+    await update.message.reply_text(f"🔍 Дебаг due:\n`{debug}`", parse_mode="Markdown")
 
 
 async def inbox_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
