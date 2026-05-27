@@ -558,18 +558,8 @@ async def send_movies(bot, chat_id, period_label="недели"):
 # TODOIST
 # =====================
 
-def add_task(text):
-    resp = requests.post(
-        f"{TODOIST_API}/tasks",
-        headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
-        json={"content": text},
-        timeout=10,
-    )
-    logger.info(f"Todoist: {resp.status_code}")
-    return resp.status_code == 200
-
-
-def get_today_tasks():
+def _todoist_get_all_tasks() -> list:
+    """Получаем все активные задачи из Todoist."""
     resp = requests.get(
         f"{TODOIST_API}/tasks",
         headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
@@ -580,40 +570,69 @@ def get_today_tasks():
         return []
     data = resp.json()
     if isinstance(data, dict):
-        all_tasks = data.get("results", [])
-    else:
-        all_tasks = data if isinstance(data, list) else []
-    
-    # Фильтруем задачи на сегодня и просроченные
+        return [t for t in data.get("results", []) if isinstance(t, dict)]
+    return [t for t in data if isinstance(t, dict)] if isinstance(data, list) else []
+
+
+def get_today_tasks() -> list:
+    """Только задачи с дедлайном сегодня или просроченные — без inbox-мусора."""
     today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
     result = []
-    for task in all_tasks:
-        if not isinstance(task, dict):
-            continue
+    for task in _todoist_get_all_tasks():
         due = task.get("due")
         if not due:
-            # Задачи без даты тоже включаем (входящие)
-            result.append(task)
-            continue
+            continue  # задачи без даты — это inbox, не показываем в утренней рассылке
         due_date = str(due.get("date", ""))[:10]
         if due_date and due_date <= today:
             result.append(task)
+    # Сортируем: сначала просроченные, потом по времени
+    def sort_key(t):
+        due = t.get("due", {}) or {}
+        return due.get("datetime") or due.get("date") or "9999"
+    return sorted(result, key=sort_key)
+
+
+def get_tasks_due_in_one_hour() -> list:
+    """Задачи с точным временем дедлайна через ~1 час (±5 минут)."""
+    now = datetime.now(TIMEZONE)
+    target_start = now + timedelta(minutes=55)
+    target_end = now + timedelta(minutes=65)
+    result = []
+    for task in _todoist_get_all_tasks():
+        due = task.get("due")
+        if not due or not due.get("datetime"):
+            continue  # нужно точное время, не просто дата
+        try:
+            # Todoist отдаёт datetime в UTC
+            due_dt = datetime.fromisoformat(due["datetime"].replace("Z", "+00:00"))
+            due_local = due_dt.astimezone(TIMEZONE)
+            if target_start <= due_local <= target_end:
+                result.append(task)
+        except Exception as e:
+            logger.error(f"Datetime parse error: {e}")
     return result
 
 
-def format_tasks(tasks):
+def format_tasks(tasks: list, header: str = "Задачи на сегодня") -> str:
     if not tasks:
         return "✅ На сегодня задач нет!"
-    # tasks может быть списком словарей или строкой при ошибке
-    if not isinstance(tasks, list):
-        return "✅ На сегодня задач нет!"
-    valid_tasks = [t for t in tasks if isinstance(t, dict)]
-    if not valid_tasks:
-        return "✅ На сегодня задач нет!"
-    text = f"📋 *Задачи на сегодня ({len(valid_tasks)}):*\n\n"
-    for i, task in enumerate(valid_tasks, 1):
+    today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
+    text = f"📋 *{header} ({len(tasks)}):*\n\n"
+    for i, task in enumerate(tasks, 1):
         priority_emoji = {1: "", 2: "🔵", 3: "🟡", 4: "🔴"}.get(task.get("priority", 1), "")
-        text += f"{i}. {priority_emoji} {task.get('content', '—')}\n"
+        due = task.get("due") or {}
+        # Показываем время если есть, или пометку "просрочено"
+        due_date = str(due.get("date", ""))[:10]
+        due_time = ""
+        if due.get("datetime"):
+            try:
+                due_dt = datetime.fromisoformat(due["datetime"].replace("Z", "+00:00"))
+                due_local = due_dt.astimezone(TIMEZONE)
+                due_time = f" `{due_local.strftime('%H:%M')}`"
+            except Exception:
+                pass
+        overdue = " ⚠️" if due_date and due_date < today else ""
+        text += f"{i}.{priority_emoji}{due_time}{overdue} {task.get('content', '—')}\n"
     return text
 
 
@@ -901,7 +920,12 @@ async def check_visa_reminders(context: ContextTypes.DEFAULT_TYPE):
 async def todoist_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MY_CHAT_ID:
         return
-    await update.message.reply_text("Привет! Я твой Todoist-помощник 📋\n\nПросто напиши задачу — добавлю в Inbox.\n\n/tasks — задачи на сегодня\n/inbox — что в Inbox")
+    await update.message.reply_text(
+        "Привет! Я твой Todoist-помощник 📋\n\n"
+        "Просто напиши задачу — добавлю в Inbox.\n\n"
+        "/tasks — задачи на сегодня\n"
+        "/inbox — все задачи без даты"
+    )
 
 
 async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -914,21 +938,13 @@ async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def inbox_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MY_CHAT_ID:
         return
-    resp = requests.get(f"{TODOIST_API}/tasks", headers={"Authorization": f"Bearer {TODOIST_TOKEN}"}, timeout=10)
-    if resp.status_code != 200:
-        await update.message.reply_text(f"❌ Ошибка Todoist: {resp.status_code}")
-        return
-    data = resp.json()
-    if isinstance(data, dict):
-        tasks = data.get("results", [])
-    else:
-        tasks = data if isinstance(data, list) else []
-    tasks = [t for t in tasks if isinstance(t, dict)]
-    if not tasks:
+    all_tasks = _todoist_get_all_tasks()
+    inbox = [t for t in all_tasks if not t.get("due")]
+    if not inbox:
         await update.message.reply_text("📥 Inbox пуст!")
         return
-    text = f"📥 *Inbox ({len(tasks)}):*\n\n"
-    for i, task in enumerate(tasks[:20], 1):
+    text = f"📥 *Inbox ({len(inbox)}):*\n\n"
+    for i, task in enumerate(inbox[:20], 1):
         text += f"{i}. {task.get('content', '—')}\n"
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -939,7 +955,12 @@ async def todoist_handle_message(update: Update, context: ContextTypes.DEFAULT_T
     text = update.message.text.strip()
     if not text:
         return
-    resp = requests.post(f"{TODOIST_API}/tasks", headers={"Authorization": f"Bearer {TODOIST_TOKEN}"}, json={"content": text}, timeout=10)
+    resp = requests.post(
+        f"{TODOIST_API}/tasks",
+        headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
+        json={"content": text},
+        timeout=10,
+    )
     if resp.status_code == 200:
         await update.message.reply_text(f"✅ Добавлено в Inbox:\n_{text}_", parse_mode="Markdown")
     else:
@@ -947,8 +968,34 @@ async def todoist_handle_message(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def morning_tasks(context: ContextTypes.DEFAULT_TYPE):
+    """Утренняя рассылка в 09:00 — только задачи с датой на сегодня."""
     tasks = get_today_tasks()
-    await context.bot.send_message(chat_id=MY_CHAT_ID, text="☀️ *Доброе утро!*\n\n" + format_tasks(tasks), parse_mode="Markdown")
+    await context.bot.send_message(
+        chat_id=MY_CHAT_ID,
+        text="☀️ *Доброе утро!*\n\n" + format_tasks(tasks),
+        parse_mode="Markdown",
+    )
+
+
+async def deadline_reminder(context: ContextTypes.DEFAULT_TYPE):
+    """Каждые 30 минут проверяем задачи с дедлайном через ~1 час."""
+    tasks = get_tasks_due_in_one_hour()
+    if not tasks:
+        return
+    for task in tasks:
+        due = task.get("due", {}) or {}
+        due_dt = datetime.fromisoformat(due["datetime"].replace("Z", "+00:00"))
+        due_local = due_dt.astimezone(TIMEZONE)
+        priority_emoji = {1: "", 2: "🔵", 3: "🟡", 4: "🔴"}.get(task.get("priority", 1), "")
+        await context.bot.send_message(
+            chat_id=MY_CHAT_ID,
+            text=(
+                f"⏰ *Напоминание — через 1 час:*\n\n"
+                f"{priority_emoji} {task.get('content', '—')}\n"
+                f"🕐 Дедлайн: `{due_local.strftime('%H:%M')}`"
+            ),
+            parse_mode="Markdown",
+        )
 
 
 # =====================
@@ -1237,6 +1284,7 @@ async def main():
     todoist_app.add_handler(CommandHandler("inbox", inbox_command))
     todoist_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, todoist_handle_message))
     todoist_app.job_queue.run_daily(morning_tasks, time=dtime(hour=9, minute=0, tzinfo=TIMEZONE))
+    todoist_app.job_queue.run_repeating(deadline_reminder, interval=1800, first=60)  # каждые 30 минут
 
     # Бот накоплений
     savings_app = Application.builder().token(SAVINGS_BOT_TOKEN).build()
