@@ -528,10 +528,12 @@ def get_today_tasks():
     resp = requests.get(
         f"{TODOIST_API}/tasks",
         headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
-        params={"filter": "today | overdue"},
         timeout=10,
     )
-    return resp.json() if resp.status_code == 200 else []
+    if resp.status_code != 200:
+        logger.error(f"Todoist tasks error: {resp.status_code} {resp.text}")
+        return []
+    return resp.json()
 
 
 def format_tasks(tasks):
@@ -841,7 +843,7 @@ async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def inbox_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MY_CHAT_ID:
         return
-    resp = requests.get(f"{TODOIST_API}/tasks", headers={"Authorization": f"Bearer {TODOIST_TOKEN}"}, params={"filter": "#Inbox"}, timeout=10)
+    resp = requests.get(f"{TODOIST_API}/tasks", headers={"Authorization": f"Bearer {TODOIST_TOKEN}"}, timeout=10)
     tasks = resp.json() if resp.status_code == 200 else []
     if not tasks:
         await update.message.reply_text("📥 Inbox пуст!")
