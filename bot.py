@@ -569,9 +569,13 @@ def _todoist_get_all_tasks() -> list:
         logger.error(f"Todoist tasks error: {resp.status_code} {resp.text}")
         return []
     data = resp.json()
+    logger.info(f"Todoist raw type: {type(data)}, preview: {str(data)[:300]}")
     if isinstance(data, dict):
-        return [t for t in data.get("results", []) if isinstance(t, dict)]
-    return [t for t in data if isinstance(t, dict)] if isinstance(data, list) else []
+        tasks = [t for t in data.get("results", []) if isinstance(t, dict)]
+    else:
+        tasks = [t for t in data if isinstance(t, dict)] if isinstance(data, list) else []
+    logger.info(f"Todoist tasks: {len(tasks)}, due fields: {[t.get('due') for t in tasks[:5]]}")
+    return tasks
 
 
 def get_today_tasks() -> list:
