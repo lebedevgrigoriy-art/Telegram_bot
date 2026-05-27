@@ -533,7 +533,11 @@ def get_today_tasks():
     if resp.status_code != 200:
         logger.error(f"Todoist tasks error: {resp.status_code} {resp.text}")
         return []
-    return resp.json()
+    data = resp.json()
+    # Новый API возвращает {"results": [...]}
+    if isinstance(data, dict):
+        return data.get("results", [])
+    return data if isinstance(data, list) else []
 
 
 def format_tasks(tasks):
@@ -854,9 +858,18 @@ async def inbox_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка Todoist: {resp.status_code}")
         return
     data = resp.json()
-    # Показываем сырой ответ для диагностики
-    raw = str(data)[:500]
-    await update.message.reply_text(f"🔍 Сырой ответ:\n`{raw}`", parse_mode="Markdown")
+    if isinstance(data, dict):
+        tasks = data.get("results", [])
+    else:
+        tasks = data if isinstance(data, list) else []
+    tasks = [t for t in tasks if isinstance(t, dict)]
+    if not tasks:
+        await update.message.reply_text("📥 Inbox пуст!")
+        return
+    text = f"📥 *Inbox ({len(tasks)}):*\n\n"
+    for i, task in enumerate(tasks[:20], 1):
+        text += f"{i}. {task.get('content', '—')}\n"
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def todoist_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
