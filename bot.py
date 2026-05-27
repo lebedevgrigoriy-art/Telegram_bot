@@ -854,17 +854,9 @@ async def inbox_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка Todoist: {resp.status_code}")
         return
     data = resp.json()
-    if not isinstance(data, list):
-        await update.message.reply_text("📥 Inbox пуст!")
-        return
-    tasks = [t for t in data if isinstance(t, dict)]
-    if not tasks:
-        await update.message.reply_text("📥 Inbox пуст!")
-        return
-    text = f"📥 *Inbox ({len(tasks)}):*\n\n"
-    for i, task in enumerate(tasks[:20], 1):
-        text += f"{i}. {task.get('content', '—')}\n"
-    await update.message.reply_text(text, parse_mode="Markdown")
+    # Показываем сырой ответ для диагностики
+    raw = str(data)[:500]
+    await update.message.reply_text(f"🔍 Сырой ответ:\n`{raw}`", parse_mode="Markdown")
 
 
 async def todoist_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
