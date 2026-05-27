@@ -534,10 +534,23 @@ def get_today_tasks():
         logger.error(f"Todoist tasks error: {resp.status_code} {resp.text}")
         return []
     data = resp.json()
-    # Новый API возвращает {"results": [...]}
     if isinstance(data, dict):
-        return data.get("results", [])
-    return data if isinstance(data, list) else []
+        all_tasks = data.get("results", [])
+    else:
+        all_tasks = data if isinstance(data, list) else []
+    
+    # Фильтруем задачи на сегодня и просроченные
+    today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
+    result = []
+    for task in all_tasks:
+        if not isinstance(task, dict):
+            continue
+        due = task.get("due")
+        if due:
+            due_date = due.get("date", "")[:10]  # берём только дату YYYY-MM-DD
+            if due_date <= today:
+                result.append(task)
+    return result
 
 
 def format_tasks(tasks):
