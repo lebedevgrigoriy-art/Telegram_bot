@@ -547,8 +547,9 @@ def get_today_tasks():
             continue
         due = task.get("due")
         if not due:
+            # Задачи без даты тоже включаем (входящие)
+            result.append(task)
             continue
-        # Дата может быть "2026-05-27" или "2026-05-27T10:00:00"
         due_date = str(due.get("date", ""))[:10]
         if due_date and due_date <= today:
             result.append(task)
