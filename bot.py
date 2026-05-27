@@ -539,10 +539,16 @@ def get_today_tasks():
 def format_tasks(tasks):
     if not tasks:
         return "✅ На сегодня задач нет!"
-    text = f"📋 *Задачи на сегодня ({len(tasks)}):*\n\n"
-    for i, task in enumerate(tasks, 1):
+    # tasks может быть списком словарей или строкой при ошибке
+    if not isinstance(tasks, list):
+        return "✅ На сегодня задач нет!"
+    valid_tasks = [t for t in tasks if isinstance(t, dict)]
+    if not valid_tasks:
+        return "✅ На сегодня задач нет!"
+    text = f"📋 *Задачи на сегодня ({len(valid_tasks)}):*\n\n"
+    for i, task in enumerate(valid_tasks, 1):
         priority_emoji = {1: "", 2: "🔵", 3: "🟡", 4: "🔴"}.get(task.get("priority", 1), "")
-        text += f"{i}. {priority_emoji} {task['content']}\n"
+        text += f"{i}. {priority_emoji} {task.get('content', '—')}\n"
     return text
 
 
@@ -844,13 +850,20 @@ async def inbox_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MY_CHAT_ID:
         return
     resp = requests.get(f"{TODOIST_API}/tasks", headers={"Authorization": f"Bearer {TODOIST_TOKEN}"}, timeout=10)
-    tasks = resp.json() if resp.status_code == 200 else []
+    if resp.status_code != 200:
+        await update.message.reply_text(f"❌ Ошибка Todoist: {resp.status_code}")
+        return
+    data = resp.json()
+    if not isinstance(data, list):
+        await update.message.reply_text("📥 Inbox пуст!")
+        return
+    tasks = [t for t in data if isinstance(t, dict)]
     if not tasks:
         await update.message.reply_text("📥 Inbox пуст!")
         return
     text = f"📥 *Inbox ({len(tasks)}):*\n\n"
     for i, task in enumerate(tasks[:20], 1):
-        text += f"{i}. {task['content']}\n"
+        text += f"{i}. {task.get('content', '—')}\n"
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
