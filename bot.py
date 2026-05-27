@@ -52,12 +52,21 @@ TODOIST_API = "https://api.todoist.com/api/v1"
 
 Q1, Q2, Q3, Q4, Q5 = range(5)
 ENTER_DATE, ENTER_EXPIRY = range(2)
+WQ1, WQ2, WQ3, WQ4, WQ5, WQ6, WQ7 = range(10, 17)
 
 QUESTIONS = [
     "🌙 Как прошёл сегодняшний день? Что запомнилось больше всего?",
     "🙏 Кому или чему ты сегодня благодарен?",
     "📖 Какой урок или вывод можно вынести из сегодняшнего дня?",
     "🗓 Какой у тебя план на завтра? Три главных дела.",
+]
+
+WEEKLY_QUESTIONS = [
+    "📅 *Итоги недели*\n\nКак в целом прошла неделя? Чем запомнилась?",
+    "😟 Что больше всего беспокоило тебя на этой неделе?",
+    "😊 Чему больше всего радовался на этой неделе?",
+    "🙏 Кому и чему ты был благодарен на прошедшей неделе?",
+    "😔 О чём жалеешь за прошедшую неделю?",
 ]
 
 MOTIVATIONS = [
@@ -146,6 +155,48 @@ def get_monthly_gratitude():
 
 def get_journal_history():
     return sb_get("journal", {"order": "date.desc", "limit": "7"})
+
+
+# =====================
+# ЕЖЕНЕДЕЛЬНЫЙ ЖУРНАЛ
+# =====================
+
+def get_current_week():
+    """Возвращает строку текущей недели в формате YYYY-WNN."""
+    now = datetime.now(TIMEZONE)
+    return now.strftime("%Y-W%W")
+
+def get_last_week():
+    """Возвращает строку прошлой недели."""
+    now = datetime.now(TIMEZONE)
+    last = now - timedelta(days=7)
+    return last.strftime("%Y-W%W")
+
+def save_weekly_entry(week, answers):
+    sb_upsert("weekly_journal", {
+        "week": week,
+        "saved_at": datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M"),
+        "summary": answers.get("summary", ""),
+        "worries": answers.get("worries", ""),
+        "joys": answers.get("joys", ""),
+        "gratitude": answers.get("gratitude", ""),
+        "regrets": answers.get("regrets", ""),
+        "plan": answers.get("plan", ""),
+        "plan_review": answers.get("plan_review", ""),
+    })
+
+def get_weekly_plan(week):
+    rows = sb_get("weekly_journal", {"week": f"eq.{week}"})
+    if rows:
+        return rows[0].get("plan", "")
+    return None
+
+def get_last_week_plan():
+    last_week = get_last_week()
+    rows = sb_get("weekly_journal", {"week": f"eq.{last_week}"})
+    if rows:
+        return rows[0].get("plan", "")
+    return None
 
 
 # =====================
@@ -1015,6 +1066,101 @@ async def monthly_books_question(context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+
+# =====================
+# ХЕНДЛЕРЫ — ЕЖЕНЕДЕЛЬНАЯ РЕФЛЕКСИЯ
+# =====================
+
+async def weekly_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+    context.user_data["weekly_answers"] = {}
+    context.user_data["week"] = get_current_week()
+    await update.message.reply_text(WEEKLY_QUESTIONS[0], parse_mode="Markdown")
+    return WQ1
+
+async def weekly_q1(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["weekly_answers"]["summary"] = update.message.text
+    await update.message.reply_text(WEEKLY_QUESTIONS[1])
+    return WQ2
+
+async def weekly_q2(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["weekly_answers"]["worries"] = update.message.text
+    await update.message.reply_text(WEEKLY_QUESTIONS[2])
+    return WQ3
+
+async def weekly_q3(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["weekly_answers"]["joys"] = update.message.text
+    await update.message.reply_text(WEEKLY_QUESTIONS[3])
+    return WQ4
+
+async def weekly_q4(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["weekly_answers"]["gratitude"] = update.message.text
+    await update.message.reply_text(WEEKLY_QUESTIONS[4])
+    return WQ5
+
+async def weekly_q5(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["weekly_answers"]["regrets"] = update.message.text
+    
+    # Показываем прошлонедельный план если есть
+    last_plan = get_last_week_plan()
+    if last_plan:
+        await update.message.reply_text(
+            f"📋 *Твои планы на эту неделю были:*\n\n{last_plan}\n\n✅ Удалось выполнить? Напиши коротко.",
+            parse_mode="Markdown"
+        )
+        return WQ6
+    else:
+        await update.message.reply_text(
+            "🗓 *Какие планы ставишь на следующую неделю?*\n\nНапиши список целей.",
+            parse_mode="Markdown"
+        )
+        return WQ7
+
+async def weekly_q6(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["weekly_answers"]["plan_review"] = update.message.text
+    await update.message.reply_text(
+        "🗓 *Какие планы ставишь на следующую неделю?*\n\nНапиши список целей.",
+        parse_mode="Markdown"
+    )
+    return WQ7
+
+async def weekly_q7(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["weekly_answers"]["plan"] = update.message.text
+    week = context.user_data["week"]
+    save_weekly_entry(week, context.user_data["weekly_answers"])
+    await update.message.reply_text(
+        f"✅ *Итоги недели сохранены!*\n\nХорошей следующей недели! 💪",
+        parse_mode="Markdown"
+    )
+    return ConversationHandler.END
+
+async def weekly_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Отменено.")
+    return ConversationHandler.END
+
+async def weekly_reminder(context: ContextTypes.DEFAULT_TYPE):
+    """Воскресенье 22:00 — напоминание об итогах недели."""
+    await context.bot.send_message(
+        chat_id=MY_CHAT_ID,
+        text="🗓 Время подвести итоги недели!\n\nНапиши /week чтобы начать.",
+    )
+
+async def monday_plan_reminder(context: ContextTypes.DEFAULT_TYPE):
+    """Понедельник 08:00 — план на неделю."""
+    plan = get_weekly_plan(get_current_week())
+    if plan:
+        await context.bot.send_message(
+            chat_id=MY_CHAT_ID,
+            text=f"☀️ *Доброе утро! Планы на эту неделю:*\n\n{plan}",
+            parse_mode="Markdown"
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=MY_CHAT_ID,
+            text="☀️ Доброе утро! Планов на эту неделю нет — заполни /week в воскресенье.",
+        )
+
 # =====================
 # ЗАПУСК
 # =====================
@@ -1036,14 +1182,31 @@ async def main():
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
+    weekly_conv = ConversationHandler(
+        entry_points=[CommandHandler("week", weekly_ask)],
+        states={
+            WQ1: [MessageHandler(filters.TEXT & ~filters.COMMAND, weekly_q1)],
+            WQ2: [MessageHandler(filters.TEXT & ~filters.COMMAND, weekly_q2)],
+            WQ3: [MessageHandler(filters.TEXT & ~filters.COMMAND, weekly_q3)],
+            WQ4: [MessageHandler(filters.TEXT & ~filters.COMMAND, weekly_q4)],
+            WQ5: [MessageHandler(filters.TEXT & ~filters.COMMAND, weekly_q5)],
+            WQ6: [MessageHandler(filters.TEXT & ~filters.COMMAND, weekly_q6)],
+            WQ7: [MessageHandler(filters.TEXT & ~filters.COMMAND, weekly_q7)],
+        },
+        fallbacks=[CommandHandler("cancel", weekly_cancel)],
+    )
+
     reflection_app.add_handler(CommandHandler("start", start_reflection))
     reflection_app.add_handler(conv_handler)
+    reflection_app.add_handler(weekly_conv)
     reflection_app.add_handler(CommandHandler("history", history))
     reflection_app.add_handler(CommandHandler("gratitude", gratitude_summary))
     reflection_app.add_handler(CommandHandler("plan", plan_command))
     reflection_app.job_queue.run_daily(morning_reminder, time=dtime(hour=10, minute=0, tzinfo=TIMEZONE))
     reflection_app.job_queue.run_daily(evening_questions, time=dtime(hour=21, minute=0, tzinfo=TIMEZONE))
     reflection_app.job_queue.run_monthly(monthly_gratitude_report, when=dtime(hour=9, tzinfo=TIMEZONE), day=1)
+    reflection_app.job_queue.run_daily(weekly_reminder, time=dtime(hour=22, minute=0, tzinfo=TIMEZONE), days=(6,))
+    reflection_app.job_queue.run_daily(monday_plan_reminder, time=dtime(hour=8, minute=0, tzinfo=TIMEZONE), days=(0,))
 
     # Бот курсов
     rates_app = Application.builder().token(BYBIT_BOT_TOKEN).build()
