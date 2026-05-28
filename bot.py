@@ -578,6 +578,29 @@ def _todoist_get_all_tasks() -> list:
     return tasks
 
 
+def _parse_due_date(due: dict) -> str:
+    """Возвращает строку даты YYYY-MM-DD из поля due."""
+    return str(due.get("date", ""))[:10]
+
+
+def _parse_due_time(due: dict):
+    """Возвращает локальный datetime если в due есть время, иначе None."""
+    date_str = due.get("date", "")
+    if not date_str or len(date_str) <= 10:
+        return None  # только дата, без времени
+    try:
+        # Todoist v1: время хранится в поле date как "2026-05-28T10:00:00"
+        # может быть без timezone — считаем UTC
+        if "+" not in date_str and date_str.endswith("Z"):
+            date_str = date_str.replace("Z", "+00:00")
+        elif "+" not in date_str and len(date_str) > 10:
+            date_str = date_str + "+00:00"
+        return datetime.fromisoformat(date_str).astimezone(TIMEZONE)
+    except Exception as e:
+        logger.error(f"Due time parse error: {e}, value: {date_str}")
+        return None
+
+
 def get_today_tasks() -> list:
     """Только задачи с дедлайном сегодня или просроченные — без inbox-мусора."""
     today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
@@ -585,14 +608,13 @@ def get_today_tasks() -> list:
     for task in _todoist_get_all_tasks():
         due = task.get("due")
         if not due:
-            continue  # задачи без даты — это inbox, не показываем в утренней рассылке
-        due_date = str(due.get("date", ""))[:10]
+            continue
+        due_date = _parse_due_date(due)
         if due_date and due_date <= today:
             result.append(task)
-    # Сортируем: сначала просроченные, потом по времени
     def sort_key(t):
-        due = t.get("due", {}) or {}
-        return due.get("datetime") or due.get("date") or "9999"
+        due = t.get("due") or {}
+        return due.get("date") or "9999"
     return sorted(result, key=sort_key)
 
 
@@ -604,16 +626,11 @@ def get_tasks_due_in_one_hour() -> list:
     result = []
     for task in _todoist_get_all_tasks():
         due = task.get("due")
-        if not due or not due.get("datetime"):
-            continue  # нужно точное время, не просто дата
-        try:
-            # Todoist отдаёт datetime в UTC
-            due_dt = datetime.fromisoformat(due["datetime"].replace("Z", "+00:00"))
-            due_local = due_dt.astimezone(TIMEZONE)
-            if target_start <= due_local <= target_end:
-                result.append(task)
-        except Exception as e:
-            logger.error(f"Datetime parse error: {e}")
+        if not due:
+            continue
+        due_local = _parse_due_time(due)
+        if due_local and target_start <= due_local <= target_end:
+            result.append(task)
     return result
 
 
@@ -625,16 +642,9 @@ def format_tasks(tasks: list, header: str = "Задачи на сегодня") 
     for i, task in enumerate(tasks, 1):
         priority_emoji = {1: "", 2: "🔵", 3: "🟡", 4: "🔴"}.get(task.get("priority", 1), "")
         due = task.get("due") or {}
-        # Показываем время если есть, или пометку "просрочено"
-        due_date = str(due.get("date", ""))[:10]
-        due_time = ""
-        if due.get("datetime"):
-            try:
-                due_dt = datetime.fromisoformat(due["datetime"].replace("Z", "+00:00"))
-                due_local = due_dt.astimezone(TIMEZONE)
-                due_time = f" `{due_local.strftime('%H:%M')}`"
-            except Exception:
-                pass
+        due_date = _parse_due_date(due)
+        due_local = _parse_due_time(due)
+        due_time = f" `{due_local.strftime('%H:%M')}`" if due_local else ""
         overdue = " ⚠️" if due_date and due_date < today else ""
         text += f"{i}.{priority_emoji}{due_time}{overdue} {task.get('content', '—')}\n"
     return text
@@ -988,8 +998,9 @@ async def deadline_reminder(context: ContextTypes.DEFAULT_TYPE):
         return
     for task in tasks:
         due = task.get("due", {}) or {}
-        due_dt = datetime.fromisoformat(due["datetime"].replace("Z", "+00:00"))
-        due_local = due_dt.astimezone(TIMEZONE)
+        due_local = _parse_due_time(due)
+        if not due_local:
+            continue
         priority_emoji = {1: "", 2: "🔵", 3: "🟡", 4: "🔴"}.get(task.get("priority", 1), "")
         await context.bot.send_message(
             chat_id=MY_CHAT_ID,
