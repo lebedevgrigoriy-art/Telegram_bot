@@ -1247,11 +1247,9 @@ async def main():
     reflection_app.add_handler(CommandHandler("history", history))
     reflection_app.add_handler(CommandHandler("gratitude", gratitude_summary))
     reflection_app.add_handler(CommandHandler("plan", plan_command))
-    reflection_app.job_queue.run_daily(morning_reminder, time=dtime(hour=10, minute=0, tzinfo=TIMEZONE))
     reflection_app.job_queue.run_daily(evening_questions, time=dtime(hour=21, minute=0, tzinfo=TIMEZONE))
     reflection_app.job_queue.run_monthly(monthly_gratitude_report, when=dtime(hour=9, tzinfo=TIMEZONE), day=1)
     reflection_app.job_queue.run_daily(weekly_reminder, time=dtime(hour=22, minute=0, tzinfo=TIMEZONE), days=(6,))
-    reflection_app.job_queue.run_daily(monday_plan_reminder, time=dtime(hour=8, minute=0, tzinfo=TIMEZONE), days=(0,))
 
     # Бот курсов
     rates_app = Application.builder().token(BYBIT_BOT_TOKEN).build()
