@@ -50,13 +50,14 @@ KP_API_KEY = os.environ.get("KP_API_KEY")
 SAVINGS_GOAL = 10000
 TODOIST_API = "https://api.todoist.com/api/v1"
 
-Q1, Q2, Q3, Q4, Q5 = range(5)
+Q1, Q2, Q_SELF, Q3, Q4, Q5 = range(6)
 ENTER_DATE, ENTER_EXPIRY = range(2)
 WQ1, WQ2, WQ3, WQ4, WQ5, WQ6, WQ7 = range(10, 17)
 
 QUESTIONS = [
     "🌙 Как прошёл сегодняшний день? Что запомнилось больше всего?",
     "🙏 Кому или чему ты сегодня благодарен?",
+    "🌟 За что ты благодарен самому себе за сегодня?",
     "📖 Какой урок или вывод можно вынести из сегодняшнего дня?",
     "🗓 Какой у тебя план на завтра? Три главных дела.",
 ]
@@ -127,6 +128,7 @@ def save_entry(date_str, answers):
         "saved_at": datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M"),
         "day_text": answers.get("day", ""),
         "gratitude": answers.get("gratitude", ""),
+        "self_gratitude": answers.get("self_gratitude", ""),
         "lesson": answers.get("lesson", ""),
         "plan": answers.get("plan", ""),
         "plan_review": answers.get("plan_review", ""),
@@ -765,12 +767,18 @@ async def answer_q1(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def answer_q2(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["answers"]["gratitude"] = update.message.text
     await update.message.reply_text(QUESTIONS[2])
+    return Q_SELF
+
+
+async def answer_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["answers"]["self_gratitude"] = update.message.text
+    await update.message.reply_text(QUESTIONS[3])
     return Q3
 
 
 async def answer_q3(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["answers"]["lesson"] = update.message.text
-    await update.message.reply_text(QUESTIONS[3])
+    await update.message.reply_text(QUESTIONS[4])
     return Q4
 
 
@@ -816,6 +824,7 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += f"✅ {row['plan_review']}\n"
         text += f"🌙 {row.get('day_text') or '—'}\n"
         text += f"🙏 {row.get('gratitude') or '—'}\n"
+        text += f"🌟 {row.get('self_gratitude') or '—'}\n"
         text += f"📖 {row.get('lesson') or '—'}\n"
         text += f"🗓 {row.get('plan') or '—'}\n"
         text += "─────────────\n"
@@ -1313,6 +1322,7 @@ async def main():
         states={
             Q1: [MessageHandler(filters.TEXT & ~filters.COMMAND, answer_q1)],
             Q2: [MessageHandler(filters.TEXT & ~filters.COMMAND, answer_q2)],
+            Q_SELF: [MessageHandler(filters.TEXT & ~filters.COMMAND, answer_self)],
             Q3: [MessageHandler(filters.TEXT & ~filters.COMMAND, answer_q3)],
             Q4: [MessageHandler(filters.TEXT & ~filters.COMMAND, answer_q4)],
             Q5: [MessageHandler(filters.TEXT & ~filters.COMMAND, answer_plan_review)],
