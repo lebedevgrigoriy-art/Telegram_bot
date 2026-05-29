@@ -99,10 +99,17 @@ def sb_get(table, params=None):
     return resp.json() if resp.ok else []
 
 
-def sb_upsert(table, data):
+def sb_upsert(table, data, on_conflict="id"):
     headers = sb_headers()
-    headers["Prefer"] = "resolution=merge-duplicates,return=representation"
-    resp = requests.post(f"{SUPABASE_URL}/rest/v1/{table}", headers=headers, json=data, timeout=10)
+    headers["Prefer"] = f"resolution=merge-duplicates,return=representation"
+    resp = requests.post(
+        f"{SUPABASE_URL}/rest/v1/{table}?on_conflict={on_conflict}",
+        headers=headers,
+        json=data,
+        timeout=10,
+    )
+    if not resp.ok:
+        logger.error(f"sb_upsert {table} error: {resp.status_code} {resp.text}")
     return resp.ok
 
 
