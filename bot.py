@@ -412,15 +412,70 @@ def make_gratitude_summary(entries, month_name):
 # КУРСЫ ВАЛЮТ
 # =====================
 
+def _yahoo_price(symbol: str) -> float | None:
+    """Цена через Yahoo Finance — без ключа."""
+    try:
+        resp = requests.get(
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+            params={"interval": "1d", "range": "1d"},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
+        result = resp.json()["chart"]["result"][0]
+        return result["meta"]["regularMarketPrice"]
+    except Exception as e:
+        logger.error(f"Yahoo Finance {symbol} error: {e}")
+        return None
+
+
+def _moex_index() -> float | None:
+    """Индекс Мосбиржи (IMOEX) через официальный API."""
+    try:
+        resp = requests.get(
+            "https://iss.moex.com/iss/engines/stock/markets/index/boards/SNDX/securities/IMOEX.json",
+            params={"iss.meta": "off", "iss.only": "marketdata"},
+            timeout=10,
+        )
+        data = resp.json()["marketdata"]
+        columns = data["columns"]
+        rows = data["data"]
+        if rows:
+            idx = columns.index("CURRENTVALUE")
+            return rows[0][idx]
+    except Exception as e:
+        logger.error(f"MOEX error: {e}")
+    return None
+
+
 def get_rates():
     try:
-        btc_resp = requests.get("https://api.coingecko.com/api/v3/simple/price", params={"ids": "bitcoin", "vs_currencies": "usd"}, timeout=10)
+        # Крипта
+        btc_resp = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": "bitcoin", "vs_currencies": "usd"},
+            timeout=10,
+        )
         btc_usd = btc_resp.json()["bitcoin"]["usd"]
+
+        # Валюты
         fx_resp = requests.get("https://open.er-api.com/v6/latest/USD", timeout=10)
         fx = fx_resp.json()["rates"]
         rub_per_usd = fx["RUB"]
         rub_per_thb = rub_per_usd / fx["THB"]
-        return {"btc_usd": btc_usd, "rub_per_usd": rub_per_usd, "rub_per_thb": rub_per_thb}
+
+        # Золото, S&P500, Мосбиржа
+        gold_usd = _yahoo_price("GC=F")       # Gold Futures
+        sp500 = _yahoo_price("^GSPC")         # S&P 500
+        moex = _moex_index()
+
+        return {
+            "btc_usd": btc_usd,
+            "rub_per_usd": rub_per_usd,
+            "rub_per_thb": rub_per_thb,
+            "gold_usd": gold_usd,
+            "sp500": sp500,
+            "moex": moex,
+        }
     except Exception as e:
         logger.error(f"Rates error: {e}")
         return None
@@ -431,7 +486,26 @@ def format_rates(rates):
         return "❌ Не удалось получить курсы."
     now = datetime.now(TIMEZONE).strftime("%d.%m.%Y %H:%M")
     btc_str = f"{rates['btc_usd']:,.0f}".replace(",", " ")
-    return f"📊 *Курсы на {now}*\n\n₿ *Bitcoin:* `${btc_str}`\n💵 *Доллар:* `{rates['rub_per_usd']:.2f} ₽`\n🇹🇭 *Бат:* `{rates['rub_per_thb']:.2f} ₽`\n"
+
+    lines = [f"📊 *Курсы на {now}*\n"]
+
+    # Крипта и валюты
+    lines.append(f"₿ *Bitcoin:* `${btc_str}`")
+    lines.append(f"💵 *Доллар:* `{rates['rub_per_usd']:.2f} ₽`")
+    lines.append(f"🇹🇭 *Бат:* `{rates['rub_per_thb']:.2f} ₽`")
+
+    # Рынки
+    if rates.get("gold_usd"):
+        gold_str = f"{rates['gold_usd']:,.0f}".replace(",", " ")
+        lines.append(f"🥇 *Золото:* `${gold_str}/oz`")
+    if rates.get("sp500"):
+        sp_str = f"{rates['sp500']:,.0f}".replace(",", " ")
+        lines.append(f"📈 *S&P 500:* `{sp_str}`")
+    if rates.get("moex"):
+        moex_str = f"{rates['moex']:,.0f}".replace(",", " ")
+        lines.append(f"🇷🇺 *Мосбиржа:* `{moex_str}`")
+
+    return "\n".join(lines)
 
 
 # =====================
@@ -602,20 +676,27 @@ def _parse_due_time(due: dict):
 
 
 def get_today_tasks() -> list:
-    """Только задачи с дедлайном сегодня или просроченные — без inbox-мусора."""
-    today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
-    result = []
-    for task in _todoist_get_all_tasks():
-        due = task.get("due")
-        if not due:
-            continue
-        due_date = _parse_due_date(due)
-        if due_date and due_date <= today:
-            result.append(task)
+    """Задачи на сегодня через filter=today — Todoist сам считает просроченные."""
+    resp = requests.get(
+        f"{TODOIST_API}/tasks",
+        headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
+        params={"filter": "today | overdue"},
+        timeout=10,
+    )
+    if resp.status_code != 200:
+        logger.error(f"Todoist today tasks error: {resp.status_code} {resp.text}")
+        return []
+    data = resp.json()
+    logger.info(f"Todoist today filter response: {str(data)[:200]}")
+    if isinstance(data, dict):
+        tasks = [t for t in data.get("results", []) if isinstance(t, dict)]
+    else:
+        tasks = [t for t in data if isinstance(t, dict)] if isinstance(data, list) else []
+    logger.info(f"Todoist today tasks count: {len(tasks)}")
     def sort_key(t):
         due = t.get("due") or {}
         return due.get("date") or "9999"
-    return sorted(result, key=sort_key)
+    return sorted(tasks, key=sort_key)
 
 
 def get_tasks_due_in_one_hour() -> list:
