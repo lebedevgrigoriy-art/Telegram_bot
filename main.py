@@ -10,6 +10,7 @@ from telegram import Update
 
 import bot as core_bots          # существующие 7 ботов
 import podcast_bot               # подкаст-дайджест
+import wishlist_bot              # вишлист
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -21,6 +22,7 @@ logger = logging.getLogger("main")
 MODULES = [
     ("core", core_bots),
     ("podcast", podcast_bot),
+    ("wishlist", wishlist_bot),
 ]
 
 
