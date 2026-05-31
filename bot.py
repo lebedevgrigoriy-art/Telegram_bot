@@ -38,6 +38,7 @@ TODOIST_TOKEN = os.environ.get("TODOIST_TOKEN")
 SAVINGS_BOT_TOKEN = os.environ.get("SAVINGS_BOT_TOKEN")
 BOOKS_BOT_TOKEN = os.environ.get("BOOKS_BOT_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
@@ -270,27 +271,23 @@ def save_monthly_topic(topic):
 
 
 def _ask_claude(prompt: str, max_tokens: int = 2000) -> str:
-    """Запрос к Claude. Возвращает пустую строку если ключа нет или ошибка."""
-    if not ANTHROPIC_API_KEY:
+    """Запрос к Gemini (имя оставлено прежним для совместимости). Пустая строка при ошибке."""
+    if not GEMINI_API_KEY:
         return ""
     try:
         resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
+            headers={"Content-Type": "application/json"},
             json={
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": max_tokens,
-                "messages": [{"role": "user", "content": prompt}],
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.7},
             },
             timeout=30,
         )
-        return resp.json()["content"][0]["text"]
+        data = resp.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"]
     except Exception as e:
-        logger.error(f"Claude error: {e}")
+        logger.error(f"Gemini error: {e}")
         return ""
 
 
@@ -362,7 +359,7 @@ def format_book(book: dict, num: int) -> str:
 async def send_weekly_books(bot, chat_id):
     books = get_weekly_books()
     if not books:
-        await bot.send_message(chat_id=chat_id, text="📚 Книжный бот заработает после добавления ANTHROPIC_API_KEY.")
+        await bot.send_message(chat_id=chat_id, text="📚 Книжный бот заработает после добавления GEMINI_API_KEY.")
         return
     now = datetime.now(TIMEZONE).strftime("%d.%m.%Y")
     await bot.send_message(chat_id=chat_id,
@@ -384,7 +381,7 @@ async def send_weekly_books(bot, chat_id):
 async def send_recommendations(bot, chat_id, topic):
     books = get_books_by_topic(topic)
     if not books:
-        await bot.send_message(chat_id=chat_id, text=f"📚 Рекомендации по теме *{topic}* заработают после добавления ANTHROPIC_API_KEY.", parse_mode="Markdown")
+        await bot.send_message(chat_id=chat_id, text=f"📚 Рекомендации по теме *{topic}* заработают после добавления GEMINI_API_KEY.", parse_mode="Markdown")
         return
     await bot.send_message(chat_id=chat_id, text=f"📚 *Лучшие книги: {topic}*", parse_mode="Markdown")
     for i, book in enumerate(books, 1):
@@ -404,7 +401,7 @@ def make_gratitude_summary(entries, month_name):
     if not entries:
         return "За этот месяц записей ещё нет."
     all_text = "\n".join(f"- {g}" for _, g in entries)
-    if ANTHROPIC_API_KEY:
+    if GEMINI_API_KEY:
         summary = _ask_claude(
             f"Записи благодарности за {month_name}:\n{all_text}\n\nТезисная сводка: кому благодарил чаще, за что, общий тон. 5-8 предложений.",
             max_tokens=500,
