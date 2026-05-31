@@ -685,23 +685,26 @@ def _parse_due_time(due: dict):
 
 
 def get_today_tasks() -> list:
-    """Задачи с дедлайном сегодня или раньше (просроченные). Без inbox без даты."""
-    today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
-    all_tasks = _todoist_get_all_tasks()
-    dated = [(t.get("content", "")[:20], _parse_due_date(t.get("due") or {})) for t in all_tasks if t.get("due")]
-    logger.info(f"Todoist today={today}, dated tasks: {dated[:20]}")
-    result = []
-    for task in all_tasks:
-        due = task.get("due")
-        if not due:
-            continue
-        due_date = _parse_due_date(due)
-        if due_date and due_date <= today:
-            result.append(task)
+    """Задачи как в разделе 'Сегодня' Todoist — через filter эндпоинт."""
+    resp = requests.get(
+        f"{TODOIST_API}/tasks/filter",
+        headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
+        params={"query": "today | overdue"},
+        timeout=10,
+    )
+    if resp.status_code != 200:
+        logger.error(f"Todoist filter error: {resp.status_code} {resp.text}")
+        return []
+    data = resp.json()
+    if isinstance(data, dict):
+        tasks = [t for t in data.get("results", []) if isinstance(t, dict)]
+    else:
+        tasks = [t for t in data if isinstance(t, dict)] if isinstance(data, list) else []
+    logger.info(f"Todoist filter 'today | overdue' returned: {len(tasks)} tasks")
     def sort_key(t):
         due = t.get("due") or {}
-        return due.get("date") or "9999"
-    return sorted(result, key=sort_key)
+        return due.get("date") or "0"
+    return sorted(tasks, key=sort_key)
 
 
 def get_tasks_due_in_one_hour() -> list:
