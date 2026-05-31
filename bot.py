@@ -1110,6 +1110,126 @@ async def deadline_reminder(context: ContextTypes.DEFAULT_TYPE):
 
 
 # =====================
+# ДНИ РОЖДЕНИЯ
+# =====================
+
+def _get_birthday_project_id() -> str | None:
+    """Находит ID проекта 'Дни рождения' по названию."""
+    try:
+        resp = requests.get(
+            f"{TODOIST_API}/projects",
+            headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            logger.error(f"Todoist projects error: {resp.status_code}")
+            return None
+        data = resp.json()
+        projects = data.get("results", []) if isinstance(data, dict) else data
+        for p in projects:
+            if isinstance(p, dict) and "дни рождения" in p.get("name", "").lower():
+                return p.get("id")
+    except Exception as e:
+        logger.error(f"Birthday project lookup error: {e}")
+    return None
+
+
+def get_birthday_tasks() -> list:
+    """Все задачи из проекта 'Дни рождения'."""
+    project_id = _get_birthday_project_id()
+    if not project_id:
+        return []
+    try:
+        resp = requests.get(
+            f"{TODOIST_API}/tasks",
+            headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
+            params={"project_id": project_id},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+        tasks = data.get("results", []) if isinstance(data, dict) else data
+        return [t for t in tasks if isinstance(t, dict)]
+    except Exception as e:
+        logger.error(f"Birthday tasks error: {e}")
+        return []
+
+
+async def check_birthday_reminders(context: ContextTypes.DEFAULT_TYPE):
+    """Ежедневно в 09:00 — напоминания за 7, 1 и 0 дней до ДР."""
+    today = datetime.now(TIMEZONE).date()
+    for task in get_birthday_tasks():
+        due = task.get("due")
+        if not due:
+            continue
+        due_date_str = _parse_due_date(due)
+        if not due_date_str:
+            continue
+        try:
+            bday = datetime.strptime(due_date_str, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        days_until = (bday - today).days
+        name = task.get("content", "—")
+
+        if days_until == 7:
+            await context.bot.send_message(
+                chat_id=MY_CHAT_ID,
+                text=f"🎂 *Через неделю день рождения!*\n\n{name}\n\n📅 {due_date_str}\n\nЕсть время выбрать подарок 🎁",
+                parse_mode="Markdown",
+            )
+        elif days_until == 1:
+            await context.bot.send_message(
+                chat_id=MY_CHAT_ID,
+                text=f"🎉 *Завтра день рождения!*\n\n{name}\n\nНе забудь поздравить! 🥳",
+                parse_mode="Markdown",
+            )
+        elif days_until == 0:
+            await context.bot.send_message(
+                chat_id=MY_CHAT_ID,
+                text=f"🎈 *Сегодня день рождения!*\n\n{name}\n\nСамое время поздравить! 🎊",
+                parse_mode="Markdown",
+            )
+
+
+async def birthdays_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать ближайшие дни рождения."""
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+    today = datetime.now(TIMEZONE).date()
+    upcoming = []
+    for task in get_birthday_tasks():
+        due = task.get("due")
+        if not due:
+            continue
+        due_date_str = _parse_due_date(due)
+        if not due_date_str:
+            continue
+        try:
+            bday = datetime.strptime(due_date_str, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        days_until = (bday - today).days
+        if 0 <= days_until <= 60:
+            upcoming.append((days_until, task.get("content", "—"), due_date_str))
+    if not upcoming:
+        await update.message.reply_text("🎂 В ближайшие 2 месяца дней рождения нет.")
+        return
+    upcoming.sort()
+    text = "🎂 *Ближайшие дни рождения:*\n\n"
+    for days, name, date_str in upcoming:
+        if days == 0:
+            when = "сегодня! 🎉"
+        elif days == 1:
+            when = "завтра"
+        else:
+            when = f"через {days} дн."
+        text += f"• {name} — {when}\n"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# =====================
 # ХЕНДЛЕРЫ — НАКОПЛЕНИЯ
 # =====================
 
@@ -1395,6 +1515,8 @@ async def main():
     todoist_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, todoist_handle_message))
     todoist_app.job_queue.run_daily(morning_tasks, time=dtime(hour=9, minute=0, tzinfo=TIMEZONE))
     todoist_app.job_queue.run_repeating(deadline_reminder, interval=1800, first=60)  # каждые 30 минут
+    todoist_app.add_handler(CommandHandler("birthdays", birthdays_command))
+    todoist_app.job_queue.run_daily(check_birthday_reminders, time=dtime(hour=9, minute=0, tzinfo=TIMEZONE))
 
     # Бот накоплений
     savings_app = Application.builder().token(SAVINGS_BOT_TOKEN).build()
