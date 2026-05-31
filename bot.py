@@ -1412,24 +1412,23 @@ async def main():
     books_app.job_queue.run_daily(weekly_books_report, time=dtime(hour=9, minute=0, tzinfo=TIMEZONE), days=(0,))
     books_app.job_queue.run_monthly(monthly_books_question, when=dtime(hour=10, tzinfo=TIMEZONE), day=1)
 
-    async with reflection_app, rates_app, cinema_app, visa_app, todoist_app, savings_app, books_app:
-        await reflection_app.start()
-        await rates_app.start()
-        await cinema_app.start()
-        await visa_app.start()
-        await todoist_app.start()
-        await savings_app.start()
-        await books_app.start()
-        await reflection_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        await rates_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        await cinema_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        await visa_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        await todoist_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        await savings_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        await books_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    return [
+        reflection_app, rates_app, cinema_app,
+        visa_app, todoist_app, savings_app, books_app,
+    ]
+
+
+async def _run_standalone():
+    """Автономный запуск bot.py отдельно (если не через main.py)."""
+    apps = await main()
+    async with apps[0], apps[1], apps[2], apps[3], apps[4], apps[5], apps[6]:
+        for app in apps:
+            await app.start()
+        for app in apps:
+            await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         logger.info("Все боты запущены.")
         await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(_run_standalone())
