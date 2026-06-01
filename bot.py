@@ -276,16 +276,28 @@ def _ask_claude(prompt: str, max_tokens: int = 2000) -> str:
         return ""
     try:
         resp = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}",
             headers={"Content-Type": "application/json"},
             json={
                 "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.7},
+                "generationConfig": {
+                    "maxOutputTokens": max_tokens,
+                    "temperature": 0.7,
+                    "thinkingConfig": {"thinkingBudget": 0},
+                },
             },
             timeout=30,
         )
         data = resp.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+        candidates = data.get("candidates", [])
+        if not candidates:
+            logger.error(f"Gemini no candidates: {str(data)[:300]}")
+            return ""
+        parts = candidates[0].get("content", {}).get("parts", [])
+        if not parts:
+            logger.error(f"Gemini no parts: {str(data)[:300]}")
+            return ""
+        return parts[0].get("text", "")
     except Exception as e:
         logger.error(f"Gemini error: {e}")
         return ""
