@@ -140,7 +140,7 @@ def save_entry(date_str, answers):
         "lesson": answers.get("lesson", ""),
         "plan": answers.get("plan", ""),
         "plan_review": answers.get("plan_review", ""),
-    })
+    }, on_conflict="date")
 
 
 def get_yesterday_plan():
@@ -190,7 +190,7 @@ def save_weekly_entry(week, answers):
         "regrets": answers.get("regrets", ""),
         "plan": answers.get("plan", ""),
         "plan_review": answers.get("plan_review", ""),
-    })
+    }, on_conflict="week")
 
 def get_weekly_plan(week):
     rows = sb_get("weekly_journal", {"week": f"eq.{week}"})
@@ -270,7 +270,7 @@ def load_monthly_topic():
 
 def save_monthly_topic(topic):
     month = datetime.now(TIMEZONE).strftime("%Y-%m")
-    sb_upsert("books_topic", {"month": month, "topic": topic})
+    sb_upsert("books_topic", {"month": month, "topic": topic}, on_conflict="month")
 
 
 def _ask_claude(prompt: str, max_tokens: int = 2000) -> str:
