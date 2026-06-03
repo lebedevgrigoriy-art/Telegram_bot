@@ -24,24 +24,36 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 # =====================
 
 def ask_gemini(prompt: str, max_tokens: int = 500) -> str:
-    """Запрос к Gemini. Пустая строка если ключа нет или ошибка."""
+    """Запрос к Gemini с повтором при пустом ответе. Пустая строка если ключа нет или 2 неудачи."""
     if not GEMINI_API_KEY:
         return ""
-    try:
-        resp = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
-            headers={"Content-Type": "application/json"},
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.9},
-            },
-            timeout=30,
-        )
-        data = resp.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-    except Exception as e:
-        logger.error(f"Gemini error: {e} | resp: {resp.text[:300] if 'resp' in dir() else ''}")
-        return ""
+    for attempt in range(2):
+        try:
+            resp = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {
+                        "maxOutputTokens": max_tokens,
+                        "temperature": 0.9,
+                        "thinkingConfig": {"thinkingBudget": 0},
+                    },
+                },
+                timeout=30,
+            )
+            data = resp.json()
+            candidates = data.get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if parts:
+                    text = parts[0].get("text", "").strip()
+                    if text:
+                        return text
+            logger.error(f"Gemini empty (attempt {attempt + 1}): {str(data)[:300]}")
+        except Exception as e:
+            logger.error(f"Gemini error (attempt {attempt + 1}): {e}")
+    return ""
 
 
 # =====================
@@ -112,7 +124,7 @@ def generate_quote() -> str:
             "Цитата должна быть подлинной, не выдумывай. "
             "Ответь СТРОГО в формате:\n«Цитата»\n— Автор\n\nБез пояснений."
         )
-    quote = ask_gemini(prompt, max_tokens=300)
+    quote = ask_gemini(prompt, max_tokens=800)
     return quote
 
 
