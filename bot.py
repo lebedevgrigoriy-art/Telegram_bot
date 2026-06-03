@@ -343,18 +343,24 @@ def get_books_by_topic(topic: str) -> list:
 
 
 def get_cover_url(title: str, author: str) -> str | None:
-    """Обложка через Open Library — бесплатно, без ключа."""
-    try:
-        resp = requests.get(
-            "https://openlibrary.org/search.json",
-            params={"q": f"{title} {author}", "limit": 1, "fields": "cover_i"},
-            timeout=8,
-        )
-        docs = resp.json().get("docs", [])
-        if docs and docs[0].get("cover_i"):
-            return f"https://covers.openlibrary.org/b/id/{docs[0]['cover_i']}-L.jpg"
-    except Exception as e:
-        logger.error(f"Open Library error: {e}")
+    """Обложка через Open Library — бесплатно, без ключа. Несколько попыток."""
+    queries = []
+    if title and author:
+        queries.append(f"{title} {author}")
+    if title:
+        queries.append(title)
+    for q in queries:
+        try:
+            resp = requests.get(
+                "https://openlibrary.org/search.json",
+                params={"q": q, "limit": 5, "fields": "cover_i"},
+                timeout=8,
+            )
+            for doc in resp.json().get("docs", []):
+                if doc.get("cover_i"):
+                    return f"https://covers.openlibrary.org/b/id/{doc['cover_i']}-L.jpg"
+        except Exception as e:
+            logger.error(f"Open Library error: {e}")
     return None
 
 
