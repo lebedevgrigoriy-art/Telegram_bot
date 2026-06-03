@@ -145,16 +145,19 @@ def save_entry(date_str, answers):
 
 def get_yesterday_plan():
     today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
-    rows = sb_get("journal", {"date": f"lt.{today}", "plan": "neq.", "order": "date.desc", "limit": 1})
-    if rows:
-        return rows[0]["date"], rows[0]["plan"]
+    # Берём последние записи до сегодня и находим первую с непустым планом
+    rows = sb_get("journal", {"date": f"lt.{today}", "order": "date.desc", "limit": "10"})
+    for row in rows:
+        plan = (row.get("plan") or "").strip()
+        if plan:
+            return row["date"], plan
     return None, None
 
 
 def get_monthly_gratitude():
     month = datetime.now(TIMEZONE).strftime("%Y-%m")
-    rows = sb_get("journal", {"date": f"like.{month}%", "gratitude": "neq.", "order": "date.asc"})
-    return [(r["date"], r["gratitude"]) for r in rows]
+    rows = sb_get("journal", {"date": f"like.{month}%", "order": "date.asc"})
+    return [(r["date"], r["gratitude"]) for r in rows if (r.get("gratitude") or "").strip()]
 
 
 def get_journal_history():
@@ -271,36 +274,36 @@ def save_monthly_topic(topic):
 
 
 def _ask_claude(prompt: str, max_tokens: int = 2000) -> str:
-    """Запрос к Gemini (имя оставлено прежним для совместимости). Пустая строка при ошибке."""
+    """Запрос к Gemini (имя оставлено прежним для совместимости). Повтор при пустом ответе."""
     if not GEMINI_API_KEY:
         return ""
-    try:
-        resp = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}",
-            headers={"Content-Type": "application/json"},
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "maxOutputTokens": max_tokens,
-                    "temperature": 0.7,
-                    "thinkingConfig": {"thinkingBudget": 0},
+    for attempt in range(2):
+        try:
+            resp = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {
+                        "maxOutputTokens": max_tokens,
+                        "temperature": 0.7,
+                        "thinkingConfig": {"thinkingBudget": 0},
+                    },
                 },
-            },
-            timeout=30,
-        )
-        data = resp.json()
-        candidates = data.get("candidates", [])
-        if not candidates:
-            logger.error(f"Gemini no candidates: {str(data)[:300]}")
-            return ""
-        parts = candidates[0].get("content", {}).get("parts", [])
-        if not parts:
-            logger.error(f"Gemini no parts: {str(data)[:300]}")
-            return ""
-        return parts[0].get("text", "")
-    except Exception as e:
-        logger.error(f"Gemini error: {e}")
-        return ""
+                timeout=30,
+            )
+            data = resp.json()
+            candidates = data.get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if parts:
+                    text = parts[0].get("text", "")
+                    if text:
+                        return text
+            logger.error(f"Gemini empty (attempt {attempt + 1}): {str(data)[:300]}")
+        except Exception as e:
+            logger.error(f"Gemini error (attempt {attempt + 1}): {e}")
+    return ""
 
 
 def _get_books_from_claude(prompt: str) -> list:
