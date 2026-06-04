@@ -58,7 +58,7 @@ WQ1, WQ2, WQ3, WQ4, WQ5, WQ6, WQ7 = range(10, 17)
 QUESTIONS = [
     "🌙 Как прошёл сегодняшний день? Что запомнилось больше всего?",
     "🙏 Кому или чему ты сегодня благодарен?",
-    "🌟 За что ты благодарен самому себе за сегодня?",
+    "🏆 Чем ты сегодня можешь гордиться? Какие были успехи, даже маленькие?",
     "📖 Какой урок или вывод можно вынести из сегодняшнего дня?",
     "🗓 Какой у тебя план на завтра? Три главных дела.",
 ]
@@ -197,6 +197,52 @@ def get_weekly_plan(week):
     if rows:
         return rows[0].get("plan", "")
     return None
+
+
+def make_weekly_ai_summary(weekly_answers):
+    """AI-сводка недели: дневные записи за 7 дней + ответы /week → сводка с паттернами."""
+    today = datetime.now(TIMEZONE)
+    week_ago = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+    rows = sb_get("journal", {"date": f"gte.{week_ago}", "order": "date.asc"})
+
+    daily_text = ""
+    for r in rows:
+        parts = []
+        if r.get("day_text"):
+            parts.append(f"день: {r['day_text']}")
+        if r.get("self_gratitude"):
+            parts.append(f"гордость/успехи: {r['self_gratitude']}")
+        if r.get("gratitude"):
+            parts.append(f"благодарность: {r['gratitude']}")
+        if r.get("lesson"):
+            parts.append(f"урок: {r['lesson']}")
+        if parts:
+            daily_text += f"\n{r['date']}: " + "; ".join(parts)
+
+    weekly_text = (
+        f"Итоги: {weekly_answers.get('summary', '')}\n"
+        f"Беспокоило: {weekly_answers.get('worries', '')}\n"
+        f"Радовало: {weekly_answers.get('joys', '')}\n"
+        f"Благодарность: {weekly_answers.get('gratitude', '')}\n"
+        f"Сожаления: {weekly_answers.get('regrets', '')}"
+    )
+
+    if not daily_text and not weekly_text.strip():
+        return None
+
+    prompt = (
+        "Ты — внимательный и поддерживающий помощник по саморефлексии. "
+        "Вот записи человека за прошедшую неделю.\n\n"
+        f"Ежедневные записи:{daily_text or ' (нет)'}\n\n"
+        f"Недельные итоги:\n{weekly_text}\n\n"
+        "Сделай тёплую, но честную сводку недели (без воды, по делу):\n"
+        "1. Чем человек может гордиться за неделю — 2-3 конкретных пункта из его записей.\n"
+        "2. Какие повторяющиеся темы, настроения или паттерны заметны (и хорошие, и тревожные).\n"
+        "3. Одно мягкое наблюдение или вопрос для размышления на следующую неделю.\n\n"
+        "Пиши на «ты», живым языком, 6-10 предложений. Без markdown-заголовков."
+    )
+    summary = _ask_claude(prompt, max_tokens=1500)
+    return summary or None
 
 def get_last_week_plan():
     last_week = get_last_week()
@@ -857,7 +903,7 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += f"✅ {row['plan_review']}\n"
         text += f"🌙 {row.get('day_text') or '—'}\n"
         text += f"🙏 {row.get('gratitude') or '—'}\n"
-        text += f"🌟 {row.get('self_gratitude') or '—'}\n"
+        text += f"🏆 {row.get('self_gratitude') or '—'}\n"
         text += f"📖 {row.get('lesson') or '—'}\n"
         text += f"🗓 {row.get('plan') or '—'}\n"
         text += "─────────────\n"
@@ -1427,11 +1473,19 @@ async def weekly_q6(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def weekly_q7(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["weekly_answers"]["plan"] = update.message.text
     week = context.user_data["week"]
-    save_weekly_entry(week, context.user_data["weekly_answers"])
+    answers = context.user_data["weekly_answers"]
+    save_weekly_entry(week, answers)
     await update.message.reply_text(
-        f"✅ *Итоги недели сохранены!*\n\nХорошей следующей недели! 💪",
+        f"✅ *Итоги недели сохранены!*\n\nГотовлю сводку за неделю... 🧠",
         parse_mode="Markdown"
     )
+    summary = make_weekly_ai_summary(answers)
+    if summary:
+        await update.message.reply_text(
+            f"📊 *Твоя неделя — взгляд со стороны*\n\n{summary}",
+            parse_mode="Markdown"
+        )
+    await update.message.reply_text("Хорошей следующей недели! 💪")
     return ConversationHandler.END
 
 async def weekly_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
