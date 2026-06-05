@@ -164,6 +164,83 @@ def get_journal_history():
     return sb_get("journal", {"order": "date.desc", "limit": "7"})
 
 
+def get_month_entries(month_str=None):
+    """Все записи журнала за месяц (по умолчанию текущий). month_str формата YYYY-MM."""
+    if month_str is None:
+        month_str = datetime.now(TIMEZONE).strftime("%Y-%m")
+    return sb_get("journal", {"date": f"like.{month_str}%", "order": "date.asc"})
+
+
+def make_month_portrait(month_str=None):
+    """Глубокий AI-разбор месяца: ежедневные + еженедельные записи, теневые паттерны."""
+    if month_str is None:
+        month_str = datetime.now(TIMEZONE).strftime("%Y-%m")
+    rows = get_month_entries(month_str)
+
+    # Ежедневные записи
+    journal_text = ""
+    for r in rows:
+        parts = []
+        if r.get("day_text"):
+            parts.append(f"день: {r['day_text']}")
+        if r.get("self_gratitude"):
+            parts.append(f"гордость/успехи: {r['self_gratitude']}")
+        if r.get("gratitude"):
+            parts.append(f"благодарность: {r['gratitude']}")
+        if r.get("lesson"):
+            parts.append(f"урок: {r['lesson']}")
+        if r.get("plan"):
+            parts.append(f"планы: {r['plan']}")
+        if r.get("plan_review"):
+            parts.append(f"выполнение плана: {r['plan_review']}")
+        if parts:
+            journal_text += f"\n{r['date']}: " + "; ".join(parts)
+
+    # Еженедельные итоги за этот же месяц
+    weekly_rows = sb_get("weekly_journal", {"saved_at": f"like.{month_str}%", "order": "saved_at.asc"})
+    weekly_text = ""
+    for w in weekly_rows:
+        parts = []
+        if w.get("summary"):
+            parts.append(f"итоги недели: {w['summary']}")
+        if w.get("worries"):
+            parts.append(f"беспокоило: {w['worries']}")
+        if w.get("joys"):
+            parts.append(f"радовало: {w['joys']}")
+        if w.get("gratitude"):
+            parts.append(f"благодарность: {w['gratitude']}")
+        if w.get("regrets"):
+            parts.append(f"сожаления: {w['regrets']}")
+        if parts:
+            weekly_text += f"\nНеделя ({w.get('week', '')}): " + "; ".join(parts)
+
+    if not journal_text.strip() and not weekly_text.strip():
+        return None
+
+    prompt = (
+        "Ты — мудрый, проницательный и поддерживающий психолог-аналитик. "
+        "Перед тобой ДВА слоя саморефлексии человека за месяц: "
+        "ежедневные записи (что он замечал каждый день) и еженедельные итоги "
+        "(как он подводил черту крупными мазками раз в неделю).\n\n"
+        f"=== ЕЖЕДНЕВНЫЕ ЗАПИСИ ===\n{journal_text or '(нет)'}\n\n"
+        f"=== ЕЖЕНЕДЕЛЬНЫЕ ИТОГИ ===\n{weekly_text or '(нет)'}\n\n"
+        "Напиши «Портрет месяца» — глубокий, тёплый, но честный разбор. "
+        "Учитывай ОБА слоя и обязательно сравнивай их между собой. Структура:\n\n"
+        "🌅 *Каким был этот месяц* — 3-4 предложения: чем запомнился, на что ушла энергия, общее настроение.\n\n"
+        "🏆 *Чем гордиться* — 3-4 конкретных достижения и роста из записей.\n\n"
+        "🔁 *Паттерны* — 2-3 повторяющиеся темы, связи, закономерности (хорошие и тревожные): "
+        "что поднимает настроение, от чего зависит продуктивность, что повторяется в тревогах.\n\n"
+        "🌑 *Теневые паттерны* — самое важное. Сравни ежедневные записи с еженедельными итогами и найди РАСХОЖДЕНИЯ: "
+        "о чём человек умалчивает в моменте, но прорывается в недельных итогах (или наоборот). "
+        "Что он, возможно, не осознаёт про себя. Что копится незаметно. Темы, которые он обходит стороной. "
+        "Будь деликатным, но честным — это ценнее всего.\n\n"
+        "🌱 *Над чем подумать* — одно мягкое, но важное наблюдение или вопрос на следующий месяц.\n\n"
+        "Пиши на «ты», живым человеческим языком, без канцелярита. "
+        "Используй *жирный* для подзаголовков как показано. Будь конкретным, ссылайся на записи, а не говори общими словами."
+    )
+    return _ask_claude(prompt, max_tokens=3000) or None
+
+
 # =====================
 # ЕЖЕНЕДЕЛЬНЫЙ ЖУРНАЛ
 # =====================
@@ -824,7 +901,8 @@ async def start_reflection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/ask — начать рефлексию\n"
         "/plan — план на сегодня\n"
         "/history — последние 7 записей\n"
-        "/gratitude — сводка благодарностей"
+        "/gratitude — сводка благодарностей\n"
+        "/portrait — портрет месяца 🖼"
     )
 
 
@@ -944,6 +1022,27 @@ async def monthly_gratitude_report(context: ContextTypes.DEFAULT_TYPE):
     entries = get_monthly_gratitude()
     month_name = datetime.now(TIMEZONE).strftime("%B %Y")
     await context.bot.send_message(chat_id=MY_CHAT_ID, text=make_gratitude_summary(entries, month_name), parse_mode="Markdown")
+
+
+async def portrait_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+    await update.message.reply_text("🖼 Собираю портрет месяца... Это займёт несколько секунд. 🧠")
+    portrait = make_month_portrait()
+    if portrait:
+        month_name = datetime.now(TIMEZONE).strftime("%B %Y")
+        await update.message.reply_text(f"🖼 *Портрет месяца — {month_name}*\n\n{portrait}", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("За этот месяц пока мало записей для портрета. Веди дневник — и в конце месяца получишь разбор.")
+
+
+async def monthly_portrait_report(context: ContextTypes.DEFAULT_TYPE):
+    """1-го числа — портрет ПРОШЕДШЕГО месяца."""
+    last_month = (datetime.now(TIMEZONE).replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+    portrait = make_month_portrait(last_month)
+    if portrait:
+        month_name = (datetime.now(TIMEZONE).replace(day=1) - timedelta(days=1)).strftime("%B %Y")
+        await context.bot.send_message(chat_id=MY_CHAT_ID, text=f"🖼 *Портрет месяца — {month_name}*\n\n{portrait}", parse_mode="Markdown")
 
 
 # =====================
@@ -1556,8 +1655,10 @@ async def main():
     reflection_app.add_handler(CommandHandler("history", history))
     reflection_app.add_handler(CommandHandler("gratitude", gratitude_summary))
     reflection_app.add_handler(CommandHandler("plan", plan_command))
+    reflection_app.add_handler(CommandHandler("portrait", portrait_command))
     reflection_app.job_queue.run_daily(evening_questions, time=dtime(hour=21, minute=0, tzinfo=TIMEZONE))
     reflection_app.job_queue.run_monthly(monthly_gratitude_report, when=dtime(hour=9, tzinfo=TIMEZONE), day=1)
+    reflection_app.job_queue.run_monthly(monthly_portrait_report, when=dtime(hour=10, tzinfo=TIMEZONE), day=1)
     reflection_app.job_queue.run_daily(weekly_reminder, time=dtime(hour=22, minute=0, tzinfo=TIMEZONE), days=(6,))
 
     # Бот курсов
