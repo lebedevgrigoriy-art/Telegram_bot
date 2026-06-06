@@ -39,6 +39,7 @@ SAVINGS_BOT_TOKEN = os.environ.get("SAVINGS_BOT_TOKEN")
 BOOKS_BOT_TOKEN = os.environ.get("BOOKS_BOT_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GOOGLE_BOOKS_API_KEY = os.environ.get("GOOGLE_BOOKS_API_KEY", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
@@ -51,12 +52,13 @@ KP_API_KEY = os.environ.get("KP_API_KEY")
 SAVINGS_GOAL = 10000
 TODOIST_API = "https://api.todoist.com/api/v1"
 
-Q1, Q2, Q_SELF, Q3, Q4, Q5 = range(6)
+Q1, Q_MOOD, Q2, Q_SELF, Q3, Q4, Q5 = range(7)
 ENTER_DATE, ENTER_EXPIRY = range(2)
 WQ1, WQ2, WQ3, WQ4, WQ5, WQ6, WQ7 = range(10, 17)
 
 QUESTIONS = [
     "🌙 Как прошёл сегодняшний день? Что запомнилось больше всего?",
+    "💭 Как ты себя чувствуешь? Какие эмоции и состояние сегодня?",
     "🙏 Кому или чему ты сегодня благодарен?",
     "🏆 Чем ты сегодня можешь гордиться? Какие были успехи, даже маленькие?",
     "📖 Какой урок или вывод можно вынести из сегодняшнего дня?",
@@ -135,6 +137,7 @@ def save_entry(date_str, answers):
         "date": date_str,
         "saved_at": datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M"),
         "day_text": answers.get("day", ""),
+        "mood": answers.get("mood", ""),
         "gratitude": answers.get("gratitude", ""),
         "self_gratitude": answers.get("self_gratitude", ""),
         "lesson": answers.get("lesson", ""),
@@ -183,6 +186,8 @@ def make_month_portrait(month_str=None):
         parts = []
         if r.get("day_text"):
             parts.append(f"день: {r['day_text']}")
+        if r.get("mood"):
+            parts.append(f"самочувствие/эмоции: {r['mood']}")
         if r.get("self_gratitude"):
             parts.append(f"гордость/успехи: {r['self_gratitude']}")
         if r.get("gratitude"):
@@ -287,6 +292,8 @@ def make_weekly_ai_summary(weekly_answers):
         parts = []
         if r.get("day_text"):
             parts.append(f"день: {r['day_text']}")
+        if r.get("mood"):
+            parts.append(f"самочувствие/эмоции: {r['mood']}")
         if r.get("self_gratitude"):
             parts.append(f"гордость/успехи: {r['self_gratitude']}")
         if r.get("gratitude"):
@@ -429,47 +436,114 @@ def _ask_claude(prompt: str, max_tokens: int = 2000) -> str:
     return ""
 
 
-def _get_books_from_claude(prompt: str) -> list:
-    """Общий парсер: просим Gemini вернуть JSON-список книг."""
-    raw = _ask_claude(prompt, max_tokens=8000)
-    if not raw:
-        logger.error("Books: пустой ответ от Gemini")
+def _fetch_google_books(query, max_results=10, order="newest"):
+    """Свежие книги из Google Books API. Реальные данные: название, автор, год, рейтинг, обложка."""
+    try:
+        params = {
+            "q": query,
+            "orderBy": order,           # newest = сначала свежие
+            "langRestrict": "ru",        # преимущественно русские
+            "printType": "books",
+            "maxResults": max_results,
+        }
+        if GOOGLE_BOOKS_API_KEY:
+            params["key"] = GOOGLE_BOOKS_API_KEY
+        resp = requests.get("https://www.googleapis.com/books/v1/volumes", params=params, timeout=12)
+        items = resp.json().get("items", [])
+        books = []
+        for it in items:
+            info = it.get("volumeInfo", {})
+            title = info.get("title", "").strip()
+            if not title:
+                continue
+            year = (info.get("publishedDate", "") or "")[:4]
+            # Обложка
+            cover = ""
+            links = info.get("imageLinks", {})
+            if links:
+                cover = (links.get("thumbnail") or links.get("smallThumbnail") or "").replace("http://", "https://")
+            books.append({
+                "title": title,
+                "author": ", ".join(info.get("authors", [])) or "—",
+                "year": year,
+                "publisher": info.get("publisher", ""),
+                "description": (info.get("description", "") or "")[:400],
+                "google_rating": info.get("averageRating"),
+                "google_ratings_count": info.get("ratingsCount", 0),
+                "categories": ", ".join(info.get("categories", [])),
+                "cover": cover,
+            })
+        return books
+    except Exception as e:
+        logger.error(f"Google Books error: {e}")
         return []
+
+
+def _enrich_with_gemini(books):
+    """Просим Gemini добавить к реальным книгам живое описание и причину прочитать.
+    Факты (название/автор/год/рейтинг) остаются из Google Books, Gemini только дописывает текст."""
+    if not books or not GEMINI_API_KEY:
+        return books
+    titles = "\n".join(f"{i+1}. {b['title']} — {b['author']} ({b.get('year','')})" for i, b in enumerate(books))
+    prompt = (
+        "Вот список реальных книг. Для каждой напиши на русском: "
+        "краткое живое описание (2 предложения) и одну причину прочитать сейчас. "
+        "НЕ выдумывай факты об авторе или содержании, если не уверен — пиши обобщённо по теме.\n\n"
+        f"{titles}\n\n"
+        "Ответь СТРОГО JSON-массивом по числу книг, в том же порядке:\n"
+        '[{"description":"...","why_read":"..."}]'
+    )
+    raw = _ask_claude(prompt, max_tokens=4000)
+    if not raw:
+        return books
     try:
         clean = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        return json.loads(clean)
-    except Exception:
-        # Резервный разбор: вытащить массив между первой [ и последней ]
-        try:
-            start = raw.find("[")
-            end = raw.rfind("]")
-            if start != -1 and end != -1 and end > start:
-                return json.loads(raw[start:end + 1])
-        except Exception as e:
-            logger.error(f"Books JSON parse error: {e} | raw: {raw[:200]}")
-        logger.error(f"Books JSON not found | raw: {raw[:200]}")
-        return []
+        start, end = clean.find("["), clean.rfind("]")
+        enrich = json.loads(clean[start:end+1]) if start != -1 else []
+        for i, b in enumerate(books):
+            if i < len(enrich):
+                if enrich[i].get("description"):
+                    b["description"] = enrich[i]["description"]
+                if enrich[i].get("why_read"):
+                    b["why_read"] = enrich[i]["why_read"]
+    except Exception as e:
+        logger.error(f"Gemini enrich parse error: {e}")
+    return books
+
+
+BOOKS_QUERIES = [
+    "бизнес предпринимательство",
+    "психология саморазвитие",
+    "финансы инвестиции",
+    "нон-фикшн биографии",
+]
 
 
 def get_weekly_books() -> list:
-    return _get_books_from_claude(
-        """Подбери 8 актуальных книг по темам: бизнес/предпринимательство, психология/саморазвитие, финансы/инвестиции, нон-фикшн/биографии.
-Книги реальные, желательно последних 3-5 лет, разнообразие жанров.
-Ответь СТРОГО в JSON-массиве без markdown, 8 объектов:
-[{"title":"...","title_en":"...","author":"...","year":2023,"genre":"...","description":"2-3 предложения","goodreads_rating":"4.2/5","why_read":"одна причина прочитать сейчас"}]"""
-    )
+    """Свежие новинки по темам из Google Books + описания от Gemini."""
+    all_books = []
+    seen = set()
+    for q in BOOKS_QUERIES:
+        for b in _fetch_google_books(q, max_results=5, order="newest"):
+            key = b["title"].lower()
+            if key not in seen and b.get("year") and b["year"] >= "2023":
+                seen.add(key)
+                all_books.append(b)
+            if len([x for x in all_books if x]) >= 8:
+                break
+    all_books = all_books[:8]
+    return _enrich_with_gemini(all_books)
 
 
 def get_books_by_topic(topic: str) -> list:
-    return _get_books_from_claude(
-        f"""Порекомендуй 5 лучших книг по теме: "{topic}".
-Ответь СТРОГО в JSON-массиве без markdown, 5 объектов:
-[{{"title":"...","title_en":"...","author":"...","year":2020,"genre":"...","description":"2-3 предложения","goodreads_rating":"4.3/5","why_read":"почему эта книга лучшая по теме"}}]"""
-    )
+    """Книги по теме из Google Books + описания от Gemini."""
+    books = _fetch_google_books(topic, max_results=6, order="relevance")
+    books = books[:5]
+    return _enrich_with_gemini(books)
 
 
 def get_cover_url(title: str, author: str) -> str | None:
-    """Обложка через Open Library — бесплатно, без ключа. Несколько попыток."""
+    """Резервная обложка через Open Library, если у Google Books её не было."""
     queries = []
     if title and author:
         queries.append(f"{title} {author}")
@@ -491,17 +565,24 @@ def get_cover_url(title: str, author: str) -> str | None:
 
 
 def format_book(book: dict, num: int) -> str:
-    emoji_map = {"бизнес": "💼", "предпринимательство": "🚀", "финансы": "💰",
-                 "инвестиции": "📈", "психология": "🧠", "саморазвитие": "⚡",
-                 "биографии": "👤", "нон-фикшн": "📖"}
-    genre = book.get("genre", "").lower()
-    icon = next((v for k, v in emoji_map.items() if k in genre), "📚")
+    cat = (book.get("categories", "") or "").lower()
+    emoji_map = {"business": "💼", "econom": "💰", "psycholog": "🧠",
+                 "self": "⚡", "biograph": "👤", "money": "💰", "finance": "📈"}
+    icon = next((v for k, v in emoji_map.items() if k in cat), "📚")
 
     lines = [f"{icon} *{num}. {book.get('title', '—')}*", f"✍️ {book.get('author', '—')}"]
-    if book.get("year") or book.get("genre"):
-        lines.append(f"📅 {book.get('year', '')}  •  {book.get('genre', '')}".strip(" •"))
-    if book.get("goodreads_rating"):
-        lines.append(f"⭐ Goodreads: {book['goodreads_rating']}")
+    meta = []
+    if book.get("year"):
+        meta.append(book["year"])
+    if book.get("publisher"):
+        meta.append(book["publisher"])
+    if meta:
+        lines.append("📅 " + "  •  ".join(meta))
+    # Реальный рейтинг Google Books
+    if book.get("google_rating"):
+        cnt = book.get("google_ratings_count", 0)
+        cnt_str = f" ({cnt} оценок)" if cnt else ""
+        lines.append(f"⭐ Google Books: {book['google_rating']}/5{cnt_str}")
     if book.get("description"):
         lines.append(f"\n📝 {book['description']}")
     if book.get("why_read"):
@@ -512,15 +593,15 @@ def format_book(book: dict, num: int) -> str:
 async def send_weekly_books(bot, chat_id):
     books = get_weekly_books()
     if not books:
-        await bot.send_message(chat_id=chat_id, text="📚 Книжный бот заработает после добавления GEMINI_API_KEY.")
+        await bot.send_message(chat_id=chat_id, text="📚 Не удалось получить новинки. Попробуй позже.")
         return
     now = datetime.now(TIMEZONE).strftime("%d.%m.%Y")
     await bot.send_message(chat_id=chat_id,
-        text=f"📚 *Книги на неделю — {now}*\nБизнес • Психология • Финансы • Нон-фикшн",
+        text=f"📚 *Книжные новинки — {now}*\nБизнес • Психология • Финансы • Нон-фикшн",
         parse_mode="Markdown")
     for i, book in enumerate(books, 1):
         caption = format_book(book, i)
-        cover = get_cover_url(book.get("title_en") or book.get("title", ""), book.get("author", ""))
+        cover = book.get("cover") or get_cover_url(book.get("title", ""), book.get("author", ""))
         try:
             if cover:
                 await bot.send_photo(chat_id=chat_id, photo=cover, caption=caption, parse_mode="Markdown")
@@ -534,12 +615,12 @@ async def send_weekly_books(bot, chat_id):
 async def send_recommendations(bot, chat_id, topic):
     books = get_books_by_topic(topic)
     if not books:
-        await bot.send_message(chat_id=chat_id, text=f"📚 Рекомендации по теме *{topic}* заработают после добавления GEMINI_API_KEY.", parse_mode="Markdown")
+        await bot.send_message(chat_id=chat_id, text=f"📚 Не удалось найти книги по теме *{topic}*. Попробуй другую формулировку.", parse_mode="Markdown")
         return
-    await bot.send_message(chat_id=chat_id, text=f"📚 *Лучшие книги: {topic}*", parse_mode="Markdown")
+    await bot.send_message(chat_id=chat_id, text=f"📚 *Книги по теме: {topic}*", parse_mode="Markdown")
     for i, book in enumerate(books, 1):
         caption = format_book(book, i)
-        cover = get_cover_url(book.get("title_en") or book.get("title", ""), book.get("author", ""))
+        cover = book.get("cover") or get_cover_url(book.get("title", ""), book.get("author", ""))
         try:
             if cover:
                 await bot.send_photo(chat_id=chat_id, photo=cover, caption=caption, parse_mode="Markdown")
@@ -621,19 +702,25 @@ def get_rates():
         fx = fx_resp.json()["rates"]
         rub_per_usd = fx["RUB"]
         rub_per_thb = rub_per_usd / fx["THB"]
+        rub_per_eur = fx["RUB"] / fx["EUR"]   # кросс-курс евро к рублю
 
-        # Золото, S&P500, Мосбиржа
+        # Золото, S&P500, Мосбиржа, нефть
         gold_usd = _yahoo_price("GC=F")       # Gold Futures
         sp500 = _yahoo_price("^GSPC")         # S&P 500
         moex = _moex_index()
+        oil_usd = _yahoo_price("BZ=F")        # Brent crude
+        oil_rub = oil_usd * rub_per_usd if oil_usd else None
 
         return {
             "btc_usd": btc_usd,
             "rub_per_usd": rub_per_usd,
             "rub_per_thb": rub_per_thb,
+            "rub_per_eur": rub_per_eur,
             "gold_usd": gold_usd,
             "sp500": sp500,
             "moex": moex,
+            "oil_usd": oil_usd,
+            "oil_rub": oil_rub,
         }
     except Exception as e:
         logger.error(f"Rates error: {e}")
@@ -651,9 +738,13 @@ def format_rates(rates):
     # Крипта и валюты
     lines.append(f"₿ *Bitcoin:* `${btc_str}`")
     lines.append(f"💵 *Доллар:* `{rates['rub_per_usd']:.2f} ₽`")
+    lines.append(f"🇪🇺 *Евро:* `{rates['rub_per_eur']:.2f} ₽`")
     lines.append(f"🇹🇭 *Бат:* `{rates['rub_per_thb']:.2f} ₽`")
 
     # Рынки
+    if rates.get("oil_usd"):
+        oil_rub_str = f"{rates['oil_rub']:,.0f}".replace(",", " ") if rates.get("oil_rub") else "—"
+        lines.append(f"🛢 *Нефть Brent:* `${rates['oil_usd']:.1f}` ({oil_rub_str} ₽)")
     if rates.get("gold_usd"):
         gold_str = f"{rates['gold_usd']:,.0f}".replace(",", " ")
         lines.append(f"🥇 *Золото:* `${gold_str}/oz`")
@@ -665,6 +756,87 @@ def format_rates(rates):
         lines.append(f"🇷🇺 *Мосбиржа:* `{moex_str}`")
 
     return "\n".join(lines)
+
+
+def _pct(old, new):
+    """Изменение в % с защитой от деления на ноль."""
+    try:
+        if old and new:
+            return (new - old) / old * 100
+    except Exception:
+        pass
+    return None
+
+
+def make_weekly_market_review():
+    """Недельный обзор: сравнение с прошлой неделей + живой AI-комментарий. Только реальные цифры."""
+    rates = get_rates()
+    if not rates:
+        return "❌ Не удалось получить данные для обзора."
+
+    # Прошлый снимок из Supabase
+    prev_rows = sb_get("market_snapshots", {"order": "date.desc", "limit": "1"})
+    prev = prev_rows[0] if prev_rows else None
+
+    # Сохраняем текущий снимок
+    today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
+    snapshot = {
+        "date": today,
+        "btc_usd": rates.get("btc_usd"),
+        "rub_per_usd": rates.get("rub_per_usd"),
+        "rub_per_eur": rates.get("rub_per_eur"),
+        "oil_usd": rates.get("oil_usd"),
+        "gold_usd": rates.get("gold_usd"),
+        "sp500": rates.get("sp500"),
+        "moex": rates.get("moex"),
+    }
+    sb_upsert("market_snapshots", snapshot, on_conflict="date")
+
+    # Считаем изменения
+    def line(emoji, name, key, cur, unit="", as_int=False):
+        val = f"{cur:,.0f}".replace(",", " ") if as_int else f"{cur:.2f}"
+        txt = f"{emoji} *{name}:* `{val}{unit}`"
+        if prev and prev.get(key):
+            p = _pct(prev[key], cur)
+            if p is not None:
+                arrow = "📈" if p >= 0 else "📉"
+                txt += f"  {arrow} {p:+.1f}%"
+        return txt
+
+    lines = ["📅 *Недельный обзор рынков*\n"]
+    if rates.get("btc_usd"):
+        lines.append(line("₿", "Bitcoin", "btc_usd", rates["btc_usd"], " $", as_int=True))
+    if rates.get("rub_per_usd"):
+        lines.append(line("💵", "Доллар", "rub_per_usd", rates["rub_per_usd"], " ₽"))
+    if rates.get("rub_per_eur"):
+        lines.append(line("🇪🇺", "Евро", "rub_per_eur", rates["rub_per_eur"], " ₽"))
+    if rates.get("oil_usd"):
+        lines.append(line("🛢", "Нефть Brent", "oil_usd", rates["oil_usd"], " $"))
+    if rates.get("gold_usd"):
+        lines.append(line("🥇", "Золото", "gold_usd", rates["gold_usd"], " $", as_int=True))
+    if rates.get("sp500"):
+        lines.append(line("📈", "S&P 500", "sp500", rates["sp500"], "", as_int=True))
+    if rates.get("moex"):
+        lines.append(line("🇷🇺", "Мосбиржа", "moex", rates["moex"], "", as_int=True))
+
+    table = "\n".join(lines)
+
+    # AI-комментарий только по реальным движениям
+    if prev and GEMINI_API_KEY:
+        prompt = (
+            "Ты — остроумный финансовый обозреватель. Вот РЕАЛЬНЫЕ данные рынков за неделю "
+            "(текущее значение и изменение в %).\n\n"
+            f"{table}\n\n"
+            "Напиши короткий живой комментарий (4-6 предложений) с лёгкой иронией про эти движения. "
+            "ВАЖНО: комментируй ТОЛЬКО приведённые цифры и проценты. "
+            "НЕ выдумывай новости, события, имена, названия компаний или причины — "
+            "ты не знаешь что происходило в мире, только цифры. "
+            "Если актив вырос — отметь, если упал — обыграй. Без markdown-заголовков."
+        )
+        comment = _ask_claude(prompt, max_tokens=800)
+        if comment:
+            return f"{table}\n\n💬 {comment}"
+    return table
 
 
 # =====================
@@ -889,6 +1061,103 @@ def format_tasks(tasks: list, header: str = "Задачи на сегодня") 
     return text
 
 
+def _get_projects_map() -> dict:
+    """Карта id проекта -> название. Плюс отдельно ищем id 'Входящие'/Inbox."""
+    try:
+        resp = requests.get(
+            f"{TODOIST_API}/projects",
+            headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            logger.error(f"Todoist projects error: {resp.status_code}")
+            return {}
+        data = resp.json()
+        projects = data.get("results", []) if isinstance(data, dict) else data
+        result = {}
+        for p in projects:
+            if isinstance(p, dict) and p.get("id"):
+                result[str(p["id"])] = {
+                    "name": p.get("name", "Без проекта"),
+                    "is_inbox": bool(p.get("is_inbox_project") or p.get("inbox_project")),
+                }
+        return result
+    except Exception as e:
+        logger.error(f"Projects map error: {e}")
+        return {}
+
+
+def _task_sort_key(task):
+    """Сортировка: сначала высокий приоритет (p1=4 в API), потом по времени дедлайна."""
+    priority = task.get("priority", 1)  # 4 = самый высокий в Todoist API
+    due = task.get("due") or {}
+    due_date = due.get("date") or "9999-12-31"
+    return (-priority, due_date)
+
+
+def build_structured_tasks(tasks: list, projects_map: dict, header: str) -> str:
+    """Группирует задачи по проектам (блокам), сортирует внутри по важности/срочности."""
+    if not tasks:
+        return f"✅ *{header}*\n\nНа сегодня задач нет — отдыхай с чистой совестью! 🌿"
+
+    # Группируем по проекту
+    blocks = {}
+    for t in tasks:
+        pid = str(t.get("project_id", ""))
+        pinfo = projects_map.get(pid, {"name": "Прочее", "is_inbox": False})
+        blocks.setdefault(pinfo["name"], []).append(t)
+
+    today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
+    block_emoji = {
+        "работа": "💼", "личное": "🌱", "здоровье": "💪", "отношения": "❤️",
+        "дом": "🏠", "дни рождения": "🎂", "финансы": "💰", "учёба": "📚",
+    }
+
+    text = f"📋 *{header}*\n\n"
+    for block_name, block_tasks in blocks.items():
+        emoji = next((v for k, v in block_emoji.items() if k in block_name.lower()), "📌")
+        text += f"{emoji} *{block_name}*\n"
+        for t in sorted(block_tasks, key=_task_sort_key):
+            pr = {1: "", 2: "🔵", 3: "🟡", 4: "🔴"}.get(t.get("priority", 1), "")
+            due = t.get("due") or {}
+            due_local = _parse_due_time(due)
+            due_time = f" `{due_local.strftime('%H:%M')}`" if due_local else ""
+            overdue = " ⚠️" if _parse_due_date(due) and _parse_due_date(due) < today else ""
+            text += f"  •{pr}{due_time}{overdue} {t.get('content', '—')}\n"
+        text += "\n"
+    return text.strip()
+
+
+def add_motivation_to_blocks(structured_text: str) -> str:
+    """Gemini добавляет к разбору тёплое, но настойчивое напутствие."""
+    if not GEMINI_API_KEY:
+        return structured_text
+    prompt = (
+        "Вот список задач человека на сегодня, разбитый по блокам:\n\n"
+        f"{structured_text}\n\n"
+        "Добавь в конце короткое (3-4 предложения) тёплое, но настойчивое напутствие. "
+        "Объясни по-доброму, почему важно не откладывать эти дела, и подбодри взяться за них с охотой. "
+        "Без сюсюканья, по-человечески и с уважением. Без markdown-заголовков, просто текст."
+    )
+    motivation = _ask_claude(prompt, max_tokens=600)
+    if motivation:
+        return f"{structured_text}\n\n💬 {motivation}"
+    return structured_text
+
+
+def get_inbox_count() -> int:
+    """Сколько задач висит во Входящих (Inbox)."""
+    projects_map = _get_projects_map()
+    inbox_ids = {pid for pid, info in projects_map.items() if info["is_inbox"]}
+    if not inbox_ids:
+        return 0
+    count = 0
+    for t in _todoist_get_all_tasks():
+        if str(t.get("project_id", "")) in inbox_ids:
+            count += 1
+    return count
+
+
 # =====================
 # ХЕНДЛЕРЫ — РЕФЛЕКСИЯ
 # =====================
@@ -918,24 +1187,30 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def answer_q1(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["answers"]["day"] = update.message.text
     await update.message.reply_text(QUESTIONS[1])
+    return Q_MOOD
+
+
+async def answer_mood(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["answers"]["mood"] = update.message.text
+    await update.message.reply_text(QUESTIONS[2])
     return Q2
 
 
 async def answer_q2(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["answers"]["gratitude"] = update.message.text
-    await update.message.reply_text(QUESTIONS[2])
+    await update.message.reply_text(QUESTIONS[3])
     return Q_SELF
 
 
 async def answer_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["answers"]["self_gratitude"] = update.message.text
-    await update.message.reply_text(QUESTIONS[3])
+    await update.message.reply_text(QUESTIONS[4])
     return Q3
 
 
 async def answer_q3(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["answers"]["lesson"] = update.message.text
-    await update.message.reply_text(QUESTIONS[4])
+    await update.message.reply_text(QUESTIONS[5])
     return Q4
 
 
@@ -980,6 +1255,7 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if row.get("plan_review"):
             text += f"✅ {row['plan_review']}\n"
         text += f"🌙 {row.get('day_text') or '—'}\n"
+        text += f"💭 {row.get('mood') or '—'}\n"
         text += f"🙏 {row.get('gratitude') or '—'}\n"
         text += f"🏆 {row.get('self_gratitude') or '—'}\n"
         text += f"📖 {row.get('lesson') or '—'}\n"
@@ -1080,11 +1356,26 @@ async def rates_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def bybit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != BYBIT_CHAT_ID:
         return
-    await update.message.reply_text("Привет! Я слежу за курсами 📊\n\nКаждое утро в 08:00 присылаю курсы.\n\n/rates — курсы прямо сейчас")
+    await update.message.reply_text("Привет! Я слежу за курсами 📊\n\nКаждое утро в 08:00 присылаю курсы.\nПо воскресеньям — недельный обзор рынков.\n\n/rates — курсы прямо сейчас\n/review — недельный обзор")
 
 
 async def morning_rates(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=BYBIT_CHAT_ID, text="☀️ *Доброе утро!*\n\n" + format_rates(get_rates()), parse_mode="Markdown")
+
+
+async def review_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != BYBIT_CHAT_ID:
+        return
+    await update.message.reply_text("📊 Готовлю недельный обзор рынков... 🧠")
+    review = make_weekly_market_review()
+    await _send_long(update.message.reply_text, review)
+
+
+async def weekly_market_report(context: ContextTypes.DEFAULT_TYPE):
+    review = make_weekly_market_review()
+    async def _send(text, parse_mode=None):
+        await context.bot.send_message(chat_id=BYBIT_CHAT_ID, text=text, parse_mode=parse_mode)
+    await _send_long(_send, review)
 
 
 # =====================
@@ -1236,7 +1527,13 @@ async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MY_CHAT_ID:
         return
     tasks = get_today_tasks()
-    await update.message.reply_text(format_tasks(tasks), parse_mode="Markdown")
+    projects_map = _get_projects_map()
+    structured = build_structured_tasks(tasks, projects_map, "Задачи на сегодня")
+    full = add_motivation_to_blocks(structured)
+    inbox_n = get_inbox_count()
+    if inbox_n > 0:
+        full += f"\n\n📥 Во *Входящих* {inbox_n} задач — не забудь разнести их по проектам."
+    await _send_long(update.message.reply_text, full)
 
 
 async def inbox_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1271,14 +1568,31 @@ async def todoist_handle_message(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text(f"❌ Ошибка {resp.status_code}: {resp.text[:200]}")
 
 
-async def morning_tasks(context: ContextTypes.DEFAULT_TYPE):
-    """Утренняя рассылка в 09:00 — только задачи с датой на сегодня."""
+async def _send_structured_tasks(context, greeting):
+    """Собирает задачи по блокам, добавляет мотивацию и напоминание про Входящие."""
     tasks = get_today_tasks()
-    await context.bot.send_message(
-        chat_id=MY_CHAT_ID,
-        text="☀️ *Доброе утро!*\n\n" + format_tasks(tasks),
-        parse_mode="Markdown",
-    )
+    projects_map = _get_projects_map()
+    structured = build_structured_tasks(tasks, projects_map, greeting)
+    full = add_motivation_to_blocks(structured)
+
+    # Напоминание разнести Входящие
+    inbox_n = get_inbox_count()
+    if inbox_n > 0:
+        full += f"\n\n📥 Во *Входящих* {inbox_n} задач — не забудь разнести их по проектам."
+
+    async def _send(text, parse_mode=None):
+        await context.bot.send_message(chat_id=MY_CHAT_ID, text=text, parse_mode=parse_mode)
+    await _send_long(_send, full)
+
+
+async def morning_tasks(context: ContextTypes.DEFAULT_TYPE):
+    """Утро 09:00 — задачи по блокам с мотивацией."""
+    await _send_structured_tasks(context, "☀️ Доброе утро! Задачи на сегодня")
+
+
+async def afternoon_tasks(context: ContextTypes.DEFAULT_TYPE):
+    """16:00 — что осталось на день, снова по блокам."""
+    await _send_structured_tasks(context, "🕓 Чек-ин дня: что осталось")
 
 
 async def deadline_reminder(context: ContextTypes.DEFAULT_TYPE):
@@ -1646,6 +1960,7 @@ async def main():
         entry_points=[CommandHandler("ask", ask)],
         states={
             Q1: [MessageHandler(filters.TEXT & ~filters.COMMAND, answer_q1)],
+            Q_MOOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, answer_mood)],
             Q2: [MessageHandler(filters.TEXT & ~filters.COMMAND, answer_q2)],
             Q_SELF: [MessageHandler(filters.TEXT & ~filters.COMMAND, answer_self)],
             Q3: [MessageHandler(filters.TEXT & ~filters.COMMAND, answer_q3)],
@@ -1684,7 +1999,9 @@ async def main():
     rates_app = Application.builder().token(BYBIT_BOT_TOKEN).build()
     rates_app.add_handler(CommandHandler("start", bybit_start))
     rates_app.add_handler(CommandHandler("rates", rates_command))
+    rates_app.add_handler(CommandHandler("review", review_command))
     rates_app.job_queue.run_daily(morning_rates, time=dtime(hour=8, minute=0, tzinfo=TIMEZONE))
+    rates_app.job_queue.run_daily(weekly_market_report, time=dtime(hour=18, minute=0, tzinfo=TIMEZONE), days=(6,))
 
     # Бот кино
     cinema_app = Application.builder().token(CINEMA_BOT_TOKEN).build()
@@ -1715,6 +2032,7 @@ async def main():
     todoist_app.add_handler(CommandHandler("inbox", inbox_command))
     todoist_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, todoist_handle_message))
     todoist_app.job_queue.run_daily(morning_tasks, time=dtime(hour=9, minute=0, tzinfo=TIMEZONE))
+    todoist_app.job_queue.run_daily(afternoon_tasks, time=dtime(hour=16, minute=0, tzinfo=TIMEZONE))
     todoist_app.job_queue.run_repeating(deadline_reminder, interval=1800, first=60)  # каждые 30 минут
     todoist_app.add_handler(CommandHandler("birthdays", birthdays_command))
     todoist_app.job_queue.run_daily(check_birthday_reminders, time=dtime(hour=9, minute=0, tzinfo=TIMEZONE))
