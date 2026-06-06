@@ -845,8 +845,11 @@ def make_weekly_market_review():
 
 def get_new_movies(limit=8):
     try:
-        resp = requests.get(f"{TMDB_BASE}/movie/now_playing", params={"api_key": TMDB_API_KEY, "language": "ru-RU", "region": "US", "page": 1}, timeout=10)
-        return resp.json().get("results", [])[:limit]
+        movies = []
+        for page in (1, 2):
+            resp = requests.get(f"{TMDB_BASE}/movie/now_playing", params={"api_key": TMDB_API_KEY, "language": "ru-RU", "region": "US", "page": page}, timeout=10)
+            movies.extend(resp.json().get("results", []))
+        return movies[:limit]
     except Exception as e:
         logger.error(f"TMDB error: {e}")
         return []
@@ -933,13 +936,38 @@ def format_movie_caption(movie, details, omdb, kp_rating):
     return caption
 
 
+def _get_sent_movie_ids() -> set:
+    """ID фильмов, которые уже отправляли."""
+    rows = sb_get("sent_movies", {"select": "movie_id"})
+    return {str(r["movie_id"]) for r in rows if r.get("movie_id")}
+
+
+def _mark_movie_sent(movie_id, title):
+    sb_upsert("sent_movies", {
+        "movie_id": str(movie_id),
+        "title": title,
+        "sent_at": datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M"),
+    }, on_conflict="movie_id")
+
+
 async def send_movies(bot, chat_id, period_label="недели"):
     await bot.send_message(chat_id=chat_id, text=f"🎬 *Новинки кино {period_label}*\n\nСобираю данные...", parse_mode="Markdown")
-    movies = get_new_movies(limit=8)
+    movies = get_new_movies(limit=20)  # берём с запасом, т.к. часть отсеется
     if not movies:
         await bot.send_message(chat_id=chat_id, text="❌ Не удалось получить список фильмов.")
         return
-    for movie in movies:
+
+    sent_ids = _get_sent_movie_ids()
+    fresh = [m for m in movies if str(m.get("id")) not in sent_ids]
+
+    if not fresh:
+        await bot.send_message(chat_id=chat_id, text="🎬 Новых фильмов с прошлой подборки пока нет. Загляну в следующий раз!")
+        return
+
+    shown = 0
+    for movie in fresh:
+        if shown >= 8:
+            break
         try:
             tmdb_id = movie["id"]
             title = movie.get("title", "")
@@ -953,6 +981,8 @@ async def send_movies(bot, chat_id, period_label="недели"):
                 await bot.send_photo(chat_id=chat_id, photo=f"{TMDB_IMG}{poster_path}", caption=caption, parse_mode="Markdown")
             else:
                 await bot.send_message(chat_id=chat_id, text=caption, parse_mode="Markdown")
+            _mark_movie_sent(tmdb_id, title)
+            shown += 1
             await asyncio.sleep(1)
         except Exception as e:
             logger.error(f"Error sending movie: {e}")
