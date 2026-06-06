@@ -1024,6 +1024,26 @@ async def monthly_gratitude_report(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=MY_CHAT_ID, text=make_gratitude_summary(entries, month_name), parse_mode="Markdown")
 
 
+async def _send_long(send_func, text, parse_mode="Markdown"):
+    """Отправляет длинный текст частями (лимит Telegram 4096). При ошибке Markdown — без разметки."""
+    chunks = []
+    while text:
+        chunk = text[:4000]
+        # стараемся резать по переносу строки
+        if len(text) > 4000:
+            cut = chunk.rfind("\n")
+            if cut > 2000:
+                chunk = text[:cut]
+        chunks.append(chunk)
+        text = text[len(chunk):]
+    for chunk in chunks:
+        try:
+            await send_func(chunk, parse_mode=parse_mode)
+        except Exception:
+            # Markdown сломался — шлём как обычный текст
+            await send_func(chunk)
+
+
 async def portrait_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MY_CHAT_ID:
         return
@@ -1031,7 +1051,7 @@ async def portrait_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     portrait = make_month_portrait()
     if portrait:
         month_name = datetime.now(TIMEZONE).strftime("%B %Y")
-        await update.message.reply_text(f"🖼 *Портрет месяца — {month_name}*\n\n{portrait}", parse_mode="Markdown")
+        await _send_long(update.message.reply_text, f"🖼 *Портрет месяца — {month_name}*\n\n{portrait}")
     else:
         await update.message.reply_text("За этот месяц пока мало записей для портрета. Веди дневник — и в конце месяца получишь разбор.")
 
@@ -1042,7 +1062,9 @@ async def monthly_portrait_report(context: ContextTypes.DEFAULT_TYPE):
     portrait = make_month_portrait(last_month)
     if portrait:
         month_name = (datetime.now(TIMEZONE).replace(day=1) - timedelta(days=1)).strftime("%B %Y")
-        await context.bot.send_message(chat_id=MY_CHAT_ID, text=f"🖼 *Портрет месяца — {month_name}*\n\n{portrait}", parse_mode="Markdown")
+        async def _send(text, parse_mode=None):
+            await context.bot.send_message(chat_id=MY_CHAT_ID, text=text, parse_mode=parse_mode)
+        await _send_long(_send, f"🖼 *Портрет месяца — {month_name}*\n\n{portrait}")
 
 
 # =====================
@@ -1580,10 +1602,7 @@ async def weekly_q7(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     summary = make_weekly_ai_summary(answers)
     if summary:
-        await update.message.reply_text(
-            f"📊 *Твоя неделя — взгляд со стороны*\n\n{summary}",
-            parse_mode="Markdown"
-        )
+        await _send_long(update.message.reply_text, f"📊 *Твоя неделя — взгляд со стороны*\n\n{summary}")
     await update.message.reply_text("Хорошей следующей недели! 💪")
     return ConversationHandler.END
 
