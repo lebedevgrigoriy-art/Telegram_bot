@@ -1164,18 +1164,24 @@ def build_tasks_with_motivation(tasks: list, projects_map: dict, header: str) ->
             "Для КАЖДОЙ сферы напиши ОДНО короткое предложение (максимум 15 слов): "
             "в чём суть-смысл взяться за эти задачи именно сегодня. "
             "Конкретно по задачам блока, с лёгким нажимом, но без воды и банальностей. "
-            "Не перечисляй задачи заново — схвати суть. "
-            "Ответь СТРОГО JSON-объектом, ключ — название сферы, значение — текст:\n"
-            '{"Работа":"...","Личное":"..."}'
+            "Не перечисляй задачи заново — схвати суть.\n\n"
+            "Формат ответа — каждая сфера с новой строки, СТРОГО так:\n"
+            "Название сферы | текст мотивации\n"
+            "Например:\n"
+            "Работа | Сегодня заложишь и качество продукта, и стабильность команды.\n"
+            "Личное | Забота о теле и финансах сейчас — это спокойствие завтра."
         )
         raw = _ask_claude(prompt, max_tokens=800)
         if raw:
-            try:
-                clean = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-                s, e = clean.find("{"), clean.rfind("}")
-                motivations = json.loads(clean[s:e+1]) if s != -1 else {}
-            except Exception as ex:
-                logger.error(f"Motivation JSON parse error: {ex}")
+            for line in raw.splitlines():
+                line = line.strip()
+                if "|" in line:
+                    name, _, note = line.partition("|")
+                    name, note = name.strip(), note.strip()
+                    if name and note:
+                        motivations[name.lower()] = note
+            if not motivations:
+                logger.error(f"Motivation: не распарсилось | raw: {raw[:200]}")
 
     text = f"📋 *{header}*\n\n"
     for block_name, block_tasks in blocks.items():
@@ -1188,9 +1194,10 @@ def build_tasks_with_motivation(tasks: list, projects_map: dict, header: str) ->
             due_time = f" `{due_local.strftime('%H:%M')}`" if due_local else ""
             overdue = " ⚠️" if _parse_due_date(due) and _parse_due_date(due) < today else ""
             text += f"  •{pr}{due_time}{overdue} {t.get('content', '—')}\n"
-        # обоснование блока — с отступом и эмодзи, отделяем от задач
-        note = motivations.get(block_name) or next(
-            (v for k, v in motivations.items() if k.lower() == block_name.lower()), None
+        # обоснование блока — ищем по названию (регистронезависимо, плюс частичное совпадение)
+        bn_low = block_name.lower()
+        note = motivations.get(bn_low) or next(
+            (v for k, v in motivations.items() if k in bn_low or bn_low in k), None
         )
         if note:
             text += f"\n   💫 _{note}_\n"
