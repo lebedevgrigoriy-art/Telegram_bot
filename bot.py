@@ -457,11 +457,16 @@ def _fetch_google_books(query, max_results=10, order="newest"):
             if not title:
                 continue
             year = (info.get("publishedDate", "") or "")[:4]
-            # Обложка
+            # Обложка — поднимаем качество
             cover = ""
             links = info.get("imageLinks", {})
             if links:
-                cover = (links.get("thumbnail") or links.get("smallThumbnail") or "").replace("http://", "https://")
+                raw_cover = (links.get("thumbnail") or links.get("smallThumbnail") or "")
+                cover = (raw_cover
+                         .replace("http://", "https://")
+                         .replace("&edge=curl", "")      # убираем дешёвый загнутый уголок
+                         .replace("zoom=1", "zoom=2")     # крупнее
+                         .replace("zoom=5", "zoom=2"))
             books.append({
                 "title": title,
                 "author": ", ".join(info.get("authors", [])) or "—",
@@ -519,27 +524,75 @@ BOOKS_QUERIES = [
 ]
 
 
+def _gemini_suggest_books(theme_prompt: str, count: int) -> list:
+    """Gemini предлагает реальные известные книги. Возвращает список {title, author}."""
+    if not GEMINI_API_KEY:
+        return []
+    prompt = (
+        f"{theme_prompt}\n\n"
+        f"Предложи {count} КОНКРЕТНЫХ, реально существующих и известных книг "
+        "(проверенных временем или популярных). Только подлинные книги, не выдумывай. "
+        "Ответь СТРОГО построчно, каждая книга на новой строке в формате:\n"
+        "Название | Автор\n"
+        "Без нумерации и лишнего текста."
+    )
+    raw = _ask_claude(prompt, max_tokens=1000)
+    if not raw:
+        return []
+    books = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if "|" in line:
+            title, _, author = line.partition("|")
+            title, author = title.strip(" .0123456789-"), author.strip()
+            if title:
+                books.append({"title": title, "author": author})
+    return books
+
+
+def _google_lookup(title: str, author: str) -> dict:
+    """Ищет карточку книги в Google Books по названию+автору. Берёт обложку, рейтинг, год."""
+    q = f'{title} {author}'.strip()
+    found = _fetch_google_books(q, max_results=1, order="relevance")
+    if found:
+        b = found[0]
+        # подставляем оригинальные название/автора от Gemini (Google иногда искажает)
+        b["title"] = title
+        if author:
+            b["author"] = author
+        return b
+    # карточки нет — отдаём минимум, обложку добьём через Open Library
+    return {"title": title, "author": author, "year": "", "publisher": "",
+            "description": "", "google_rating": None, "google_ratings_count": 0,
+            "categories": "", "cover": ""}
+
+
 def get_weekly_books() -> list:
-    """Свежие новинки по темам из Google Books + описания от Gemini."""
-    all_books = []
-    seen = set()
-    for q in BOOKS_QUERIES:
-        for b in _fetch_google_books(q, max_results=5, order="newest"):
-            key = b["title"].lower()
-            if key not in seen and b.get("year") and b["year"] >= "2023":
-                seen.add(key)
-                all_books.append(b)
-            if len([x for x in all_books if x]) >= 8:
-                break
-    all_books = all_books[:8]
-    return _enrich_with_gemini(all_books)
+    """Известные книги по темам (Gemini) + карточки из Google Books."""
+    suggestions = _gemini_suggest_books(
+        "Темы: бизнес и предпринимательство, психология и саморазвитие, "
+        "финансы и инвестиции, нон-фикшн и биографии. Разнообразь темы.",
+        count=8,
+    )
+    if not suggestions:
+        return []
+    books, seen = [], set()
+    for s in suggestions:
+        key = s["title"].lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        books.append(_google_lookup(s["title"], s["author"]))
+    return _enrich_with_gemini(books[:8])
 
 
 def get_books_by_topic(topic: str) -> list:
-    """Книги по теме из Google Books + описания от Gemini."""
-    books = _fetch_google_books(topic, max_results=6, order="relevance")
-    books = books[:5]
-    return _enrich_with_gemini(books)
+    """Известные книги по теме (Gemini) + карточки из Google Books."""
+    suggestions = _gemini_suggest_books(f'Тема: "{topic}".', count=5)
+    if not suggestions:
+        return []
+    books = [_google_lookup(s["title"], s["author"]) for s in suggestions]
+    return _enrich_with_gemini(books[:5])
 
 
 def get_cover_url(title: str, author: str) -> str | None:
