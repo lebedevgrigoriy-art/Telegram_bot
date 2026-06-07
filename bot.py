@@ -551,17 +551,26 @@ def _gemini_suggest_books(theme_prompt: str, count: int) -> list:
 
 
 def _google_lookup(title: str, author: str) -> dict:
-    """Ищет карточку книги в Google Books по названию+автору. Берёт обложку, рейтинг, год."""
+    """Ищет карточку книги в Google Books. Среди нескольких изданий берёт то, где есть рейтинг."""
     q = f'{title} {author}'.strip()
-    found = _fetch_google_books(q, max_results=1, order="relevance")
+    found = _fetch_google_books(q, max_results=5, order="relevance")
     if found:
-        b = found[0]
+        # Предпочитаем издание с рейтингом; если нет — с обложкой; иначе первое
+        best = found[0]
+        for b in found:
+            if b.get("google_rating"):
+                best = b
+                break
+        else:
+            for b in found:
+                if b.get("cover"):
+                    best = b
+                    break
         # подставляем оригинальные название/автора от Gemini (Google иногда искажает)
-        b["title"] = title
+        best["title"] = title
         if author:
-            b["author"] = author
-        return b
-    # карточки нет — отдаём минимум, обложку добьём через Open Library
+            best["author"] = author
+        return best
     return {"title": title, "author": author, "year": "", "publisher": "",
             "description": "", "google_rating": None, "google_ratings_count": 0,
             "categories": "", "cover": ""}
@@ -1299,36 +1308,42 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def answer_q1(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["answers"]["day"] = update.message.text
+    save_entry(context.user_data["date"], context.user_data["answers"])  # автосохранение прогресса
     await update.message.reply_text(QUESTIONS[1])
     return Q_MOOD
 
 
 async def answer_mood(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["answers"]["mood"] = update.message.text
+    save_entry(context.user_data["date"], context.user_data["answers"])
     await update.message.reply_text(QUESTIONS[2])
     return Q2
 
 
 async def answer_q2(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["answers"]["gratitude"] = update.message.text
+    save_entry(context.user_data["date"], context.user_data["answers"])
     await update.message.reply_text(QUESTIONS[3])
     return Q_SELF
 
 
 async def answer_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["answers"]["self_gratitude"] = update.message.text
+    save_entry(context.user_data["date"], context.user_data["answers"])
     await update.message.reply_text(QUESTIONS[4])
     return Q3
 
 
 async def answer_q3(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["answers"]["lesson"] = update.message.text
+    save_entry(context.user_data["date"], context.user_data["answers"])
     await update.message.reply_text(QUESTIONS[5])
     return Q4
 
 
 async def answer_q4(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["answers"]["plan"] = update.message.text
+    save_entry(context.user_data["date"], context.user_data["answers"])  # план уже сохранён
     date_str, yesterday_plan = get_yesterday_plan()
     if yesterday_plan:
         await update.message.reply_text(
@@ -1337,7 +1352,6 @@ async def answer_q4(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return Q5
     date_str = context.user_data["date"]
-    save_entry(date_str, context.user_data["answers"])
     await update.message.reply_text(f"✅ Всё записано. Хорошего вечера!\n\nЗапись за {date_str} сохранена.")
     return ConversationHandler.END
 
