@@ -70,8 +70,8 @@ def get_sent_video_ids() -> set:
 
 def mark_video_sent(video_id: str, topic: str):
     try:
-        requests.post(
-            f"{SUPABASE_URL}/rest/v1/podcast_sent",
+        resp = requests.post(
+            f"{SUPABASE_URL}/rest/v1/podcast_sent?on_conflict=video_id",
             headers={**sb_headers(), "Prefer": "resolution=merge-duplicates"},
             json={
                 "video_id": video_id,
@@ -80,6 +80,8 @@ def mark_video_sent(video_id: str, topic: str):
             },
             timeout=10,
         )
+        if not resp.ok:
+            logger.error(f"mark_video_sent failed: {resp.status_code} {resp.text}")
     except Exception as e:
         logger.error(f"Supabase mark sent error: {e}")
 
