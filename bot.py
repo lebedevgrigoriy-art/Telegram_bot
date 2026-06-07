@@ -1159,15 +1159,16 @@ def build_tasks_with_motivation(tasks: list, projects_map: dict, header: str) ->
             task_list = "; ".join(t.get("content", "") for t in bt)
             blocks_for_ai += f"\n[{bn}]: {task_list}"
         prompt = (
-            "Вот задачи человека на сегодня, сгруппированные по сферам жизни:\n"
+            "Вот задачи человека на сегодня по сферам жизни:\n"
             f"{blocks_for_ai}\n\n"
-            "Для КАЖДОЙ сферы напиши 1-2 предложения: почему важно выполнить именно эти задачи "
-            "(по их сути, не абстрактно), по-доброму но настойчиво — чтобы захотелось взяться. "
-            "Опирайся на конкретные задачи блока, без банальностей вроде «ты сможешь». "
+            "Для КАЖДОЙ сферы напиши ОДНО короткое предложение (максимум 15 слов): "
+            "в чём суть-смысл взяться за эти задачи именно сегодня. "
+            "Конкретно по задачам блока, с лёгким нажимом, но без воды и банальностей. "
+            "Не перечисляй задачи заново — схвати суть. "
             "Ответь СТРОГО JSON-объектом, ключ — название сферы, значение — текст:\n"
             '{"Работа":"...","Личное":"..."}'
         )
-        raw = _ask_claude(prompt, max_tokens=1500)
+        raw = _ask_claude(prompt, max_tokens=800)
         if raw:
             try:
                 clean = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
@@ -1187,12 +1188,12 @@ def build_tasks_with_motivation(tasks: list, projects_map: dict, header: str) ->
             due_time = f" `{due_local.strftime('%H:%M')}`" if due_local else ""
             overdue = " ⚠️" if _parse_due_date(due) and _parse_due_date(due) < today else ""
             text += f"  •{pr}{due_time}{overdue} {t.get('content', '—')}\n"
-        # обоснование блока
+        # обоснование блока — с отступом и эмодзи, отделяем от задач
         note = motivations.get(block_name) or next(
             (v for k, v in motivations.items() if k.lower() == block_name.lower()), None
         )
         if note:
-            text += f"  _{note}_\n"
+            text += f"\n   💫 _{note}_\n"
         text += "\n"
     return text.strip()
 
