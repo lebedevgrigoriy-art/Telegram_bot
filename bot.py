@@ -1052,11 +1052,19 @@ def get_today_tasks() -> list:
         tasks = [t for t in data.get("results", []) if isinstance(t, dict)]
     else:
         tasks = [t for t in data if isinstance(t, dict)] if isinstance(data, list) else []
-    logger.info(f"Todoist filter 'today | overdue' returned: {len(tasks)} tasks")
+    # Убираем дубли по id (filter может вернуть задачу дважды: и today, и overdue)
+    seen = set()
+    unique = []
+    for t in tasks:
+        tid = t.get("id")
+        if tid and tid not in seen:
+            seen.add(tid)
+            unique.append(t)
+    logger.info(f"Todoist filter 'today | overdue': {len(tasks)} → {len(unique)} уникальных")
     def sort_key(t):
         due = t.get("due") or {}
         return due.get("date") or "0"
-    return sorted(tasks, key=sort_key)
+    return sorted(unique, key=sort_key)
 
 
 def get_tasks_due_in_one_hour() -> list:
@@ -1125,8 +1133,8 @@ def _task_sort_key(task):
     return (-priority, due_date)
 
 
-def build_structured_tasks(tasks: list, projects_map: dict, header: str) -> str:
-    """Группирует задачи по проектам (блокам), сортирует внутри по важности/срочности."""
+def build_tasks_with_motivation(tasks: list, projects_map: dict, header: str) -> str:
+    """Группирует задачи по блокам, сортирует, и Gemini пишет обоснование к КАЖДОМУ блоку."""
     if not tasks:
         return f"✅ *{header}*\n\nНа сегодня задач нет — отдыхай с чистой совестью! 🌿"
 
@@ -1143,6 +1151,31 @@ def build_structured_tasks(tasks: list, projects_map: dict, header: str) -> str:
         "дом": "🏠", "дни рождения": "🎂", "финансы": "💰", "учёба": "📚",
     }
 
+    # Просим Gemini обоснование по каждому блоку одним запросом (JSON)
+    motivations = {}
+    if GEMINI_API_KEY:
+        blocks_for_ai = ""
+        for bn, bt in blocks.items():
+            task_list = "; ".join(t.get("content", "") for t in bt)
+            blocks_for_ai += f"\n[{bn}]: {task_list}"
+        prompt = (
+            "Вот задачи человека на сегодня, сгруппированные по сферам жизни:\n"
+            f"{blocks_for_ai}\n\n"
+            "Для КАЖДОЙ сферы напиши 1-2 предложения: почему важно выполнить именно эти задачи "
+            "(по их сути, не абстрактно), по-доброму но настойчиво — чтобы захотелось взяться. "
+            "Опирайся на конкретные задачи блока, без банальностей вроде «ты сможешь». "
+            "Ответь СТРОГО JSON-объектом, ключ — название сферы, значение — текст:\n"
+            '{"Работа":"...","Личное":"..."}'
+        )
+        raw = _ask_claude(prompt, max_tokens=1500)
+        if raw:
+            try:
+                clean = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+                s, e = clean.find("{"), clean.rfind("}")
+                motivations = json.loads(clean[s:e+1]) if s != -1 else {}
+            except Exception as ex:
+                logger.error(f"Motivation JSON parse error: {ex}")
+
     text = f"📋 *{header}*\n\n"
     for block_name, block_tasks in blocks.items():
         emoji = next((v for k, v in block_emoji.items() if k in block_name.lower()), "📌")
@@ -1154,25 +1187,14 @@ def build_structured_tasks(tasks: list, projects_map: dict, header: str) -> str:
             due_time = f" `{due_local.strftime('%H:%M')}`" if due_local else ""
             overdue = " ⚠️" if _parse_due_date(due) and _parse_due_date(due) < today else ""
             text += f"  •{pr}{due_time}{overdue} {t.get('content', '—')}\n"
+        # обоснование блока
+        note = motivations.get(block_name) or next(
+            (v for k, v in motivations.items() if k.lower() == block_name.lower()), None
+        )
+        if note:
+            text += f"  _{note}_\n"
         text += "\n"
     return text.strip()
-
-
-def add_motivation_to_blocks(structured_text: str) -> str:
-    """Gemini добавляет к разбору тёплое, но настойчивое напутствие."""
-    if not GEMINI_API_KEY:
-        return structured_text
-    prompt = (
-        "Вот список задач человека на сегодня, разбитый по блокам:\n\n"
-        f"{structured_text}\n\n"
-        "Добавь в конце короткое (3-4 предложения) тёплое, но настойчивое напутствие. "
-        "Объясни по-доброму, почему важно не откладывать эти дела, и подбодри взяться за них с охотой. "
-        "Без сюсюканья, по-человечески и с уважением. Без markdown-заголовков, просто текст."
-    )
-    motivation = _ask_claude(prompt, max_tokens=600)
-    if motivation:
-        return f"{structured_text}\n\n💬 {motivation}"
-    return structured_text
 
 
 def get_inbox_count() -> int:
@@ -1558,8 +1580,7 @@ async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     tasks = get_today_tasks()
     projects_map = _get_projects_map()
-    structured = build_structured_tasks(tasks, projects_map, "Задачи на сегодня")
-    full = add_motivation_to_blocks(structured)
+    full = build_tasks_with_motivation(tasks, projects_map, "Задачи на сегодня")
     inbox_n = get_inbox_count()
     if inbox_n > 0:
         full += f"\n\n📥 Во *Входящих* {inbox_n} задач — не забудь разнести их по проектам."
@@ -1602,8 +1623,7 @@ async def _send_structured_tasks(context, greeting):
     """Собирает задачи по блокам, добавляет мотивацию и напоминание про Входящие."""
     tasks = get_today_tasks()
     projects_map = _get_projects_map()
-    structured = build_structured_tasks(tasks, projects_map, greeting)
-    full = add_motivation_to_blocks(structured)
+    full = build_tasks_with_motivation(tasks, projects_map, greeting)
 
     # Напоминание разнести Входящие
     inbox_n = get_inbox_count()
