@@ -1145,6 +1145,48 @@ def get_tasks_due_in_one_hour() -> list:
     return result
 
 
+def get_completed_today() -> list:
+    """Задачи, завершённые сегодня. Через Todoist Sync API completed/get_all."""
+    today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
+    since = datetime.now(TIMEZONE).replace(hour=0, minute=0, second=0).astimezone(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        resp = requests.get(
+            "https://api.todoist.com/sync/v9/completed/get_all",
+            headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
+            params={"since": since, "limit": 50},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            logger.error(f"Todoist completed error: {resp.status_code} {resp.text[:200]}")
+            return []
+        items = resp.json().get("items", [])
+        result = []
+        for it in items:
+            completed_at = it.get("completed_at", "")
+            if completed_at:
+                try:
+                    dt_local = datetime.fromisoformat(completed_at.replace("Z", "+00:00")).astimezone(TIMEZONE)
+                    if dt_local.strftime("%Y-%m-%d") == today:
+                        result.append(it)
+                except Exception:
+                    result.append(it)
+        return result
+    except Exception as e:
+        logger.error(f"get_completed_today error: {e}")
+        return []
+
+
+def get_tomorrow_tasks() -> list:
+    """Задачи с дедлайном завтра."""
+    tomorrow = (datetime.now(TIMEZONE) + timedelta(days=1)).strftime("%Y-%m-%d")
+    result = []
+    for task in _todoist_get_all_tasks():
+        due = task.get("due") or {}
+        if _parse_due_date(due) == tomorrow:
+            result.append(task)
+    return result
+
+
 def format_tasks(tasks: list, header: str = "Задачи на сегодня") -> str:
     if not tasks:
         return "✅ На сегодня задач нет!"
@@ -1162,29 +1204,32 @@ def format_tasks(tasks: list, header: str = "Задачи на сегодня") 
 
 
 def _get_projects_map() -> dict:
-    """Карта id проекта -> название. Плюс отдельно ищем id 'Входящие'/Inbox."""
-    try:
-        resp = requests.get(
-            f"{TODOIST_API}/projects",
-            headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            logger.error(f"Todoist projects error: {resp.status_code}")
-            return {}
-        data = resp.json()
-        projects = data.get("results", []) if isinstance(data, dict) else data
-        result = {}
-        for p in projects:
-            if isinstance(p, dict) and p.get("id"):
-                result[str(p["id"])] = {
-                    "name": p.get("name", "Без проекта"),
-                    "is_inbox": bool(p.get("is_inbox_project") or p.get("inbox_project")),
-                }
-        return result
-    except Exception as e:
-        logger.error(f"Projects map error: {e}")
-        return {}
+    """Карта id проекта -> название. Повтор при сбое, чтобы задачи не падали в 'Прочее'."""
+    for attempt in range(3):
+        try:
+            resp = requests.get(
+                f"{TODOIST_API}/projects",
+                headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                logger.error(f"Todoist projects error (attempt {attempt+1}): {resp.status_code}")
+                continue
+            data = resp.json()
+            projects = data.get("results", []) if isinstance(data, dict) else data
+            result = {}
+            for p in projects:
+                if isinstance(p, dict) and p.get("id"):
+                    result[str(p["id"])] = {
+                        "name": p.get("name", "Без проекта"),
+                        "is_inbox": bool(p.get("is_inbox_project") or p.get("inbox_project")),
+                    }
+            if result:
+                return result
+        except Exception as e:
+            logger.error(f"Projects map error (attempt {attempt+1}): {e}")
+    logger.error("Projects map: не удалось загрузить проекты после 3 попыток")
+    return {}
 
 
 def _task_sort_key(task):
@@ -1202,6 +1247,7 @@ def build_tasks_with_motivation(tasks: list, projects_map: dict, header: str) ->
 
     # Группируем по проекту
     blocks = {}
+    projects_failed = not projects_map  # карта пустая = Todoist API не отдал проекты
     for t in tasks:
         pid = str(t.get("project_id", ""))
         pinfo = projects_map.get(pid, {"name": "Прочее", "is_inbox": False})
@@ -1246,6 +1292,8 @@ def build_tasks_with_motivation(tasks: list, projects_map: dict, header: str) ->
                 logger.error(f"Motivation: не распарсилось | raw: {raw[:200]}")
 
     text = f"📋 *{header}*\n\n"
+    if projects_failed:
+        text += "_⚠️ Todoist не отдал проекты — задачи без группировки. Попробуй /tasks позже._\n\n"
     for block_name, block_tasks in blocks.items():
         emoji = next((v for k, v in block_emoji.items() if k in block_name.lower()), "📌")
         text += f"{emoji} *{block_name}*\n"
@@ -1346,6 +1394,7 @@ async def answer_q4(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_entry(context.user_data["date"], context.user_data["answers"])  # план уже сохранён
     date_str, yesterday_plan = get_yesterday_plan()
     if yesterday_plan:
+        context.user_data["yesterday_plan"] = yesterday_plan
         await update.message.reply_text(
             f"📋 *Твой план со вчера ({date_str}):*\n\n{yesterday_plan}\n\n✅ Удалось выполнить что-то из списка?",
             parse_mode="Markdown"
@@ -1357,9 +1406,29 @@ async def answer_q4(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def answer_plan_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["answers"]["plan_review"] = update.message.text
+    review_text = update.message.text
+    context.user_data["answers"]["plan_review"] = review_text
     date_str = context.user_data["date"]
     save_entry(date_str, context.user_data["answers"])
+
+    # Gemini реагирует по контексту: хвалит за сделанное или мягко поддерживает
+    yesterday_plan = context.user_data.get("yesterday_plan", "")
+    reaction = ""
+    if yesterday_plan and GEMINI_API_KEY:
+        reaction = _ask_claude(
+            "Вчера человек ставил такой план:\n"
+            f"{yesterday_plan}\n\n"
+            "Вот что он сейчас написал о выполнении:\n"
+            f"{review_text}\n\n"
+            "Отреагируй по-человечески (2-3 предложения) на основе того, что он реально сделал. "
+            "Если выполнил — искренне порадуйся за конкретные дела. "
+            "Если не всё или ничего — поддержи без осуждения, помоги увидеть, что мешало, мягко настрой на завтра. "
+            "Тёплый живой тон, на «ты», без шаблонов и нравоучений. Без markdown-заголовков.",
+            max_tokens=400,
+        )
+
+    if reaction:
+        await update.message.reply_text(f"💬 {reaction}")
     await update.message.reply_text(f"✅ Всё записано. Хорошего вечера!\n\nЗапись за {date_str} сохранена.")
     return ConversationHandler.END
 
@@ -1718,6 +1787,52 @@ async def morning_tasks(context: ContextTypes.DEFAULT_TYPE):
 async def afternoon_tasks(context: ContextTypes.DEFAULT_TYPE):
     """16:00 — что осталось на день, снова по блокам."""
     await _send_structured_tasks(context, "🕓 Чек-ин дня: что осталось")
+
+
+async def evening_summary(context: ContextTypes.DEFAULT_TYPE):
+    """21:00 — похвала за выполненное сегодня + задачи на завтра."""
+    completed = get_completed_today()
+    tomorrow = get_tomorrow_tasks()
+
+    # Похвала за выполненное (каждый раз разная, через Gemini)
+    if completed:
+        done_list = "\n".join(f"- {t.get('content', '')}" for t in completed)
+        praise = _ask_claude(
+            "Человек сегодня выполнил эти задачи:\n"
+            f"{done_list}\n\n"
+            "Похвали его искренне и по-человечески за сделанное (3-4 предложения). "
+            "Отметь конкретные дела, без шаблонов и пафоса. Тёплый, живой тон, на «ты». "
+            "Без markdown-заголовков.",
+            max_tokens=500,
+        )
+        text = "🌙 *Итоги дня*\n\n"
+        text += f"Сегодня сделано ({len(completed)}):\n"
+        for t in completed:
+            text += f"  ✅ {t.get('content', '')}\n"
+        if praise:
+            text += f"\n💫 _{praise}_\n"
+    else:
+        # Нечего хвалить — поддерживаем
+        text = "🌙 *Итоги дня*\n\n"
+        text += ("Сегодня в Todoist нет отмеченных задач. Бывают такие дни — "
+                 "и это нормально. Отдохни, завтра новый старт. 🌿\n")
+
+    # Что на завтра
+    if tomorrow:
+        text += f"\n📅 *На завтра ({len(tomorrow)}):*\n"
+        for t in sorted(tomorrow, key=_task_sort_key):
+            pr = {1: "", 2: "🔵", 3: "🟡", 4: "🔴"}.get(t.get("priority", 1), "")
+            due = t.get("due") or {}
+            due_local = _parse_due_time(due)
+            due_time = f" `{due_local.strftime('%H:%M')}`" if due_local else ""
+            text += f"  •{pr}{due_time} {t.get('content', '—')}\n"
+        text += "\n_Готовься спокойно — ты уже знаешь что впереди._"
+    else:
+        text += "\n📅 На завтра пока ничего не запланировано — чистый лист."
+
+    async def _send(t, parse_mode=None):
+        await context.bot.send_message(chat_id=MY_CHAT_ID, text=t, parse_mode=parse_mode)
+    await _send_long(_send, text)
 
 
 async def deadline_reminder(context: ContextTypes.DEFAULT_TYPE):
@@ -2158,6 +2273,7 @@ async def main():
     todoist_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, todoist_handle_message))
     todoist_app.job_queue.run_daily(morning_tasks, time=dtime(hour=9, minute=0, tzinfo=TIMEZONE))
     todoist_app.job_queue.run_daily(afternoon_tasks, time=dtime(hour=16, minute=0, tzinfo=TIMEZONE))
+    todoist_app.job_queue.run_daily(evening_summary, time=dtime(hour=21, minute=0, tzinfo=TIMEZONE))
     todoist_app.job_queue.run_repeating(deadline_reminder, interval=1800, first=60)  # каждые 30 минут
     todoist_app.add_handler(CommandHandler("birthdays", birthdays_command))
     todoist_app.job_queue.run_daily(check_birthday_reminders, time=dtime(hour=9, minute=0, tzinfo=TIMEZONE))
