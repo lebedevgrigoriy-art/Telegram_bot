@@ -12,6 +12,8 @@ import bot as core_bots          # существующие 7 ботов
 import podcast_bot               # подкаст-дайджест
 import wishlist_bot              # вишлист
 import quote_bot                 # цитата дня
+import plant_bot                 # уход за цветами
+import cleaning_bot              # уборка квартиры
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -25,6 +27,8 @@ MODULES = [
     ("podcast", podcast_bot),
     ("wishlist", wishlist_bot),
     ("quote", quote_bot),
+    ("plant", plant_bot),
+    ("cleaning", cleaning_bot),
 ]
 
 
