@@ -1457,7 +1457,7 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"📖 {row.get('lesson') or '—'}\n"
         text += f"🗓 {row.get('plan') or '—'}\n"
         text += "─────────────\n"
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await _send_long(update.message.reply_text, text)
 
 
 async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
