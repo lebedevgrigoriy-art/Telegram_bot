@@ -1146,44 +1146,46 @@ def get_tasks_due_in_one_hour() -> list:
 
 
 def get_completed_today() -> list:
-    """Задачи, завершённые сегодня. Через Todoist Sync API completed/get_all."""
-    today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
-    since = datetime.now(TIMEZONE).replace(hour=0, minute=0, second=0).astimezone(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%S")
-    try:
-        resp = requests.get(
-            "https://api.todoist.com/sync/v9/completed/get_all",
-            headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
-            params={"since": since, "limit": 50},
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            logger.error(f"Todoist completed error: {resp.status_code} {resp.text[:200]}")
-            return []
-        items = resp.json().get("items", [])
-        result = []
-        for it in items:
-            completed_at = it.get("completed_at", "")
-            if completed_at:
-                try:
-                    dt_local = datetime.fromisoformat(completed_at.replace("Z", "+00:00")).astimezone(TIMEZONE)
-                    if dt_local.strftime("%Y-%m-%d") == today:
-                        result.append(it)
-                except Exception:
-                    result.append(it)
-        return result
-    except Exception as e:
-        logger.error(f"get_completed_today error: {e}")
-        return []
+    """Задачи, завершённые сегодня. Через Todoist API v1 completed by completion date."""
+    now = datetime.now(TIMEZONE)
+    since = now.replace(hour=0, minute=0, second=0).strftime("%Y-%m-%dT%H:%M:%S")
+    until = now.replace(hour=23, minute=59, second=59).strftime("%Y-%m-%dT%H:%M:%S")
+    # Пробуем новый API v1
+    for url, params in [
+        (f"{TODOIST_API}/tasks/completed/by_completion_date",
+         {"since": since, "until": until, "limit": 100}),
+        ("https://api.todoist.com/sync/v9/completed/get_all",
+         {"since": since, "limit": 100}),
+    ]:
+        try:
+            resp = requests.get(
+                url,
+                headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
+                params=params,
+                timeout=10,
+            )
+            logger.info(f"Completed tasks {url}: HTTP {resp.status_code}, {resp.text[:200]}")
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            items = data.get("items", []) if isinstance(data, dict) else data
+            if items:
+                return [it for it in items if isinstance(it, dict)]
+        except Exception as e:
+            logger.error(f"get_completed_today error ({url}): {e}")
+    return []
 
 
 def get_tomorrow_tasks() -> list:
     """Задачи с дедлайном завтра."""
     tomorrow = (datetime.now(TIMEZONE) + timedelta(days=1)).strftime("%Y-%m-%d")
+    all_tasks = _todoist_get_all_tasks()
     result = []
-    for task in _todoist_get_all_tasks():
+    for task in all_tasks:
         due = task.get("due") or {}
         if _parse_due_date(due) == tomorrow:
             result.append(task)
+    logger.info(f"Tomorrow ({tomorrow}) tasks: {len(result)} из {len(all_tasks)}")
     return result
 
 
