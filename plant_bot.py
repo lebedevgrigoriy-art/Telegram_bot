@@ -92,9 +92,9 @@ async def main() -> list:
     app.add_handler(CommandHandler("water", water_command))
 
     # Полив: понедельник (0) и пятница (4) в 09:00
-    app.job_queue.run_daily(water_reminder, time=dtime(hour=9, minute=0, tzinfo=TIMEZONE), days=(0, 4))
+    app.job_queue.run_daily(water_reminder, time=dtime(hour=9, minute=0, tzinfo=TIMEZONE), days=(1, 5))
     # Отстаивание воды: вторник (1) и пятница (4) — за 3 дня до пятницы и понедельника
-    app.job_queue.run_daily(settle_water_reminder, time=dtime(hour=9, minute=0, tzinfo=TIMEZONE), days=(1, 4))
+    app.job_queue.run_daily(settle_water_reminder, time=dtime(hour=9, minute=0, tzinfo=TIMEZONE), days=(2, 5))
     # Рыхление: 1-го числа каждого месяца в 09:00
     app.job_queue.run_monthly(loosen_soil_reminder, when=dtime(hour=9, minute=0, tzinfo=TIMEZONE), day=1)
 
