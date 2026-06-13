@@ -107,7 +107,7 @@ def sb_headers(extra_prefer=""):
 
 def add_wish(title, price, photo_id):
     try:
-        requests.post(
+        resp = requests.post(
             f"{SUPABASE_URL}/rest/v1/wishlist",
             headers=sb_headers(),
             json={
@@ -119,7 +119,9 @@ def add_wish(title, price, photo_id):
             },
             timeout=10,
         )
-        return True
+        if not resp.ok:
+            logger.error(f"add_wish failed: {resp.status_code} {resp.text}")
+        return resp.ok
     except Exception as e:
         logger.error(f"add_wish error: {e}")
         return False
@@ -133,7 +135,12 @@ def get_wishes(bought=False):
             params={"bought": f"eq.{str(bought).lower()}", "order": "created_at.desc"},
             timeout=10,
         )
-        return resp.json() if resp.ok else []
+        if not resp.ok:
+            logger.error(f"get_wishes failed: {resp.status_code} {resp.text}")
+            return []
+        result = resp.json()
+        logger.info(f"get_wishes(bought={bought}): {len(result)} items")
+        return result
     except Exception as e:
         logger.error(f"get_wishes error: {e}")
         return []
@@ -340,7 +347,7 @@ async def main() -> list:
     app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, handle_message))
 
     # Воскресенье 20:00 (понедельник=0 ... воскресенье=6)
-    app.job_queue.run_daily(weekly_wishlist, time=dtime(hour=20, minute=0, tzinfo=TIMEZONE), days=(6,))
+    app.job_queue.run_daily(weekly_wishlist, time=dtime(hour=20, minute=0, tzinfo=TIMEZONE), days=(0,))
 
     return [app]
 
