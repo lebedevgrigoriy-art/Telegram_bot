@@ -82,9 +82,9 @@ async def main() -> list:
     app.add_handler(CommandHandler("start", cleaning_start))
 
     # Полы и санузел — воскресенье (6), пыль — понедельник (0); все в 12:00
-    app.job_queue.run_daily(floors_reminder, time=dtime(hour=12, minute=0, tzinfo=TIMEZONE), days=(6,))
-    app.job_queue.run_daily(bathroom_reminder, time=dtime(hour=12, minute=0, tzinfo=TIMEZONE), days=(6,))
-    app.job_queue.run_daily(dust_reminder, time=dtime(hour=12, minute=0, tzinfo=TIMEZONE), days=(0,))
+    app.job_queue.run_daily(floors_reminder, time=dtime(hour=12, minute=0, tzinfo=TIMEZONE), days=(0,))
+    app.job_queue.run_daily(bathroom_reminder, time=dtime(hour=12, minute=0, tzinfo=TIMEZONE), days=(0,))
+    app.job_queue.run_daily(dust_reminder, time=dtime(hour=12, minute=0, tzinfo=TIMEZONE), days=(1,))
     # Окна — 1-го числа, только в нечётные месяцы (раз в 2 месяца)
     app.job_queue.run_monthly(windows_reminder, when=dtime(hour=12, minute=0, tzinfo=TIMEZONE), day=1)
 
