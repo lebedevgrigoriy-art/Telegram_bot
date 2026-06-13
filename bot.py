@@ -830,17 +830,8 @@ def _pct(old, new):
     return None
 
 
-def make_weekly_market_review():
-    """Недельный обзор: сравнение с прошлой неделей + живой AI-комментарий. Только реальные цифры."""
-    rates = get_rates()
-    if not rates:
-        return "❌ Не удалось получить данные для обзора."
-
-    # Прошлый снимок из Supabase
-    prev_rows = sb_get("market_snapshots", {"order": "date.desc", "limit": "1"})
-    prev = prev_rows[0] if prev_rows else None
-
-    # Сохраняем текущий снимок
+def _save_snapshot(rates):
+    """Сохраняет снимок рынка за сегодня (ежедневно, молча)."""
     today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
     snapshot = {
         "date": today,
@@ -854,7 +845,50 @@ def make_weekly_market_review():
     }
     sb_upsert("market_snapshots", snapshot, on_conflict="date")
 
-    # Считаем изменения
+
+def _find_snapshot_near(target_date, tolerance_days=4):
+    """Ищет снимок ближайший к target_date (в пределах ±tolerance_days)."""
+    lo = (target_date - timedelta(days=tolerance_days)).strftime("%Y-%m-%d")
+    hi = (target_date + timedelta(days=tolerance_days)).strftime("%Y-%m-%d")
+    rows = sb_get("market_snapshots", {
+        "date": f"gte.{lo}",
+        "order": "date.asc",
+    })
+    # фильтруем по верхней границе и берём ближайший к target
+    target_str = target_date.strftime("%Y-%m-%d")
+    best, best_diff = None, 999
+    for r in rows:
+        d = r.get("date", "")
+        if d > hi:
+            continue
+        try:
+            diff = abs((datetime.strptime(d, "%Y-%m-%d") - target_date).days)
+            if diff < best_diff:
+                best, best_diff = r, diff
+        except Exception:
+            continue
+    return best
+
+
+async def daily_snapshot_job(context):
+    """Ежедневно сохраняет снимок рынка для истории сравнений."""
+    rates = get_rates()
+    if rates:
+        _save_snapshot(rates)
+
+
+def make_market_review(period_label, days_back):
+    """Универсальный обзор: сравнивает сегодня с тем, что было days_back назад.
+    period_label — 'неделю'/'месяц'/'полгода'/'год' для текста."""
+    rates = get_rates()
+    if not rates:
+        return "❌ Не удалось получить данные для обзора."
+
+    # снимок нужной давности
+    target = datetime.now(TIMEZONE) - timedelta(days=days_back)
+    prev = _find_snapshot_near(target, tolerance_days=max(3, days_back // 10))
+
+    changes = []
     def line(emoji, name, key, cur, unit="", as_int=False):
         val = f"{cur:,.0f}".replace(",", " ") if as_int else f"{cur:.2f}"
         txt = f"{emoji} *{name}:* `{val}{unit}`"
@@ -863,9 +897,12 @@ def make_weekly_market_review():
             if p is not None:
                 arrow = "📈" if p >= 0 else "📉"
                 txt += f"  {arrow} {p:+.1f}%"
+                changes.append(f"{name}: {val}{unit} ({p:+.1f}% за {period_label})")
+        else:
+            changes.append(f"{name}: {val}{unit}")
         return txt
 
-    lines = ["📅 *Недельный обзор рынков*\n"]
+    lines = [f"📅 *Обзор рынков за {period_label}*\n"]
     if rates.get("btc_usd"):
         lines.append(line("₿", "Bitcoin", "btc_usd", rates["btc_usd"], " $", as_int=True))
     if rates.get("rub_per_usd"):
@@ -882,23 +919,38 @@ def make_weekly_market_review():
         lines.append(line("🇷🇺", "Мосбиржа", "moex", rates["moex"], "", as_int=True))
 
     table = "\n".join(lines)
+    has_dynamics = prev is not None
 
-    # AI-комментарий только по реальным движениям
-    if prev and GEMINI_API_KEY:
-        prompt = (
-            "Ты — остроумный финансовый обозреватель. Вот РЕАЛЬНЫЕ данные рынков за неделю "
-            "(текущее значение и изменение в %).\n\n"
-            f"{table}\n\n"
-            "Напиши короткий живой комментарий (4-6 предложений) с лёгкой иронией про эти движения. "
-            "ВАЖНО: комментируй ТОЛЬКО приведённые цифры и проценты. "
-            "НЕ выдумывай новости, события, имена, названия компаний или причины — "
-            "ты не знаешь что происходило в мире, только цифры. "
-            "Если актив вырос — отметь, если упал — обыграй. Без markdown-заголовков."
-        )
-        comment = _ask_claude(prompt, max_tokens=800)
+    if GEMINI_API_KEY:
+        if has_dynamics:
+            prompt = (
+                "Ты — остроумный финансовый обозреватель в духе телеграм-каналов про рынки. "
+                f"Вот РЕАЛЬНЫЕ данные с изменением за {period_label}:\n\n"
+                + "\n".join(changes) +
+                f"\n\nНапиши живой ироничный комментарий (5-7 предложений) про движения за {period_label}. "
+                "Обыграй кто вырос, кто упал, что просело сильнее, что держится. "
+                "Свяжи активы где уместно (доллар и нефть, золото как защита). "
+                "ВАЖНО: опирайся ТОЛЬКО на эти цифры и проценты. "
+                "НЕ выдумывай новости, события, имена, компании, причины — знаешь только цифры. "
+                "Без markdown-заголовков, живой разговорный тон."
+            )
+        else:
+            prompt = (
+                "Ты — остроумный финансовый обозреватель. Текущие данные рынков:\n\n"
+                + "\n".join(changes) +
+                f"\n\nНапиши живой комментарий (4-5 предложений): что дорого, что дёшево, на что смотреть. "
+                f"Данных за {period_label} назад пока нет — динамика появится позже. "
+                "Опирайся ТОЛЬКО на эти цифры, не выдумывай новости. Без markdown-заголовков."
+            )
+        comment = _ask_claude(prompt, max_tokens=900)
         if comment:
-            return f"{table}\n\n💬 {comment}"
+            footer = "" if has_dynamics else f"\n\n_📸 Нет данных за {period_label} назад — динамика появится когда накопится история._"
+            return f"{table}\n\n💬 {comment}{footer}"
+
+    if not has_dynamics:
+        table += f"\n\n_📸 Нет данных за {period_label} назад — динамика появится когда накопится история._"
     return table
+
 
 
 # =====================
@@ -1554,7 +1606,7 @@ async def rates_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def bybit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != BYBIT_CHAT_ID:
         return
-    await update.message.reply_text("Привет! Я слежу за курсами 📊\n\nКаждое утро в 08:00 присылаю курсы.\nПо воскресеньям — недельный обзор рынков.\n\n/rates — курсы прямо сейчас\n/review — недельный обзор")
+    await update.message.reply_text("Привет! Я слежу за курсами 📊\n\nКаждое утро в 08:00 — курсы.\nОбзоры: неделя (вс 18:00), месяц, полгода, год.\n\n/rates — курсы сейчас\n/review — обзор за неделю\n/month — за месяц\n/halfyear — за полгода\n/year — за год")
 
 
 async def morning_rates(context: ContextTypes.DEFAULT_TYPE):
@@ -1564,16 +1616,58 @@ async def morning_rates(context: ContextTypes.DEFAULT_TYPE):
 async def review_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != BYBIT_CHAT_ID:
         return
-    await update.message.reply_text("📊 Готовлю недельный обзор рынков... 🧠")
-    review = make_weekly_market_review()
-    await _send_long(update.message.reply_text, review)
+    await update.message.reply_text("📊 Готовлю обзор за неделю... 🧠")
+    await _send_long(update.message.reply_text, make_market_review("неделю", 7))
+
+
+async def month_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != BYBIT_CHAT_ID:
+        return
+    await update.message.reply_text("📊 Готовлю обзор за месяц... 🧠")
+    await _send_long(update.message.reply_text, make_market_review("месяц", 30))
+
+
+async def halfyear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != BYBIT_CHAT_ID:
+        return
+    await update.message.reply_text("📊 Готовлю обзор за полгода... 🧠")
+    await _send_long(update.message.reply_text, make_market_review("полгода", 182))
+
+
+async def year_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != BYBIT_CHAT_ID:
+        return
+    await update.message.reply_text("📊 Готовлю обзор за год... 🧠")
+    await _send_long(update.message.reply_text, make_market_review("год", 365))
 
 
 async def weekly_market_report(context: ContextTypes.DEFAULT_TYPE):
-    review = make_weekly_market_review()
     async def _send(text, parse_mode=None):
         await context.bot.send_message(chat_id=BYBIT_CHAT_ID, text=text, parse_mode=parse_mode)
-    await _send_long(_send, review)
+    await _send_long(_send, make_market_review("неделю", 7))
+
+
+async def monthly_market_report(context: ContextTypes.DEFAULT_TYPE):
+    # шлём только 30-го числа (run_monthly на 30 пропустит короткие месяцы — подстрахуемся днём)
+    async def _send(text, parse_mode=None):
+        await context.bot.send_message(chat_id=BYBIT_CHAT_ID, text=text, parse_mode=parse_mode)
+    await _send_long(_send, make_market_review("месяц", 30))
+
+
+async def halfyear_market_report(context: ContextTypes.DEFAULT_TYPE):
+    today = datetime.now(TIMEZONE)
+    if today.month == 7 and today.day == 15:
+        async def _send(text, parse_mode=None):
+            await context.bot.send_message(chat_id=BYBIT_CHAT_ID, text=text, parse_mode=parse_mode)
+        await _send_long(_send, make_market_review("полгода", 182))
+
+
+async def yearly_market_report(context: ContextTypes.DEFAULT_TYPE):
+    today = datetime.now(TIMEZONE)
+    if today.month == 12 and today.day == 31:
+        async def _send(text, parse_mode=None):
+            await context.bot.send_message(chat_id=BYBIT_CHAT_ID, text=text, parse_mode=parse_mode)
+        await _send_long(_send, make_market_review("год", 365))
 
 
 # =====================
@@ -2242,8 +2336,19 @@ async def main():
     rates_app.add_handler(CommandHandler("start", bybit_start))
     rates_app.add_handler(CommandHandler("rates", rates_command))
     rates_app.add_handler(CommandHandler("review", review_command))
+    rates_app.add_handler(CommandHandler("month", month_command))
+    rates_app.add_handler(CommandHandler("halfyear", halfyear_command))
+    rates_app.add_handler(CommandHandler("year", year_command))
     rates_app.job_queue.run_daily(morning_rates, time=dtime(hour=8, minute=0, tzinfo=TIMEZONE))
+    # Ежедневный снимок рынка для истории сравнений (08:05)
+    rates_app.job_queue.run_daily(daily_snapshot_job, time=dtime(hour=8, minute=5, tzinfo=TIMEZONE))
+    # Недельный обзор — воскресенье 18:00
     rates_app.job_queue.run_daily(weekly_market_report, time=dtime(hour=18, minute=0, tzinfo=TIMEZONE), days=(6,))
+    # Месячный обзор — 30-го числа 18:00 (run_monthly с day=30)
+    rates_app.job_queue.run_monthly(monthly_market_report, when=dtime(hour=18, minute=0, tzinfo=TIMEZONE), day=30)
+    # Полгода (15 июля) и год (31 декабря) — проверяем дату внутри, гоняем ежедневно 18:00
+    rates_app.job_queue.run_daily(halfyear_market_report, time=dtime(hour=18, minute=30, tzinfo=TIMEZONE))
+    rates_app.job_queue.run_daily(yearly_market_report, time=dtime(hour=18, minute=30, tzinfo=TIMEZONE))
 
     # Бот кино
     cinema_app = Application.builder().token(CINEMA_BOT_TOKEN).build()
