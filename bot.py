@@ -2329,7 +2329,7 @@ async def main():
     reflection_app.job_queue.run_daily(evening_questions, time=dtime(hour=21, minute=0, tzinfo=TIMEZONE))
     reflection_app.job_queue.run_monthly(monthly_gratitude_report, when=dtime(hour=9, tzinfo=TIMEZONE), day=1)
     reflection_app.job_queue.run_monthly(monthly_portrait_report, when=dtime(hour=10, tzinfo=TIMEZONE), day=1)
-    reflection_app.job_queue.run_daily(weekly_reminder, time=dtime(hour=22, minute=0, tzinfo=TIMEZONE), days=(6,))
+    reflection_app.job_queue.run_daily(weekly_reminder, time=dtime(hour=22, minute=0, tzinfo=TIMEZONE), days=(0,))
 
     # Бот курсов
     rates_app = Application.builder().token(BYBIT_BOT_TOKEN).build()
@@ -2343,7 +2343,7 @@ async def main():
     # Ежедневный снимок рынка для истории сравнений (08:05)
     rates_app.job_queue.run_daily(daily_snapshot_job, time=dtime(hour=8, minute=5, tzinfo=TIMEZONE))
     # Недельный обзор — воскресенье 18:00
-    rates_app.job_queue.run_daily(weekly_market_report, time=dtime(hour=18, minute=0, tzinfo=TIMEZONE), days=(6,))
+    rates_app.job_queue.run_daily(weekly_market_report, time=dtime(hour=18, minute=0, tzinfo=TIMEZONE), days=(0,))
     # Месячный обзор — 30-го числа 18:00 (run_monthly с day=30)
     rates_app.job_queue.run_monthly(monthly_market_report, when=dtime(hour=18, minute=0, tzinfo=TIMEZONE), day=30)
     # Полгода (15 июля) и год (31 декабря) — проверяем дату внутри, гоняем ежедневно 18:00
@@ -2390,7 +2390,7 @@ async def main():
     savings_app.add_handler(CommandHandler("start", savings_start))
     savings_app.add_handler(CommandHandler("balance", balance_command))
     savings_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, savings_handle_message))
-    savings_app.job_queue.run_daily(weekly_savings_report, time=dtime(hour=20, minute=0, tzinfo=TIMEZONE), days=(6,))
+    savings_app.job_queue.run_daily(weekly_savings_report, time=dtime(hour=20, minute=0, tzinfo=TIMEZONE), days=(0,))
 
     # Книжный бот
     books_app = Application.builder().token(BOOKS_BOT_TOKEN).build()
@@ -2398,7 +2398,7 @@ async def main():
     books_app.add_handler(CommandHandler("books", books_command))
     books_app.add_handler(CommandHandler("recommend", recommend_command))
     books_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, books_handle_message))
-    books_app.job_queue.run_daily(weekly_books_report, time=dtime(hour=9, minute=0, tzinfo=TIMEZONE), days=(0,))
+    books_app.job_queue.run_daily(weekly_books_report, time=dtime(hour=9, minute=0, tzinfo=TIMEZONE), days=(1,))
     books_app.job_queue.run_monthly(monthly_books_question, when=dtime(hour=10, tzinfo=TIMEZONE), day=1)
 
     return [
