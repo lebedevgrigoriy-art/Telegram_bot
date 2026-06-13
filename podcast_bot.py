@@ -273,7 +273,7 @@ async def main() -> list:
     app.job_queue.run_daily(
         weekly_digest,
         time=dtime(hour=21, minute=0, tzinfo=TIMEZONE),
-        days=(6,),
+        days=(0,),
     )
     return [app]
 
