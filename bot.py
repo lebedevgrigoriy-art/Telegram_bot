@@ -354,8 +354,8 @@ def load_visa():
 
 
 def days_left(expiry_date_str):
-    expiry = datetime.strptime(expiry_date_str, "%d.%m.%Y")
-    today = datetime.now(TIMEZONE).replace(tzinfo=None)
+    expiry = datetime.strptime(expiry_date_str, "%d.%m.%Y").date()
+    today = datetime.now(TIMEZONE).date()
     return (expiry - today).days
 
 
@@ -1827,6 +1827,14 @@ async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_long(update.message.reply_text, full)
 
 
+async def evening_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ручной вызов вечернего блока для теста."""
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+    await update.message.reply_text("🌙 Собираю итоги дня... 🧠")
+    await evening_summary(context)
+
+
 async def inbox_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MY_CHAT_ID:
         return
@@ -2330,6 +2338,7 @@ async def main():
     reflection_app.job_queue.run_monthly(monthly_gratitude_report, when=dtime(hour=9, tzinfo=TIMEZONE), day=1)
     reflection_app.job_queue.run_monthly(monthly_portrait_report, when=dtime(hour=10, tzinfo=TIMEZONE), day=1)
     reflection_app.job_queue.run_daily(weekly_reminder, time=dtime(hour=22, minute=0, tzinfo=TIMEZONE), days=(0,))
+    reflection_app.job_queue.run_daily(monday_plan_reminder, time=dtime(hour=8, minute=0, tzinfo=TIMEZONE), days=(1,))
 
     # Бот курсов
     rates_app = Application.builder().token(BYBIT_BOT_TOKEN).build()
@@ -2376,6 +2385,7 @@ async def main():
     todoist_app = Application.builder().token(TODOIST_BOT_TOKEN).build()
     todoist_app.add_handler(CommandHandler("start", todoist_start))
     todoist_app.add_handler(CommandHandler("tasks", tasks_command))
+    todoist_app.add_handler(CommandHandler("evening", evening_command))
     todoist_app.add_handler(CommandHandler("inbox", inbox_command))
     todoist_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, todoist_handle_message))
     todoist_app.job_queue.run_daily(morning_tasks, time=dtime(hour=9, minute=0, tzinfo=TIMEZONE))
