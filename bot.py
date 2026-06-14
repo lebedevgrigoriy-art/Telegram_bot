@@ -1198,34 +1198,44 @@ def get_tasks_due_in_one_hour() -> list:
 
 
 def get_completed_today() -> list:
-    """Задачи, завершённые сегодня. Через Todoist API v1 completed by completion date."""
-    now = datetime.now(TIMEZONE)
-    since = now.replace(hour=0, minute=0, second=0).strftime("%Y-%m-%dT%H:%M:%S")
-    until = now.replace(hour=23, minute=59, second=59).strftime("%Y-%m-%dT%H:%M:%S")
-    # Пробуем новый API v1
-    for url, params in [
-        (f"{TODOIST_API}/tasks/completed/by_completion_date",
-         {"since": since, "until": until, "limit": 100}),
-        ("https://api.todoist.com/sync/v9/completed/get_all",
-         {"since": since, "limit": 100}),
-    ]:
-        try:
-            resp = requests.get(
-                url,
-                headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
-                params=params,
-                timeout=10,
-            )
-            logger.info(f"Completed tasks {url}: HTTP {resp.status_code}, {resp.text[:200]}")
-            if resp.status_code != 200:
+    """Задачи, завершённые сегодня. Todoist API v1, диапазон в UTC."""
+    now_local = datetime.now(TIMEZONE)
+    today_local = now_local.strftime("%Y-%m-%d")
+    # Берём окно с запасом (вчера-завтра по UTC), потом фильтруем по локальной дате
+    since_utc = (now_local - timedelta(days=1)).astimezone(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%S")
+    until_utc = (now_local + timedelta(days=1)).astimezone(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        resp = requests.get(
+            f"{TODOIST_API}/tasks/completed/by_completion_date",
+            headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
+            params={"since": since_utc, "until": until_utc, "limit": 200},
+            timeout=10,
+        )
+        logger.info(f"Completed tasks: HTTP {resp.status_code}, {resp.text[:200]}")
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+        items = data.get("items", []) if isinstance(data, dict) else data
+        result = []
+        for it in items:
+            if not isinstance(it, dict):
                 continue
-            data = resp.json()
-            items = data.get("items", []) if isinstance(data, dict) else data
-            if items:
-                return [it for it in items if isinstance(it, dict)]
-        except Exception as e:
-            logger.error(f"get_completed_today error ({url}): {e}")
-    return []
+            # фильтруем по локальной дате завершения
+            ca = it.get("completed_at", "")
+            if ca:
+                try:
+                    dt_local = datetime.fromisoformat(ca.replace("Z", "+00:00")).astimezone(TIMEZONE)
+                    if dt_local.strftime("%Y-%m-%d") == today_local:
+                        result.append(it)
+                except Exception:
+                    result.append(it)
+            else:
+                result.append(it)
+        logger.info(f"Completed today (local {today_local}): {len(result)}")
+        return result
+    except Exception as e:
+        logger.error(f"get_completed_today error: {e}")
+        return []
 
 
 def get_tomorrow_tasks() -> list:
