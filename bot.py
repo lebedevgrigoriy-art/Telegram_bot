@@ -1202,8 +1202,8 @@ def get_completed_today() -> list:
     now_local = datetime.now(TIMEZONE)
     today_local = now_local.strftime("%Y-%m-%d")
     # Берём окно с запасом (вчера-завтра по UTC), потом фильтруем по локальной дате
-    since_utc = (now_local - timedelta(days=1)).astimezone(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%S")
-    until_utc = (now_local + timedelta(days=1)).astimezone(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%S")
+    since_utc = (now_local - timedelta(days=1)).astimezone(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    until_utc = (now_local + timedelta(days=1)).astimezone(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
         resp = requests.get(
             f"{TODOIST_API}/tasks/completed/by_completion_date",
