@@ -251,13 +251,20 @@ def make_month_portrait(month_str=None):
 # =====================
 
 def get_current_week():
-    """Возвращает строку текущей недели в формате YYYY-WNN."""
+    """Номер недели. Воскресенье относим к НАСТУПАЮЩЕЙ неделе (как понедельник),
+    чтобы план из /week в вс совпал с чтением в пн (%W считает недели с понедельника)."""
     now = datetime.now(TIMEZONE)
+    # weekday(): пн=0 ... вс=6. Если воскресенье — берём следующий день (понедельник),
+    # чтобы попасть в ту же неделю что и рабочая
+    if now.weekday() == 6:  # воскресенье
+        now = now + timedelta(days=1)
     return now.strftime("%Y-W%W")
 
 def get_last_week():
     """Возвращает строку прошлой недели."""
     now = datetime.now(TIMEZONE)
+    if now.weekday() == 6:
+        now = now + timedelta(days=1)
     last = now - timedelta(days=7)
     return last.strftime("%Y-W%W")
 
