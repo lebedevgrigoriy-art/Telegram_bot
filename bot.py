@@ -773,56 +773,61 @@ def get_rates():
         rub_per_thb = rub_per_usd / fx["THB"]
         rub_per_eur = fx["RUB"] / fx["EUR"]   # кросс-курс евро к рублю
 
-        # Золото, S&P500, Мосбиржа, нефть
-        gold_usd = _yahoo_price("GC=F")       # Gold Futures
+        # Золото, S&P500, Мосбиржа
+        gold_usd_oz = _yahoo_price("GC=F")    # Gold Futures, $/унция
         sp500 = _yahoo_price("^GSPC")         # S&P 500
         moex = _moex_index()
-        oil_usd = _yahoo_price("BZ=F")        # Brent crude
-        oil_rub = oil_usd * rub_per_usd if oil_usd else None
+
+        # Золото в рублях за грамм (1 унция = 31.1035 грамма)
+        gold_rub_gram = None
+        if gold_usd_oz and rub_per_usd:
+            gold_rub_gram = (gold_usd_oz / 31.1035) * rub_per_usd
 
         return {
             "btc_usd": btc_usd,
             "rub_per_usd": rub_per_usd,
             "rub_per_thb": rub_per_thb,
             "rub_per_eur": rub_per_eur,
-            "gold_usd": gold_usd,
+            "gold_rub_gram": gold_rub_gram,
             "sp500": sp500,
             "moex": moex,
-            "oil_usd": oil_usd,
-            "oil_rub": oil_rub,
         }
     except Exception as e:
         logger.error(f"Rates error: {e}")
         return None
 
 
-def format_rates(rates):
+def format_rates(rates, prev=None):
+    """Форматирует курсы единообразно: эмодзи, название, значение, опционально % за сутки."""
     if not rates:
         return "❌ Не удалось получить курсы."
     now = datetime.now(TIMEZONE).strftime("%d.%m.%Y %H:%M")
-    btc_str = f"{rates['btc_usd']:,.0f}".replace(",", " ")
+
+    def fmt_line(emoji, name, key, value, unit, as_int=False, decimals=2):
+        val_str = f"{value:,.0f}".replace(",", " ") if as_int else f"{value:.{decimals}f}"
+        line = f"{emoji} *{name}:* `{val_str} {unit}`".rstrip() if unit else f"{emoji} *{name}:* `{val_str}`"
+        if prev and prev.get(key):
+            p = _pct(prev[key], value)
+            if p is not None:
+                if p > 0:
+                    line += f" +{p:.1f}%"
+                elif p < 0:
+                    line += f" {p:.1f}%"
+                else:
+                    line += " 0.0%"
+        return line
 
     lines = [f"📊 *Курсы на {now}*\n"]
-
-    # Крипта и валюты
-    lines.append(f"₿ *Bitcoin:* `${btc_str}`")
-    lines.append(f"💵 *Доллар:* `{rates['rub_per_usd']:.2f} ₽`")
-    lines.append(f"🇪🇺 *Евро:* `{rates['rub_per_eur']:.2f} ₽`")
-    lines.append(f"🇹🇭 *Бат:* `{rates['rub_per_thb']:.2f} ₽`")
-
-    # Рынки
-    if rates.get("oil_usd"):
-        oil_rub_str = f"{rates['oil_rub']:,.0f}".replace(",", " ") if rates.get("oil_rub") else "—"
-        lines.append(f"🛢 *Нефть Brent:* `${rates['oil_usd']:.1f}` ({oil_rub_str} ₽)")
-    if rates.get("gold_usd"):
-        gold_str = f"{rates['gold_usd']:,.0f}".replace(",", " ")
-        lines.append(f"🥇 *Золото:* `${gold_str}/oz`")
+    lines.append(fmt_line("₿", "Bitcoin", "btc_usd", rates["btc_usd"], "$", as_int=True))
+    lines.append(fmt_line("💵", "Доллар", "rub_per_usd", rates["rub_per_usd"], "₽"))
+    lines.append(fmt_line("🇪🇺", "Евро", "rub_per_eur", rates["rub_per_eur"], "₽"))
+    lines.append(fmt_line("🇹🇭", "Бат", "rub_per_thb", rates["rub_per_thb"], "₽"))
+    if rates.get("gold_rub_gram"):
+        lines.append(fmt_line("🥇", "Золото", "gold_rub_gram", rates["gold_rub_gram"], "₽/г", as_int=True))
     if rates.get("sp500"):
-        sp_str = f"{rates['sp500']:,.0f}".replace(",", " ")
-        lines.append(f"📈 *S&P 500:* `{sp_str}`")
+        lines.append(fmt_line("📈", "S&P 500", "sp500", rates["sp500"], "пт", as_int=True))
     if rates.get("moex"):
-        moex_str = f"{rates['moex']:,.0f}".replace(",", " ")
-        lines.append(f"🇷🇺 *Мосбиржа:* `{moex_str}`")
+        lines.append(fmt_line("🇷🇺", "Мосбиржа", "moex", rates["moex"], "пт", as_int=True))
 
     return "\n".join(lines)
 
@@ -1614,10 +1619,17 @@ async def monthly_portrait_report(context: ContextTypes.DEFAULT_TYPE):
 # ХЕНДЛЕРЫ — КУРСЫ
 # =====================
 
+def _get_yesterday_snapshot():
+    """Снимок рынка за вчера (для % изменения за сутки)."""
+    yesterday = datetime.now(TIMEZONE) - timedelta(days=1)
+    return _find_snapshot_near(yesterday, tolerance_days=2)
+
+
 async def rates_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != BYBIT_CHAT_ID:
         return
-    await update.message.reply_text(format_rates(get_rates()), parse_mode="Markdown")
+    prev = _get_yesterday_snapshot()
+    await update.message.reply_text(format_rates(get_rates(), prev), parse_mode="Markdown")
 
 
 async def bybit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1627,7 +1639,8 @@ async def bybit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def morning_rates(context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_message(chat_id=BYBIT_CHAT_ID, text="☀️ *Доброе утро!*\n\n" + format_rates(get_rates()), parse_mode="Markdown")
+    prev = _get_yesterday_snapshot()
+    await context.bot.send_message(chat_id=BYBIT_CHAT_ID, text="☀️ *Доброе утро!*\n\n" + format_rates(get_rates(), prev), parse_mode="Markdown")
 
 
 async def review_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
