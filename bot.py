@@ -843,19 +843,23 @@ def _pct(old, new):
 
 
 def _save_snapshot(rates):
-    """Сохраняет снимок рынка за сегодня (ежедневно, молча)."""
+    """Сохраняет снимок рынка за сегодня. Ключи совпадают с теми что использует format_rates."""
     today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
     snapshot = {
         "date": today,
         "btc_usd": rates.get("btc_usd"),
         "rub_per_usd": rates.get("rub_per_usd"),
         "rub_per_eur": rates.get("rub_per_eur"),
-        "oil_usd": rates.get("oil_usd"),
-        "gold_usd": rates.get("gold_usd"),
+        "rub_per_thb": rates.get("rub_per_thb"),
+        "gold_rub_gram": rates.get("gold_rub_gram"),
         "sp500": rates.get("sp500"),
         "moex": rates.get("moex"),
     }
-    sb_upsert("market_snapshots", snapshot, on_conflict="date")
+    result = sb_upsert("market_snapshots", snapshot, on_conflict="date")
+    if result:
+        logger.info(f"Snapshot saved for {today}")
+    else:
+        logger.error(f"Snapshot FAILED for {today}")
 
 
 def _find_snapshot_near(target_date, tolerance_days=4):
