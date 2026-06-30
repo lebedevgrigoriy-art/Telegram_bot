@@ -864,25 +864,31 @@ def _save_snapshot(rates):
 
 def _find_snapshot_near(target_date, tolerance_days=4):
     """Ищет снимок ближайший к target_date (в пределах ±tolerance_days)."""
-    lo = (target_date - timedelta(days=tolerance_days)).strftime("%Y-%m-%d")
-    hi = (target_date + timedelta(days=tolerance_days)).strftime("%Y-%m-%d")
+    # Приводим к чистой дате (без времени и таймзоны) чтобы не было конфликта naive/aware
+    target_d = target_date.date() if hasattr(target_date, "date") else target_date
+    lo = (target_d - timedelta(days=tolerance_days)).strftime("%Y-%m-%d")
+    hi = (target_d + timedelta(days=tolerance_days)).strftime("%Y-%m-%d")
     rows = sb_get("market_snapshots", {
         "date": f"gte.{lo}",
         "order": "date.asc",
     })
-    # фильтруем по верхней границе и берём ближайший к target
-    target_str = target_date.strftime("%Y-%m-%d")
     best, best_diff = None, 999
     for r in rows:
         d = r.get("date", "")
-        if d > hi:
+        if not d or d > hi:
             continue
         try:
-            diff = abs((datetime.strptime(d, "%Y-%m-%d") - target_date).days)
+            snap_d = datetime.strptime(d, "%Y-%m-%d").date()
+            diff = abs((snap_d - target_d).days)
             if diff < best_diff:
                 best, best_diff = r, diff
-        except Exception:
+        except Exception as e:
+            logger.error(f"_find_snapshot_near parse error for '{d}': {e}")
             continue
+    if best:
+        logger.info(f"Snapshot near {target_d}: found {best.get('date')} (diff {best_diff}d)")
+    else:
+        logger.warning(f"Snapshot near {target_d}: NONE found among {len(rows)} rows")
     return best
 
 
