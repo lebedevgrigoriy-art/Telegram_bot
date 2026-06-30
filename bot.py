@@ -1130,23 +1130,34 @@ async def send_movies(bot, chat_id, period_label="недели"):
 # =====================
 
 def _todoist_get_all_tasks() -> list:
-    """Получаем все активные задачи из Todoist."""
-    resp = requests.get(
-        f"{TODOIST_API}/tasks",
-        headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
-        timeout=10,
-    )
-    if resp.status_code != 200:
-        logger.error(f"Todoist tasks error: {resp.status_code} {resp.text}")
-        return []
-    data = resp.json()
-    logger.info(f"Todoist raw type: {type(data)}, preview: {str(data)[:300]}")
-    if isinstance(data, dict):
-        tasks = [t for t in data.get("results", []) if isinstance(t, dict)]
-    else:
-        tasks = [t for t in data if isinstance(t, dict)] if isinstance(data, list) else []
-    logger.info(f"Todoist tasks: {len(tasks)}, due fields: {[t.get('due') for t in tasks[:5]]}")
-    return tasks
+    """Получаем ВСЕ активные задачи из Todoist (с пагинацией по cursor)."""
+    all_tasks = []
+    cursor = None
+    for _ in range(20):  # до 20 страниц (защита от бесконечного цикла)
+        params = {"limit": 200}
+        if cursor:
+            params["cursor"] = cursor
+        resp = requests.get(
+            f"{TODOIST_API}/tasks",
+            headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
+            params=params,
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            logger.error(f"Todoist tasks error: {resp.status_code} {resp.text}")
+            break
+        data = resp.json()
+        if isinstance(data, dict):
+            page = [t for t in data.get("results", []) if isinstance(t, dict)]
+            cursor = data.get("next_cursor")
+        else:
+            page = [t for t in data if isinstance(t, dict)] if isinstance(data, list) else []
+            cursor = None
+        all_tasks.extend(page)
+        if not cursor:
+            break
+    logger.info(f"Todoist tasks loaded (all pages): {len(all_tasks)}")
+    return all_tasks
 
 
 def _parse_due_date(due: dict) -> str:
@@ -1219,13 +1230,54 @@ def get_tasks_due_in_one_hour() -> list:
     return result
 
 
-def get_completed_today() -> list:
-    """Задачи, завершённые сегодня. Todoist API v1, диапазон в UTC."""
+def _get_completed_recurring_today() -> list:
+    """Выполненные сегодня ПОВТОРЯЮЩИЕСЯ задачи через Activity Log.
+    Todoist не кладёт их в completed/by_completion_date — они только в журнале событий."""
     now_local = datetime.now(TIMEZONE)
     today_local = now_local.strftime("%Y-%m-%d")
-    # Берём окно с запасом (вчера-завтра по UTC), потом фильтруем по локальной дате
+    try:
+        resp = requests.get(
+            "https://api.todoist.com/sync/v9/activity/get",
+            headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
+            params={"event_type": "completed", "limit": 100},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            logger.info(f"Activity log: HTTP {resp.status_code} {resp.text[:150]}")
+            return []
+        events = resp.json().get("events", [])
+        result = []
+        seen = set()
+        for ev in events:
+            ev_date = ev.get("event_date", "")
+            if not ev_date:
+                continue
+            try:
+                dt_local = datetime.fromisoformat(ev_date.replace("Z", "+00:00")).astimezone(TIMEZONE)
+            except Exception:
+                continue
+            if dt_local.strftime("%Y-%m-%d") != today_local:
+                continue
+            name = (ev.get("extra_data") or {}).get("content", "")
+            if name and name not in seen:
+                seen.add(name)
+                result.append({"content": name})
+        logger.info(f"Activity log completed recurring today: {len(result)}")
+        return result
+    except Exception as e:
+        logger.error(f"_get_completed_recurring_today error: {e}")
+        return []
+
+
+def get_completed_today() -> list:
+    """Задачи, завершённые сегодня. Обычные (completed API) + повторяющиеся (Activity Log)."""
+    now_local = datetime.now(TIMEZONE)
+    today_local = now_local.strftime("%Y-%m-%d")
     since_utc = (now_local - timedelta(days=1)).astimezone(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     until_utc = (now_local + timedelta(days=1)).astimezone(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    result = []
+    seen_names = set()
+    # 1. Обычные выполненные задачи
     try:
         resp = requests.get(
             f"{TODOIST_API}/tasks/completed/by_completion_date",
@@ -1234,30 +1286,36 @@ def get_completed_today() -> list:
             timeout=10,
         )
         logger.info(f"Completed tasks: HTTP {resp.status_code}, {resp.text[:200]}")
-        if resp.status_code != 200:
-            return []
-        data = resp.json()
-        items = data.get("items", []) if isinstance(data, dict) else data
-        result = []
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            # фильтруем по локальной дате завершения
-            ca = it.get("completed_at", "")
-            if ca:
-                try:
-                    dt_local = datetime.fromisoformat(ca.replace("Z", "+00:00")).astimezone(TIMEZONE)
-                    if dt_local.strftime("%Y-%m-%d") == today_local:
+        if resp.status_code == 200:
+            data = resp.json()
+            items = data.get("items", []) if isinstance(data, dict) else data
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                ca = it.get("completed_at", "")
+                ok = True
+                if ca:
+                    try:
+                        dt_local = datetime.fromisoformat(ca.replace("Z", "+00:00")).astimezone(TIMEZONE)
+                        ok = dt_local.strftime("%Y-%m-%d") == today_local
+                    except Exception:
+                        ok = True
+                if ok:
+                    name = it.get("content", "")
+                    if name and name not in seen_names:
+                        seen_names.add(name)
                         result.append(it)
-                except Exception:
-                    result.append(it)
-            else:
-                result.append(it)
-        logger.info(f"Completed today (local {today_local}): {len(result)}")
-        return result
     except Exception as e:
         logger.error(f"get_completed_today error: {e}")
-        return []
+
+    # 2. Повторяющиеся выполненные (из Activity Log)
+    for rec in _get_completed_recurring_today():
+        if rec["content"] not in seen_names:
+            seen_names.add(rec["content"])
+            result.append(rec)
+
+    logger.info(f"Completed today TOTAL (local {today_local}): {len(result)}")
+    return result
 
 
 def get_tomorrow_tasks() -> list:
