@@ -105,15 +105,24 @@ def sb_get(table, params=None):
 def sb_upsert(table, data, on_conflict="id"):
     headers = sb_headers()
     headers["Prefer"] = f"resolution=merge-duplicates,return=representation"
-    resp = requests.post(
-        f"{SUPABASE_URL}/rest/v1/{table}?on_conflict={on_conflict}",
-        headers=headers,
-        json=data,
-        timeout=10,
-    )
-    if not resp.ok:
-        logger.error(f"sb_upsert {table} error: {resp.status_code} {resp.text}")
-    return resp.ok
+    last_err = None
+    for attempt in range(3):  # до 3 попыток при сетевом сбое
+        try:
+            resp = requests.post(
+                f"{SUPABASE_URL}/rest/v1/{table}?on_conflict={on_conflict}",
+                headers=headers,
+                json=data,
+                timeout=10,
+            )
+            if resp.ok:
+                return True
+            logger.error(f"sb_upsert {table} error (attempt {attempt+1}): {resp.status_code} {resp.text}")
+            last_err = f"{resp.status_code}"
+        except Exception as e:
+            logger.error(f"sb_upsert {table} network error (attempt {attempt+1}): {e}")
+            last_err = str(e)
+    logger.error(f"sb_upsert {table} FAILED after 3 attempts: {last_err}")
+    return False
 
 
 def init_db():
@@ -133,7 +142,8 @@ def init_db():
 # =====================
 
 def save_entry(date_str, answers):
-    sb_upsert("journal", {
+    logger.info(f"save_entry вызван для {date_str}, полей: {len([k for k,v in answers.items() if v])}")
+    ok = sb_upsert("journal", {
         "date": date_str,
         "saved_at": datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M"),
         "day_text": answers.get("day", ""),
@@ -144,6 +154,11 @@ def save_entry(date_str, answers):
         "plan": answers.get("plan", ""),
         "plan_review": answers.get("plan_review", ""),
     }, on_conflict="date")
+    if ok:
+        logger.info(f"save_entry OK для {date_str}")
+    else:
+        logger.error(f"save_entry FAILED для {date_str}")
+    return ok
 
 
 def get_yesterday_plan():
@@ -1547,7 +1562,12 @@ async def answer_q3(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def answer_q4(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["answers"]["plan"] = update.message.text
-    save_entry(context.user_data["date"], context.user_data["answers"])  # план уже сохранён
+    # date мог потеряться при перезапуске бота — подстрахуемся сегодняшней датой
+    if "date" not in context.user_data:
+        context.user_data["date"] = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
+    if "answers" not in context.user_data:
+        context.user_data["answers"] = {"plan": update.message.text}
+    save_entry(context.user_data["date"], context.user_data["answers"])
     date_str, yesterday_plan = get_yesterday_plan()
     if yesterday_plan:
         context.user_data["yesterday_plan"] = yesterday_plan
@@ -1557,7 +1577,14 @@ async def answer_q4(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return Q5
     date_str = context.user_data["date"]
-    await update.message.reply_text(f"✅ Всё записано. Хорошего вечера!\n\nЗапись за {date_str} сохранена.")
+    ok = save_entry(date_str, context.user_data["answers"])
+    if ok:
+        await update.message.reply_text(f"✅ Всё записано. Хорошего вечера!\n\nЗапись за {date_str} сохранена.")
+    else:
+        await update.message.reply_text(
+            "⚠️ Не удалось сохранить запись — проблема со связью. "
+            "Попробуй пройти /ask ещё раз через минуту, чтобы запись не потерялась."
+        )
     return ConversationHandler.END
 
 
@@ -1565,7 +1592,7 @@ async def answer_plan_review(update: Update, context: ContextTypes.DEFAULT_TYPE)
     review_text = update.message.text
     context.user_data["answers"]["plan_review"] = review_text
     date_str = context.user_data["date"]
-    save_entry(date_str, context.user_data["answers"])
+    ok = save_entry(date_str, context.user_data["answers"])
 
     # Gemini реагирует по контексту: хвалит за сделанное или мягко поддерживает
     yesterday_plan = context.user_data.get("yesterday_plan", "")
@@ -1585,7 +1612,13 @@ async def answer_plan_review(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if reaction:
         await update.message.reply_text(f"💬 {reaction}")
-    await update.message.reply_text(f"✅ Всё записано. Хорошего вечера!\n\nЗапись за {date_str} сохранена.")
+    if ok:
+        await update.message.reply_text(f"✅ Всё записано. Хорошего вечера!\n\nЗапись за {date_str} сохранена.")
+    else:
+        await update.message.reply_text(
+            "⚠️ Не удалось сохранить запись — проблема со связью. "
+            "Попробуй пройти /ask ещё раз через минуту, чтобы запись не потерялась."
+        )
     return ConversationHandler.END
 
 
