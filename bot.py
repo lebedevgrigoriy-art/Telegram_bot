@@ -157,8 +157,20 @@ def get_yesterday_plan():
     return None, None
 
 
+def _gratitude_target_month():
+    """Определяет за какой месяц показывать сводку.
+    Первые 5 дней нового месяца — показываем ПРОШЛЫЙ (завершившийся) месяц."""
+    now = datetime.now(TIMEZONE)
+    if now.day <= 5:
+        # первый день прошлого месяца
+        first_this = now.replace(day=1)
+        last_month = first_this - timedelta(days=1)
+        return last_month.strftime("%Y-%m"), last_month.strftime("%B %Y")
+    return now.strftime("%Y-%m"), now.strftime("%B %Y")
+
+
 def get_monthly_gratitude():
-    month = datetime.now(TIMEZONE).strftime("%Y-%m")
+    month, _ = _gratitude_target_month()
     rows = sb_get("journal", {"date": f"like.{month}%", "order": "date.asc"})
     return [(r["date"], r["gratitude"]) for r in rows if (r.get("gratitude") or "").strip()]
 
@@ -1618,7 +1630,7 @@ async def gratitude_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MY_CHAT_ID:
         return
     entries = get_monthly_gratitude()
-    month_name = datetime.now(TIMEZONE).strftime("%B %Y")
+    _, month_name = _gratitude_target_month()
     await update.message.reply_text(make_gratitude_summary(entries, month_name), parse_mode="Markdown")
 
 
@@ -1636,7 +1648,7 @@ async def evening_questions(context: ContextTypes.DEFAULT_TYPE):
 
 async def monthly_gratitude_report(context: ContextTypes.DEFAULT_TYPE):
     entries = get_monthly_gratitude()
-    month_name = datetime.now(TIMEZONE).strftime("%B %Y")
+    _, month_name = _gratitude_target_month()
     await context.bot.send_message(chat_id=MY_CHAT_ID, text=make_gratitude_summary(entries, month_name), parse_mode="Markdown")
 
 
