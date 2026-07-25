@@ -784,44 +784,42 @@ def _moex_index() -> float | None:
 
 
 def get_rates():
+    result = {}
+
+    # Биткоин — CoinGecko
     try:
-        # Крипта
         btc_resp = requests.get(
             "https://api.coingecko.com/api/v3/simple/price",
             params={"ids": "bitcoin", "vs_currencies": "usd"},
+            headers={"User-Agent": "Mozilla/5.0"},
             timeout=10,
         )
-        btc_usd = btc_resp.json()["bitcoin"]["usd"]
+        result["btc_usd"] = btc_resp.json()["bitcoin"]["usd"]
+    except Exception as e:
+        logger.error(f"Rates: CoinGecko BTC failed: {e}")
 
-        # Валюты
+    # Валюты — er-api
+    try:
         fx_resp = requests.get("https://open.er-api.com/v6/latest/USD", timeout=10)
         fx = fx_resp.json()["rates"]
-        rub_per_usd = fx["RUB"]
-        rub_per_thb = rub_per_usd / fx["THB"]
-        rub_per_eur = fx["RUB"] / fx["EUR"]   # кросс-курс евро к рублю
-
-        # Золото, S&P500, Мосбиржа
-        gold_usd_oz = _yahoo_price("GC=F")    # Gold Futures, $/унция
-        sp500 = _yahoo_price("^GSPC")         # S&P 500
-        moex = _moex_index()
-
-        # Золото в рублях за грамм (1 унция = 31.1035 грамма)
-        gold_rub_gram = None
-        if gold_usd_oz and rub_per_usd:
-            gold_rub_gram = (gold_usd_oz / 31.1035) * rub_per_usd
-
-        return {
-            "btc_usd": btc_usd,
-            "rub_per_usd": rub_per_usd,
-            "rub_per_thb": rub_per_thb,
-            "rub_per_eur": rub_per_eur,
-            "gold_rub_gram": gold_rub_gram,
-            "sp500": sp500,
-            "moex": moex,
-        }
+        result["rub_per_usd"] = fx["RUB"]
+        result["rub_per_thb"] = fx["RUB"] / fx["THB"]
+        result["rub_per_eur"] = fx["RUB"] / fx["EUR"]
     except Exception as e:
-        logger.error(f"Rates error: {e}")
-        return None
+        logger.error(f"Rates: er-api FX failed: {e}")
+
+    # Золото, S&P, Мосбиржа (уже защищены — возвращают None при сбое)
+    gold_usd_oz = _yahoo_price("GC=F")
+    result["sp500"] = _yahoo_price("^GSPC")
+    result["moex"] = _moex_index()
+
+    # Золото в рублях за грамм
+    if gold_usd_oz and result.get("rub_per_usd"):
+        result["gold_rub_gram"] = (gold_usd_oz / 31.1035) * result["rub_per_usd"]
+
+    logger.info(f"Rates собрано: {list(result.keys())}")
+    # Возвращаем результат если есть хоть что-то (обычно биткоин или валюты)
+    return result if result else None
 
 
 def format_rates(rates, prev=None):
@@ -845,10 +843,14 @@ def format_rates(rates, prev=None):
         return line
 
     lines = [f"📊 *Курсы на {now}*\n"]
-    lines.append(fmt_line("₿", "Bitcoin", "btc_usd", rates["btc_usd"], "$", as_int=True))
-    lines.append(fmt_line("💵", "Доллар", "rub_per_usd", rates["rub_per_usd"], "₽"))
-    lines.append(fmt_line("🇪🇺", "Евро", "rub_per_eur", rates["rub_per_eur"], "₽"))
-    lines.append(fmt_line("🇹🇭", "Бат", "rub_per_thb", rates["rub_per_thb"], "₽"))
+    if rates.get("btc_usd"):
+        lines.append(fmt_line("₿", "Bitcoin", "btc_usd", rates["btc_usd"], "$", as_int=True))
+    if rates.get("rub_per_usd"):
+        lines.append(fmt_line("💵", "Доллар", "rub_per_usd", rates["rub_per_usd"], "₽"))
+    if rates.get("rub_per_eur"):
+        lines.append(fmt_line("🇪🇺", "Евро", "rub_per_eur", rates["rub_per_eur"], "₽"))
+    if rates.get("rub_per_thb"):
+        lines.append(fmt_line("🇹🇭", "Бат", "rub_per_thb", rates["rub_per_thb"], "₽"))
     if rates.get("gold_rub_gram"):
         lines.append(fmt_line("🥇", "Золото", "gold_rub_gram", rates["gold_rub_gram"], "₽/г", as_int=True))
     if rates.get("sp500"):
@@ -856,6 +858,8 @@ def format_rates(rates, prev=None):
     if rates.get("moex"):
         lines.append(fmt_line("🇷🇺", "Мосбиржа", "moex", rates["moex"], "пт", as_int=True))
 
+    if len(lines) == 1:  # только заголовок, данных нет
+        return "❌ Источники курсов временно недоступны. Попробуй позже."
     return "\n".join(lines)
 
 
