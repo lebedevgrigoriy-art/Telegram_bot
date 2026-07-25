@@ -1740,9 +1740,19 @@ def _get_yesterday_snapshot():
 
 async def rates_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != BYBIT_CHAT_ID:
+        logger.info(f"/rates проигнорирован: chat {update.effective_chat.id} != BYBIT_CHAT_ID {BYBIT_CHAT_ID}")
         return
-    prev = _get_yesterday_snapshot()
-    await update.message.reply_text(format_rates(get_rates(), prev), parse_mode="Markdown")
+    try:
+        await update.message.reply_text("📊 Собираю курсы...")
+        rates = get_rates()
+        if not rates:
+            await update.message.reply_text("❌ Не удалось получить курсы — источники данных недоступны. Попробуй позже.")
+            return
+        prev = _get_yesterday_snapshot()
+        await update.message.reply_text(format_rates(rates, prev), parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"rates_command error: {e}")
+        await update.message.reply_text(f"❌ Ошибка при получении курсов: {e}")
 
 
 async def bybit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
