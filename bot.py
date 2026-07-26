@@ -2025,10 +2025,16 @@ async def todoist_handle_message(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def _send_structured_tasks(context, greeting):
-    """Собирает задачи по блокам, добавляет мотивацию и напоминание про Входящие."""
+    """Собирает задачи по блокам, добавляет мотивацию и напоминание про Входящие.
+    В авторассылках показываем только красный (4) и оранжевый/жёлтый (3) приоритет — чтобы не перегружать."""
     tasks = get_today_tasks()
+    urgent = [t for t in tasks if t.get("priority", 1) in (3, 4)]
     projects_map = _get_projects_map()
-    full = build_tasks_with_motivation(tasks, projects_map, greeting)
+
+    if not urgent:
+        full = f"✅ *{greeting}*\n\nСрочных задач (🔴🟡) на сегодня нет — можно выдохнуть. Остальное смотри в /tasks."
+    else:
+        full = build_tasks_with_motivation(urgent, projects_map, greeting)
 
     # Напоминание разнести Входящие
     inbox_n = get_inbox_count()
@@ -2078,10 +2084,11 @@ async def evening_summary(context: ContextTypes.DEFAULT_TYPE):
         text += ("Сегодня в Todoist нет отмеченных задач. Бывают такие дни — "
                  "и это нормально. Отдохни, завтра новый старт. 🌿\n")
 
-    # Что на завтра
-    if tomorrow:
-        text += f"\n📅 *На завтра ({len(tomorrow)}):*\n"
-        for t in sorted(tomorrow, key=_task_sort_key):
+    # Что на завтра — только срочное (красный/оранжевый), чтобы не перегружать
+    tomorrow_urgent = [t for t in tomorrow if t.get("priority", 1) in (3, 4)]
+    if tomorrow_urgent:
+        text += f"\n📅 *На завтра, срочное ({len(tomorrow_urgent)}):*\n"
+        for t in sorted(tomorrow_urgent, key=_task_sort_key):
             pr = {1: "", 2: "🔵", 3: "🟡", 4: "🔴"}.get(t.get("priority", 1), "")
             due = t.get("due") or {}
             due_local = _parse_due_time(due)
@@ -2089,7 +2096,7 @@ async def evening_summary(context: ContextTypes.DEFAULT_TYPE):
             text += f"  •{pr}{due_time} {t.get('content', '—')}\n"
         text += "\n_Готовься спокойно — ты уже знаешь что впереди._"
     else:
-        text += "\n📅 На завтра пока ничего не запланировано — чистый лист."
+        text += "\n📅 На завтра срочных (🔴🟡) задач нет — чистый лист."
 
     async def _send(t, parse_mode=None):
         await context.bot.send_message(chat_id=MY_CHAT_ID, text=t, parse_mode=parse_mode)
