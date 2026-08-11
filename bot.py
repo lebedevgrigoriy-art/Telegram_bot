@@ -558,19 +558,55 @@ BOOKS_QUERIES = [
 ]
 
 
-def _gemini_suggest_books(theme_prompt: str, count: int) -> list:
+def _get_sent_book_titles() -> set:
+    """Все уже присланные названия книг (нижний регистр) — чтобы не повторяться неделя за неделей."""
+    try:
+        resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/sent_books",
+            headers=sb_headers(),
+            params={"select": "title"},
+            timeout=10,
+        )
+        if resp.ok:
+            return {row["title"].lower() for row in resp.json() if row.get("title")}
+    except Exception as e:
+        logger.error(f"_get_sent_book_titles error: {e}")
+    return set()
+
+
+def _mark_book_sent(title: str, author: str):
+    try:
+        sb_upsert("sent_books", {
+            "title": title,
+            "author": author,
+            "sent_at": datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M"),
+        }, on_conflict="title")
+    except Exception as e:
+        logger.error(f"_mark_book_sent error: {e}")
+
+
+def _gemini_suggest_books(theme_prompt: str, count: int, exclude: set = None) -> list:
     """Gemini предлагает реальные известные книги. Возвращает список {title, author}."""
     if not GEMINI_API_KEY:
         return []
+    exclude_text = ""
+    if exclude:
+        # ограничиваем список исключений чтобы не раздувать промпт
+        sample = list(exclude)[:60]
+        exclude_text = (
+            "\n\nЭТИ КНИГИ УЖЕ ПРИСЫЛАЛИСЬ РАНЕЕ — НЕ ПРЕДЛАГАЙ ИХ СНОВА:\n"
+            + ", ".join(sample)
+        )
     prompt = (
         f"{theme_prompt}\n\n"
         f"Предложи {count} КОНКРЕТНЫХ, реально существующих и известных книг "
         "(проверенных временем или популярных). Только подлинные книги, не выдумывай. "
+        f"{exclude_text}\n\n"
         "Ответь СТРОГО построчно, каждая книга на новой строке в формате:\n"
         "Название | Автор\n"
         "Без нумерации и лишнего текста."
     )
-    raw = _ask_claude(prompt, max_tokens=1000)
+    raw = _ask_claude(prompt, max_tokens=1200)
     if not raw:
         return []
     books = []
@@ -611,21 +647,35 @@ def _google_lookup(title: str, author: str) -> dict:
 
 
 def get_weekly_books() -> list:
-    """Известные книги по темам (Gemini) + карточки из Google Books."""
-    suggestions = _gemini_suggest_books(
-        "Темы: бизнес и предпринимательство, психология и саморазвитие, "
-        "финансы и инвестиции, нон-фикшн и биографии. Разнообразь темы.",
-        count=8,
-    )
-    if not suggestions:
-        return []
+    """Известные книги по темам (Gemini) + карточки из Google Books. Не повторяет ранее присланные."""
+    sent = _get_sent_book_titles()
+    theme = ("Темы: бизнес и предпринимательство, психология и саморазвитие, "
+             "финансы и инвестиции, нон-фикшн и биографии. Разнообразь темы.")
+
     books, seen = [], set()
-    for s in suggestions:
-        key = s["title"].lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        books.append(_google_lookup(s["title"], s["author"]))
+    for attempt in range(3):  # до 3 попыток добрать нужное количество без повторов
+        need = 8 - len(books)
+        if need <= 0:
+            break
+        suggestions = _gemini_suggest_books(theme, count=need + 2, exclude=sent | seen)
+        if not suggestions:
+            break
+        for s in suggestions:
+            key = s["title"].lower()
+            if key in seen or key in sent:
+                continue
+            seen.add(key)
+            books.append(_google_lookup(s["title"], s["author"]))
+            if len(books) >= 8:
+                break
+
+    if not books:
+        return []
+
+    # помечаем как отправленные, чтобы не повторить в будущем
+    for b in books[:8]:
+        _mark_book_sent(b.get("title", ""), b.get("author", ""))
+
     return _enrich_with_gemini(books[:8])
 
 
@@ -748,22 +798,6 @@ def make_gratitude_summary(entries, month_name):
 # КУРСЫ ВАЛЮТ
 # =====================
 
-def _yahoo_price(symbol: str) -> float | None:
-    """Цена через Yahoo Finance — без ключа."""
-    try:
-        resp = requests.get(
-            f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
-            params={"interval": "1d", "range": "1d"},
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=10,
-        )
-        result = resp.json()["chart"]["result"][0]
-        return result["meta"]["regularMarketPrice"]
-    except Exception as e:
-        logger.error(f"Yahoo Finance {symbol} error: {e}")
-        return None
-
-
 def _moex_index() -> float | None:
     """Индекс Мосбиржи (IMOEX) через официальный API."""
     try:
@@ -808,14 +842,8 @@ def get_rates():
     except Exception as e:
         logger.error(f"Rates: er-api FX failed: {e}")
 
-    # Золото, S&P, Мосбиржа (уже защищены — возвращают None при сбое)
-    gold_usd_oz = _yahoo_price("GC=F")
-    result["sp500"] = _yahoo_price("^GSPC")
+    # Мосбиржа (уже защищена — возвращает None при сбое)
     result["moex"] = _moex_index()
-
-    # Золото в рублях за грамм
-    if gold_usd_oz and result.get("rub_per_usd"):
-        result["gold_rub_gram"] = (gold_usd_oz / 31.1035) * result["rub_per_usd"]
 
     logger.info(f"Rates собрано: {list(result.keys())}")
     # Возвращаем результат если есть хоть что-то (обычно биткоин или валюты)
@@ -851,10 +879,6 @@ def format_rates(rates, prev=None):
         lines.append(fmt_line("🇪🇺", "Евро", "rub_per_eur", rates["rub_per_eur"], "₽"))
     if rates.get("rub_per_thb"):
         lines.append(fmt_line("🇹🇭", "Бат", "rub_per_thb", rates["rub_per_thb"], "₽"))
-    if rates.get("gold_rub_gram"):
-        lines.append(fmt_line("🥇", "Золото", "gold_rub_gram", rates["gold_rub_gram"], "₽/г", as_int=True))
-    if rates.get("sp500"):
-        lines.append(fmt_line("📈", "S&P 500", "sp500", rates["sp500"], "пт", as_int=True))
     if rates.get("moex"):
         lines.append(fmt_line("🇷🇺", "Мосбиржа", "moex", rates["moex"], "пт", as_int=True))
 
@@ -882,8 +906,6 @@ def _save_snapshot(rates):
         "rub_per_usd": rates.get("rub_per_usd"),
         "rub_per_eur": rates.get("rub_per_eur"),
         "rub_per_thb": rates.get("rub_per_thb"),
-        "gold_rub_gram": rates.get("gold_rub_gram"),
-        "sp500": rates.get("sp500"),
         "moex": rates.get("moex"),
     }
     result = sb_upsert("market_snapshots", snapshot, on_conflict="date")
@@ -962,12 +984,6 @@ def make_market_review(period_label, days_back):
         lines.append(line("💵", "Доллар", "rub_per_usd", rates["rub_per_usd"], " ₽"))
     if rates.get("rub_per_eur"):
         lines.append(line("🇪🇺", "Евро", "rub_per_eur", rates["rub_per_eur"], " ₽"))
-    if rates.get("oil_usd"):
-        lines.append(line("🛢", "Нефть Brent", "oil_usd", rates["oil_usd"], " $"))
-    if rates.get("gold_usd"):
-        lines.append(line("🥇", "Золото", "gold_usd", rates["gold_usd"], " $", as_int=True))
-    if rates.get("sp500"):
-        lines.append(line("📈", "S&P 500", "sp500", rates["sp500"], "", as_int=True))
     if rates.get("moex"):
         lines.append(line("🇷🇺", "Мосбиржа", "moex", rates["moex"], "", as_int=True))
 
@@ -1965,10 +1981,13 @@ async def todoist_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MY_CHAT_ID:
         return
     await update.message.reply_text(
-        "Привет! Я твой Todoist-помощник 📋\n\n"
+        "Привет! Я твой Todoist-напоминалка 📋\n\n"
         "Просто напиши задачу — добавлю в Inbox.\n\n"
+        "Напоминаю о задачах с назначенным временем — за час до дедлайна.\n"
+        "Плюс слежу за днями рождения (за 7 дней, за 1 день и в день).\n\n"
         "/tasks — задачи на сегодня\n"
-        "/inbox — все задачи без даты"
+        "/inbox — все задачи без даты\n"
+        "/birthdays — ближайшие дни рождения"
     )
 
 
@@ -2552,10 +2571,9 @@ async def main():
     todoist_app.add_handler(CommandHandler("evening", evening_command))
     todoist_app.add_handler(CommandHandler("inbox", inbox_command))
     todoist_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, todoist_handle_message))
-    todoist_app.job_queue.run_daily(morning_tasks, time=dtime(hour=9, minute=0, tzinfo=TIMEZONE))
-    todoist_app.job_queue.run_daily(afternoon_tasks, time=dtime(hour=16, minute=0, tzinfo=TIMEZONE))
-    todoist_app.job_queue.run_daily(evening_summary, time=dtime(hour=21, minute=0, tzinfo=TIMEZONE))
+    # Бот Todoist теперь только напоминалка по времени — списки задач убраны
     todoist_app.job_queue.run_repeating(deadline_reminder, interval=1800, first=60)  # каждые 30 минут
+    todoist_app.job_queue.run_daily(check_birthday_reminders, time=dtime(hour=9, minute=0, tzinfo=TIMEZONE))
     todoist_app.add_handler(CommandHandler("birthdays", birthdays_command))
     todoist_app.job_queue.run_daily(check_birthday_reminders, time=dtime(hour=9, minute=0, tzinfo=TIMEZONE))
 
