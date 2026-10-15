@@ -471,7 +471,7 @@ def _ask_claude(prompt: str, max_tokens: int = 2000) -> str:
     return ""
 
 
-def _ask_gemini_grounded(prompt: str, max_tokens: int = 4000) -> str:
+def _ask_gemini_grounded(prompt: str, max_tokens: int = 12000) -> str:
     """Gemini с поиском Google: видит свежие данные из интернета (то, чего нет в его памяти)."""
     if not GEMINI_API_KEY:
         return ""
@@ -483,7 +483,10 @@ def _ask_gemini_grounded(prompt: str, max_tokens: int = 4000) -> str:
                 json={
                     "contents": [{"parts": [{"text": prompt}]}],
                     "tools": [{"google_search": {}}],
-                    "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.3},
+                    # размышления Gemini тратят тот же лимит, что и ответ: ограничиваем их,
+                    # иначе список книг обрезается на середине
+                    "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.3,
+                                         "thinkingConfig": {"thinkingBudget": 2048}},
                 },
                 timeout=90,
             )
@@ -492,6 +495,8 @@ def _ask_gemini_grounded(prompt: str, max_tokens: int = 4000) -> str:
             if candidates:
                 parts = candidates[0].get("content", {}).get("parts", [])
                 text = "".join(p.get("text", "") for p in parts)
+                if candidates[0].get("finishReason") == "MAX_TOKENS":
+                    logger.warning("Gemini grounded: ответ обрезан по лимиту токенов")
                 if text.strip():
                     return text
             logger.error(f"Gemini grounded empty (attempt {attempt + 1}): {str(data)[:300]}")
@@ -630,6 +635,37 @@ def _mark_book_sent(title: str, author: str):
         logger.error(f"_mark_book_sent error: {e}")
 
 
+def _parse_books_json(raw: str) -> list:
+    """Разбирает JSON-массив книг. Поля по именам, поэтому пропущенный автор ничего не сдвигает."""
+    start, end = raw.find("["), raw.rfind("]")
+    if start == -1 or end <= start:
+        return []
+    try:
+        items = json.loads(raw[start:end + 1])
+    except Exception as e:
+        logger.error(f"Книги: JSON не разобрался: {e}")
+        return []
+    books = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        section = str(it.get("section", "")).upper().strip()
+        title = str(it.get("title", "")).strip().strip("«»\"")
+        if section not in ("RU", "WORLD") or not title:
+            continue
+        books.append({
+            "section": section,
+            "title": title,
+            "author": str(it.get("author") or "").strip() or "—",
+            "publisher": str(it.get("publisher") or "").strip(),
+            "year": str(it.get("date") or "").strip(),
+            "description": str(it.get("about") or "").strip(),
+            "why_read": str(it.get("why") or "").strip(),
+            "link": str(it.get("link") or "").strip(),
+        })
+    return books
+
+
 def _parse_book_lines(raw: str) -> list:
     """Разбирает строки вида: RU | Название | Автор | Издательство | Дата | О чём | Почему сейчас"""
     books = []
@@ -675,14 +711,18 @@ def _find_fresh_books(exclude: set, ru_count: int = 4, world_count: int = 4) -> 
         "Выбирай то, что обсуждают и ждут, а не проходное. Только реальные книги с подтверждённой "
         "датой выхода в этом окне. Классику и книги старше 30 дней не бери.\n"
         f"{exclude_text}\n"
-        "Ответ СТРОГО построчно, одна книга на строку, без заголовков и пояснений, в формате:\n"
-        "RU | Название | Автор | Издательство | Дата выхода | О чём (2 предложения) | Почему стоит прочитать (1 предложение)\n"
-        "Для мировых книг первое поле WORLD, название на языке оригинала. Всё остальное пиши на русском."
+        "Ответь ТОЛЬКО JSON-массивом, без пояснений до и после. Каждая книга:\n"
+        '{"section": "RU или WORLD", "title": "название", "author": "автор (обязательно, имя человека)", '
+        '"publisher": "издательство", "date": "месяц и год выхода", '
+        '"about": "о чём книга, 2 предложения", "why": "почему стоит прочитать, 1 предложение", '
+        '"link": "ссылка на страницу книги на сайте издательства или магазина, где ты её нашёл"}\n'
+        "Для мировых книг название на языке оригинала, остальные поля на русском. "
+        "Если автора не нашёл, такую книгу не включай."
     )
-    raw = _ask_gemini_grounded(prompt, max_tokens=4000)
+    raw = _ask_gemini_grounded(prompt)
     if not raw:
         return []
-    books = _parse_book_lines(raw)
+    books = _parse_books_json(raw) or _parse_book_lines(raw)
     logger.info(f"Свежие книги из поиска: {len(books)} (RU {sum(b['section']=='RU' for b in books)}, "
                 f"WORLD {sum(b['section']=='WORLD' for b in books)})")
     return books
@@ -706,19 +746,41 @@ def _fallback_google_newest(exclude: set, count: int = 8) -> list:
     return result
 
 
+def _cover_from_page(url: str) -> str:
+    """Берёт обложку со страницы книги (тег og:image). У новинок она есть почти всегда."""
+    if not url.startswith("http"):
+        return ""
+    try:
+        resp = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+        if not resp.ok:
+            return ""
+        m = (re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', resp.text)
+             or re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image', resp.text))
+        return m.group(1) if m and m.group(1).startswith("http") else ""
+    except Exception as e:
+        logger.info(f"og:image не получен ({url[:60]}): {e}")
+        return ""
+
+
 def _attach_cover(book: dict) -> dict:
-    """Подтягиваем обложку и рейтинг из Google Books, не трогая данные о новинке."""
-    lang = "ru" if book.get("section") == "RU" else None
-    found = _fetch_google_books(f'{book["title"]} {book.get("author", "")}', max_results=5,
-                                order="relevance", lang=lang)
-    want = _norm_title(book["title"])
-    for f in found:
-        if want[:20] and want[:20] in _norm_title(f["title"]):
-            book["cover"] = f.get("cover", "")
-            book["google_rating"] = f.get("google_rating")
-            book["google_ratings_count"] = f.get("google_ratings_count", 0)
-            book["categories"] = f.get("categories", "")
-            break
+    """Обложка и рейтинг: страница книги, затем Google Books по названию (с автором и без)."""
+    page_cover = _cover_from_page(book.get("link", ""))
+    if page_cover:
+        book["cover"] = page_cover
+    else:
+        book["link"] = ""  # ссылка не открылась: в карточку её не ставим
+
+    want = _norm_title(book["title"])[:20]
+    author = book.get("author", "") if book.get("author") != "—" else ""
+    for query in (f'{book["title"]} {author}'.strip(), book["title"]):
+        for f in _fetch_google_books(query, max_results=5, order="relevance", lang=None):
+            if want and want in _norm_title(f["title"]):
+                if not book.get("cover"):
+                    book["cover"] = f.get("cover", "")
+                book["google_rating"] = f.get("google_rating")
+                book["google_ratings_count"] = f.get("google_ratings_count", 0)
+                book["categories"] = f.get("categories", "")
+                return book
     return book
 
 
@@ -851,6 +913,8 @@ def format_book(book: dict, num: int) -> str:
         lines.append(f"\n📝 {book['description']}")
     if book.get("why_read"):
         lines.append(f"\n💡 _{book['why_read']}_")
+    if book.get("link"):
+        lines.append(f"\n🔗 [Подробнее]({book['link']})")
     return "\n".join(lines)
 
 
@@ -866,7 +930,7 @@ async def _send_book_card(bot, chat_id, book, num):
         else:
             await bot.send_message(chat_id=chat_id, text=caption, parse_mode="Markdown")
     except Exception:
-        plain = caption.replace("*", "").replace("_", "")
+        plain = re.sub(r"\n🔗 \[Подробнее\]\(.+?\)", "", caption).replace("*", "").replace("_", "")
         try:
             if cover:
                 await bot.send_photo(chat_id=chat_id, photo=cover, caption=plain)
