@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import logging
 import requests
 import random
@@ -470,16 +471,46 @@ def _ask_claude(prompt: str, max_tokens: int = 2000) -> str:
     return ""
 
 
-def _fetch_google_books(query, max_results=10, order="newest"):
-    """Свежие книги из Google Books API. Реальные данные: название, автор, год, рейтинг, обложка."""
+def _ask_gemini_grounded(prompt: str, max_tokens: int = 4000) -> str:
+    """Gemini с поиском Google: видит свежие данные из интернета (то, чего нет в его памяти)."""
+    if not GEMINI_API_KEY:
+        return ""
+    for attempt in range(2):
+        try:
+            resp = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "tools": [{"google_search": {}}],
+                    "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.3},
+                },
+                timeout=90,
+            )
+            data = resp.json()
+            candidates = data.get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                text = "".join(p.get("text", "") for p in parts)
+                if text.strip():
+                    return text
+            logger.error(f"Gemini grounded empty (attempt {attempt + 1}): {str(data)[:300]}")
+        except Exception as e:
+            logger.error(f"Gemini grounded error (attempt {attempt + 1}): {e}")
+    return ""
+
+
+def _fetch_google_books(query, max_results=10, order="newest", lang="ru"):
+    """Книги из Google Books API. Реальные данные: название, автор, год, рейтинг, обложка."""
     try:
         params = {
             "q": query,
-            "orderBy": order,           # newest = сначала свежие
-            "langRestrict": "ru",        # преимущественно русские
+            "orderBy": order,
             "printType": "books",
             "maxResults": max_results,
         }
+        if lang:
+            params["langRestrict"] = lang
         if GOOGLE_BOOKS_API_KEY:
             params["key"] = GOOGLE_BOOKS_API_KEY
         resp = requests.get("https://www.googleapis.com/books/v1/volumes", params=params, timeout=12)
@@ -505,6 +536,7 @@ def _fetch_google_books(query, max_results=10, order="newest"):
                 "title": title,
                 "author": ", ".join(info.get("authors", [])) or "—",
                 "year": year,
+                "published": info.get("publishedDate", "") or "",
                 "publisher": info.get("publisher", ""),
                 "description": (info.get("description", "") or "")[:400],
                 "google_rating": info.get("averageRating"),
@@ -557,9 +589,18 @@ BOOKS_QUERIES = [
     "нон-фикшн биографии",
 ]
 
+BOOKS_THEMES = "бизнес и предпринимательство, психология и саморазвитие, финансы и инвестиции, нон-фикшн, наука, биографии"
+
+
+def _norm_title(title: str) -> str:
+    """Нормализуем название для сравнения: регистр, кавычки, знаки препинания."""
+    t = (title or "").lower().replace("ё", "е")
+    t = re.sub(r"[«»\"'“”„.,:;!?()\[\]—–-]", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
 
 def _get_sent_book_titles() -> set:
-    """Все уже присланные названия книг (нижний регистр) — чтобы не повторяться неделя за неделей."""
+    """Все уже присланные названия книг (нормализованные), чтобы не повторяться неделя за неделей."""
     try:
         resp = requests.get(
             f"{SUPABASE_URL}/rest/v1/sent_books",
@@ -568,7 +609,11 @@ def _get_sent_book_titles() -> set:
             timeout=10,
         )
         if resp.ok:
-            return {row["title"].lower() for row in resp.json() if row.get("title")}
+            titles = {_norm_title(row["title"]) for row in resp.json() if row.get("title")}
+            logger.info(f"sent_books: в памяти {len(titles)} книг")
+            return titles
+        logger.error(f"sent_books недоступна ({resp.status_code}): {resp.text[:200]}. "
+                     f"Защита от повторов НЕ работает, создай таблицу sent_books")
     except Exception as e:
         logger.error(f"_get_sent_book_titles error: {e}")
     return set()
@@ -585,23 +630,131 @@ def _mark_book_sent(title: str, author: str):
         logger.error(f"_mark_book_sent error: {e}")
 
 
-def _gemini_suggest_books(theme_prompt: str, count: int, exclude: set = None) -> list:
-    """Gemini предлагает реальные известные книги. Возвращает список {title, author}."""
-    if not GEMINI_API_KEY:
-        return []
+def _parse_book_lines(raw: str) -> list:
+    """Разбирает строки вида: RU | Название | Автор | Издательство | Дата | О чём | Почему сейчас"""
+    books = []
+    for line in raw.splitlines():
+        line = line.strip().strip("*").strip()
+        if line.count("|") < 4:
+            continue
+        line = re.sub(r"^\s*(\d+[.)]|[-•])\s*", "", line)  # убираем только нумерацию списка
+        parts = [p.strip() for p in line.split("|", 6)]
+        while len(parts) < 7:
+            parts.append("")
+        section, title, author, publisher, date, about, why = parts
+        section = section.upper()
+        if section not in ("RU", "WORLD") or not title:
+            continue
+        books.append({
+            "section": section,
+            "title": title.strip("«»\""),
+            "author": author or "—",
+            "publisher": publisher,
+            "year": date,
+            "description": about,
+            "why_read": why,
+        })
+    return books
+
+
+def _find_fresh_books(exclude: set, ru_count: int = 4, world_count: int = 4) -> list:
+    """Gemini ищет в интернете реальные книжные новинки последних 30 дней."""
+    today = datetime.now(TIMEZONE)
+    since = (today - timedelta(days=30)).strftime("%d.%m.%Y")
     exclude_text = ""
     if exclude:
-        # ограничиваем список исключений чтобы не раздувать промпт
-        sample = list(exclude)[:60]
-        exclude_text = (
-            "\n\nЭТИ КНИГИ УЖЕ ПРИСЫЛАЛИСЬ РАНЕЕ — НЕ ПРЕДЛАГАЙ ИХ СНОВА:\n"
-            + ", ".join(sample)
-        )
+        exclude_text = ("\nНЕ ПРЕДЛАГАЙ эти книги, они уже были: "
+                        + "; ".join(sorted(exclude)[-80:]) + "\n")
+    prompt = (
+        f"Сегодня {today.strftime('%d.%m.%Y')}. Найди в интернете САМЫЕ СВЕЖИЕ книжные новинки, "
+        f"которые вышли с {since} по сегодня. Темы: {BOOKS_THEMES}.\n\n"
+        f"Нужно {ru_count} книги, вышедшие на русском языке (смотри новинки издательств "
+        "Альпина Паблишер, Альпина нон-фикшн, МИФ, Individuum, Corpus, Бомбора, Эксмо, АСТ), "
+        f"и {world_count} книги, вышедшие в мире на английском (свежие релизы нон-фикшн, "
+        "новинки из списков бестселлеров, о которых сейчас говорят).\n"
+        "Выбирай то, что обсуждают и ждут, а не проходное. Только реальные книги с подтверждённой "
+        "датой выхода в этом окне. Классику и книги старше 30 дней не бери.\n"
+        f"{exclude_text}\n"
+        "Ответ СТРОГО построчно, одна книга на строку, без заголовков и пояснений, в формате:\n"
+        "RU | Название | Автор | Издательство | Дата выхода | О чём (2 предложения) | Почему стоит прочитать (1 предложение)\n"
+        "Для мировых книг первое поле WORLD, название на языке оригинала. Всё остальное пиши на русском."
+    )
+    raw = _ask_gemini_grounded(prompt, max_tokens=4000)
+    if not raw:
+        return []
+    books = _parse_book_lines(raw)
+    logger.info(f"Свежие книги из поиска: {len(books)} (RU {sum(b['section']=='RU' for b in books)}, "
+                f"WORLD {sum(b['section']=='WORLD' for b in books)})")
+    return books
+
+
+def _fallback_google_newest(exclude: set, count: int = 8) -> list:
+    """Запасной вариант: свежие издания из Google Books за последние 90 дней."""
+    cutoff = (datetime.now(TIMEZONE) - timedelta(days=90)).strftime("%Y-%m-%d")
+    result, seen = [], set()
+    for q in BOOKS_QUERIES:
+        for b in _fetch_google_books(q, max_results=20, order="newest"):
+            key = _norm_title(b["title"])
+            pub = b.get("published", "")
+            if len(pub) < 7 or pub < cutoff[:len(pub)] or key in exclude or key in seen:
+                continue
+            seen.add(key)
+            b["section"] = "RU"
+            result.append(b)
+            if len(result) >= count:
+                return result
+    return result
+
+
+def _attach_cover(book: dict) -> dict:
+    """Подтягиваем обложку и рейтинг из Google Books, не трогая данные о новинке."""
+    lang = "ru" if book.get("section") == "RU" else None
+    found = _fetch_google_books(f'{book["title"]} {book.get("author", "")}', max_results=5,
+                                order="relevance", lang=lang)
+    want = _norm_title(book["title"])
+    for f in found:
+        if want[:20] and want[:20] in _norm_title(f["title"]):
+            book["cover"] = f.get("cover", "")
+            book["google_rating"] = f.get("google_rating")
+            book["google_ratings_count"] = f.get("google_ratings_count", 0)
+            book["categories"] = f.get("categories", "")
+            break
+    return book
+
+
+def get_weekly_books() -> list:
+    """Свежие новинки недели: 4 на русском + 4 мировые. Без повторов из прошлых подборок."""
+    sent = _get_sent_book_titles()
+    books, seen = [], set()
+    for b in _find_fresh_books(sent):
+        key = _norm_title(b["title"])
+        if key in sent or key in seen:
+            continue
+        seen.add(key)
+        books.append(b)
+
+    if not books:
+        logger.warning("Поиск новинок пустой, беру свежие издания из Google Books")
+        books = _enrich_with_gemini(_fallback_google_newest(sent))
+
+    # русские сначала, потом мировые; максимум по 4 в каждом блоке
+    ru = [b for b in books if b.get("section") == "RU"][:4]
+    world = [b for b in books if b.get("section") == "WORLD"][:4]
+    books = [_attach_cover(b) for b in ru + world]
+
+    for b in books:
+        _mark_book_sent(b.get("title", ""), b.get("author", ""))
+    return books
+
+
+def _gemini_suggest_books(theme_prompt: str, count: int, exclude: set = None) -> list:
+    """Gemini предлагает реальные известные книги по теме (для /recommend). Список {title, author}."""
+    if not GEMINI_API_KEY:
+        return []
     prompt = (
         f"{theme_prompt}\n\n"
-        f"Предложи {count} КОНКРЕТНЫХ, реально существующих и известных книг "
-        "(проверенных временем или популярных). Только подлинные книги, не выдумывай. "
-        f"{exclude_text}\n\n"
+        f"Предложи {count} КОНКРЕТНЫХ, реально существующих и известных книг. "
+        "Только подлинные книги, не выдумывай.\n\n"
         "Ответь СТРОГО построчно, каждая книга на новой строке в формате:\n"
         "Название | Автор\n"
         "Без нумерации и лишнего текста."
@@ -611,10 +764,10 @@ def _gemini_suggest_books(theme_prompt: str, count: int, exclude: set = None) ->
         return []
     books = []
     for line in raw.splitlines():
-        line = line.strip()
+        line = re.sub(r"^\s*(\d+[.)]|[-•])\s*", "", line.strip())
         if "|" in line:
             title, _, author = line.partition("|")
-            title, author = title.strip(" .0123456789-"), author.strip()
+            title, author = title.strip().strip("«»\""), author.strip()
             if title:
                 books.append({"title": title, "author": author})
     return books
@@ -625,7 +778,6 @@ def _google_lookup(title: str, author: str) -> dict:
     q = f'{title} {author}'.strip()
     found = _fetch_google_books(q, max_results=5, order="relevance")
     if found:
-        # Предпочитаем издание с рейтингом; если нет — с обложкой; иначе первое
         best = found[0]
         for b in found:
             if b.get("google_rating"):
@@ -636,7 +788,6 @@ def _google_lookup(title: str, author: str) -> dict:
                 if b.get("cover"):
                     best = b
                     break
-        # подставляем оригинальные название/автора от Gemini (Google иногда искажает)
         best["title"] = title
         if author:
             best["author"] = author
@@ -644,39 +795,6 @@ def _google_lookup(title: str, author: str) -> dict:
     return {"title": title, "author": author, "year": "", "publisher": "",
             "description": "", "google_rating": None, "google_ratings_count": 0,
             "categories": "", "cover": ""}
-
-
-def get_weekly_books() -> list:
-    """Известные книги по темам (Gemini) + карточки из Google Books. Не повторяет ранее присланные."""
-    sent = _get_sent_book_titles()
-    theme = ("Темы: бизнес и предпринимательство, психология и саморазвитие, "
-             "финансы и инвестиции, нон-фикшн и биографии. Разнообразь темы.")
-
-    books, seen = [], set()
-    for attempt in range(3):  # до 3 попыток добрать нужное количество без повторов
-        need = 8 - len(books)
-        if need <= 0:
-            break
-        suggestions = _gemini_suggest_books(theme, count=need + 2, exclude=sent | seen)
-        if not suggestions:
-            break
-        for s in suggestions:
-            key = s["title"].lower()
-            if key in seen or key in sent:
-                continue
-            seen.add(key)
-            books.append(_google_lookup(s["title"], s["author"]))
-            if len(books) >= 8:
-                break
-
-    if not books:
-        return []
-
-    # помечаем как отправленные, чтобы не повторить в будущем
-    for b in books[:8]:
-        _mark_book_sent(b.get("title", ""), b.get("author", ""))
-
-    return _enrich_with_gemini(books[:8])
 
 
 def get_books_by_topic(topic: str) -> list:
@@ -736,26 +854,47 @@ def format_book(book: dict, num: int) -> str:
     return "\n".join(lines)
 
 
+async def _send_book_card(bot, chat_id, book, num):
+    """Карточка книги: с обложкой если есть; при сбое разметки шлём простым текстом."""
+    caption = format_book(book, num)
+    cover = book.get("cover") or get_cover_url(book.get("title", ""), book.get("author", ""))
+    if len(caption) > 1000:
+        cover = None  # подпись к фото ограничена 1024 символами
+    try:
+        if cover:
+            await bot.send_photo(chat_id=chat_id, photo=cover, caption=caption, parse_mode="Markdown")
+        else:
+            await bot.send_message(chat_id=chat_id, text=caption, parse_mode="Markdown")
+    except Exception:
+        plain = caption.replace("*", "").replace("_", "")
+        try:
+            if cover:
+                await bot.send_photo(chat_id=chat_id, photo=cover, caption=plain)
+            else:
+                await bot.send_message(chat_id=chat_id, text=plain)
+        except Exception:
+            await bot.send_message(chat_id=chat_id, text=plain)
+    await asyncio.sleep(0.7)
+
+
 async def send_weekly_books(bot, chat_id):
     books = get_weekly_books()
     if not books:
-        await bot.send_message(chat_id=chat_id, text="📚 Не удалось получить новинки. Попробуй позже.")
+        await bot.send_message(chat_id=chat_id, text="📚 Не удалось найти свежие новинки. Попробуй позже.")
         return
     now = datetime.now(TIMEZONE).strftime("%d.%m.%Y")
     await bot.send_message(chat_id=chat_id,
-        text=f"📚 *Книжные новинки — {now}*\nБизнес • Психология • Финансы • Нон-фикшн",
+        text=f"📚 *Свежие книжные новинки — {now}*\nВышли за последний месяц",
         parse_mode="Markdown")
-    for i, book in enumerate(books, 1):
-        caption = format_book(book, i)
-        cover = book.get("cover") or get_cover_url(book.get("title", ""), book.get("author", ""))
-        try:
-            if cover:
-                await bot.send_photo(chat_id=chat_id, photo=cover, caption=caption, parse_mode="Markdown")
-            else:
-                await bot.send_message(chat_id=chat_id, text=caption, parse_mode="Markdown")
-        except Exception:
-            await bot.send_message(chat_id=chat_id, text=caption, parse_mode="Markdown")
-        await asyncio.sleep(0.7)
+    num = 0
+    for section, title in (("RU", "🇷🇺 *Вышло на русском*"), ("WORLD", "🌍 *Вышло в мире*")):
+        part = [b for b in books if b.get("section") == section]
+        if not part:
+            continue
+        await bot.send_message(chat_id=chat_id, text=title, parse_mode="Markdown")
+        for book in part:
+            num += 1
+            await _send_book_card(bot, chat_id, book, num)
 
 
 async def send_recommendations(bot, chat_id, topic):
@@ -765,16 +904,7 @@ async def send_recommendations(bot, chat_id, topic):
         return
     await bot.send_message(chat_id=chat_id, text=f"📚 *Книги по теме: {topic}*", parse_mode="Markdown")
     for i, book in enumerate(books, 1):
-        caption = format_book(book, i)
-        cover = book.get("cover") or get_cover_url(book.get("title", ""), book.get("author", ""))
-        try:
-            if cover:
-                await bot.send_photo(chat_id=chat_id, photo=cover, caption=caption, parse_mode="Markdown")
-            else:
-                await bot.send_message(chat_id=chat_id, text=caption, parse_mode="Markdown")
-        except Exception:
-            await bot.send_message(chat_id=chat_id, text=caption, parse_mode="Markdown")
-        await asyncio.sleep(0.7)
+        await _send_book_card(bot, chat_id, book, i)
 
 
 def make_gratitude_summary(entries, month_name):
@@ -2326,13 +2456,13 @@ async def weekly_savings_report(context: ContextTypes.DEFAULT_TYPE):
 async def books_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MY_CHAT_ID:
         return
-    await update.message.reply_text("📚 *Книжный бот*\n\nКаждый понедельник в 09:00 — новинки.\n1-го числа — спрошу тему месяца.\n\n/books — подборка прямо сейчас\n/recommend [тема] — лучшие книги по теме", parse_mode="Markdown")
+    await update.message.reply_text("📚 *Книжный бот*\n\nКаждый понедельник в 09:00 — свежие новинки за месяц: 4 на русском и 4 мировые.\n1-го числа — спрошу тему месяца.\n\n/books — подборка прямо сейчас\n/recommend [тема] — лучшие книги по теме", parse_mode="Markdown")
 
 
 async def books_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MY_CHAT_ID:
         return
-    await update.message.reply_text("📚 Ищу книжные новинки... ⏳")
+    await update.message.reply_text("📚 Ищу свежие новинки в интернете, это займёт около минуты... ⏳")
     await send_weekly_books(context.bot, MY_CHAT_ID)
 
 
@@ -2386,28 +2516,39 @@ async def weekly_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(WEEKLY_QUESTIONS[0], parse_mode="Markdown")
     return WQ1
 
+def _autosave_week(context):
+    """Сохраняем недельный опрос после каждого ответа, чтобы прерванный /week не терялся."""
+    week = context.user_data.get("week") or get_current_week()
+    save_weekly_entry(week, context.user_data.get("weekly_answers", {}))
+
+
 async def weekly_q1(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["weekly_answers"]["summary"] = update.message.text
+    _autosave_week(context)
     await update.message.reply_text(WEEKLY_QUESTIONS[1])
     return WQ2
 
 async def weekly_q2(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["weekly_answers"]["worries"] = update.message.text
+    _autosave_week(context)
     await update.message.reply_text(WEEKLY_QUESTIONS[2])
     return WQ3
 
 async def weekly_q3(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["weekly_answers"]["joys"] = update.message.text
+    _autosave_week(context)
     await update.message.reply_text(WEEKLY_QUESTIONS[3])
     return WQ4
 
 async def weekly_q4(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["weekly_answers"]["gratitude"] = update.message.text
+    _autosave_week(context)
     await update.message.reply_text(WEEKLY_QUESTIONS[4])
     return WQ5
 
 async def weekly_q5(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["weekly_answers"]["regrets"] = update.message.text
+    _autosave_week(context)
     
     # Показываем прошлонедельный план если есть
     last_plan = get_last_week_plan()
@@ -2426,6 +2567,7 @@ async def weekly_q5(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def weekly_q6(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["weekly_answers"]["plan_review"] = update.message.text
+    _autosave_week(context)
     await update.message.reply_text(
         "🗓 *Какие планы ставишь на следующую неделю?*\n\nНапиши список целей.",
         parse_mode="Markdown"
@@ -2446,6 +2588,11 @@ async def weekly_q7(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_long(update.message.reply_text, f"📊 *Твоя неделя — взгляд со стороны*\n\n{summary}")
     await update.message.reply_text("Хорошей следующей недели! 💪")
     return ConversationHandler.END
+
+async def _end_silently(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Закрывает текущий диалог без сообщения: пользователь переключился на другой опрос."""
+    return ConversationHandler.END
+
 
 async def weekly_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Отменено.")
@@ -2494,7 +2641,8 @@ async def main():
             Q4: [MessageHandler(filters.TEXT & ~filters.COMMAND, answer_q4)],
             Q5: [MessageHandler(filters.TEXT & ~filters.COMMAND, answer_plan_review)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("week", _end_silently)],
+        allow_reentry=True,  # повторный /ask начинает опрос заново, а не игнорируется
     )
     weekly_conv = ConversationHandler(
         entry_points=[CommandHandler("week", weekly_ask)],
@@ -2507,12 +2655,15 @@ async def main():
             WQ6: [MessageHandler(filters.TEXT & ~filters.COMMAND, weekly_q6)],
             WQ7: [MessageHandler(filters.TEXT & ~filters.COMMAND, weekly_q7)],
         },
-        fallbacks=[CommandHandler("cancel", weekly_cancel)],
+        fallbacks=[CommandHandler("cancel", weekly_cancel), CommandHandler("ask", _end_silently)],
+        allow_reentry=True,
     )
 
     reflection_app.add_handler(CommandHandler("start", start_reflection))
     reflection_app.add_handler(conv_handler)
-    reflection_app.add_handler(weekly_conv)
+    # Недельный опрос в отдельной группе: /ask и /week видят оба диалога,
+    # поэтому начало одного опроса тихо закрывает другой, и бот не зависает
+    reflection_app.add_handler(weekly_conv, group=1)
     reflection_app.add_handler(CommandHandler("history", history))
     reflection_app.add_handler(CommandHandler("gratitude", gratitude_summary))
     reflection_app.add_handler(CommandHandler("plan", plan_command))
