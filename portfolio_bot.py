@@ -1,0 +1,704 @@
+"""
+Бот портфеля ИИС (Т-Инвестиции).
+
+Что делает:
+  • понедельник 10:00 — сверка портфеля: количество, средняя цена покупки, текущая цена,
+    изменение за неделю, прибыль/убыток;
+  • каждые 15 минут во время торгов — алерт, если бумага ушла больше чем на 5% от вчерашнего закрытия;
+  • 1-го числа 10:00 — календарь купонов и погашений на месяц с суммами;
+  • 1-го числа сразу после календаря — разбор эмитентов: новости, отчёты, Смартлаб, риск дефолта.
+
+Источники: T-Invest API (токен только для чтения), Мосбиржа (купоны и погашения),
+Смартлаб (страница облигации и форум эмитента), Gemini с поиском Google (новости и анализ).
+
+Переменные окружения: PORTFOLIO_BOT_TOKEN, TINVEST_TOKEN, MY_CHAT_ID, GEMINI_API_KEY,
+необязательно TINVEST_ACCOUNT_ID (если ИИС не определился сам).
+"""
+import asyncio
+import html
+import logging
+import os
+import re
+from datetime import datetime, timedelta, time as dtime
+
+import pytz
+import requests
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+
+logger = logging.getLogger(__name__)
+
+TIMEZONE = pytz.timezone("Asia/Bangkok")
+MOSCOW = pytz.timezone("Europe/Moscow")
+
+PORTFOLIO_BOT_TOKEN = os.environ.get("PORTFOLIO_BOT_TOKEN")
+TINVEST_TOKEN = os.environ.get("TINVEST_TOKEN")
+TINVEST_ACCOUNT_ID = os.environ.get("TINVEST_ACCOUNT_ID", "").strip()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+MY_CHAT_ID = int(os.environ.get("MY_CHAT_ID") or 0)
+
+ALERT_THRESHOLD = 5.0          # % движения цены для алерта
+TINVEST_URL = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1."
+UA = {"User-Agent": "Mozilla/5.0 (portfolio-bot)"}
+MONTHS = ["", "январь", "февраль", "март", "апрель", "май", "июнь", "июль",
+          "август", "сентябрь", "октябрь", "ноябрь", "декабрь"]
+
+_alerted = {}          # uid -> дата последнего алерта (не чаще раза в день по бумаге)
+_instrument_cache = {}  # uid -> {name, isin, type}
+_account_id = None
+
+
+# =====================
+# ФОРМАТИРОВАНИЕ
+# =====================
+
+def _q(v) -> float:
+    """Quotation / MoneyValue из API -> float."""
+    if not v:
+        return 0.0
+    return int(v.get("units", 0) or 0) + int(v.get("nano", 0) or 0) / 1e9
+
+
+def rub(x: float) -> str:
+    sign = "−" if x < 0 else ""
+    return f"{sign}{abs(x):,.0f} ₽".replace(",", " ")
+
+
+def price(x: float) -> str:
+    s = f"{x:,.2f}".replace(",", " ").replace(".", ",")
+    return s.rstrip("0").rstrip(",") + " ₽" if "," in s else s + " ₽"
+
+
+def pct(x: float) -> str:
+    sign = "+" if x > 0 else ("−" if x < 0 else "")
+    return f"{sign}{abs(x):.1f}%".replace(".", ",")
+
+
+def dot(x: float) -> str:
+    return "🟢" if x > 0.05 else ("🔴" if x < -0.05 else "⚪")
+
+
+def esc(s) -> str:
+    return html.escape(str(s or ""))
+
+
+# =====================
+# T-INVEST API
+# =====================
+
+def tapi(method: str, body: dict) -> dict:
+    """Вызов T-Invest API (REST). method вида 'OperationsService/GetPortfolio'."""
+    resp = requests.post(
+        TINVEST_URL + method,
+        headers={"Authorization": f"Bearer {TINVEST_TOKEN}", "Content-Type": "application/json"},
+        json=body,
+        timeout=20,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"T-Invest {method}: {resp.status_code} {resp.text[:300]}")
+    return resp.json()
+
+
+ACCOUNT_TYPES = {
+    "ACCOUNT_TYPE_TINKOFF": "брокерский счёт",
+    "ACCOUNT_TYPE_TINKOFF_IIS": "ИИС",
+    "ACCOUNT_TYPE_INVEST_BOX": "инвесткопилка",
+}
+
+
+def get_accounts() -> list:
+    return tapi("UsersService/GetAccounts", {}).get("accounts", [])
+
+
+def get_account_id() -> str:
+    """ИИС определяется сам; TINVEST_ACCOUNT_ID нужен только если счетов несколько и ИИС не нашёлся."""
+    global _account_id
+    if TINVEST_ACCOUNT_ID:
+        return TINVEST_ACCOUNT_ID
+    if _account_id:
+        return _account_id
+    accounts = [a for a in get_accounts() if a.get("status") != "ACCOUNT_STATUS_CLOSED"]
+    iis = [a for a in accounts if a.get("type") == "ACCOUNT_TYPE_TINKOFF_IIS"]
+    if iis:
+        _account_id = iis[0]["id"]
+    elif len(accounts) == 1:
+        _account_id = accounts[0]["id"]
+    if _account_id:
+        return _account_id
+    raise RuntimeError("ИИС не найден среди счетов. Проверь /accounts")
+
+
+def instrument_info(uid: str) -> dict:
+    if uid in _instrument_cache:
+        return _instrument_cache[uid]
+    info = {"name": "", "isin": "", "type": ""}
+    try:
+        ins = tapi("InstrumentsService/GetInstrumentBy",
+                   {"idType": "INSTRUMENT_ID_TYPE_UID", "id": uid}).get("instrument", {})
+        info = {"name": ins.get("name", ""), "isin": ins.get("isin", ""), "type": ins.get("instrumentType", "")}
+    except Exception as e:
+        logger.error(f"instrument_info {uid}: {e}")
+    _instrument_cache[uid] = info
+    return info
+
+
+def get_positions() -> tuple[list, float]:
+    """Бумаги портфеля и свободные рубли."""
+    data = tapi("OperationsService/GetPortfolio", {"accountId": get_account_id(), "currency": "RUB"})
+    positions, cash = [], 0.0
+    for p in data.get("positions", []):
+        qty = _q(p.get("quantity"))
+        if qty <= 0:
+            continue
+        if p.get("instrumentType") == "currency":
+            if (p.get("ticker") or "").upper().startswith("RUB"):
+                cash += qty
+            continue
+        uid = p.get("instrumentUid")
+        info = instrument_info(uid)
+        positions.append({
+            "uid": uid,
+            "ticker": p.get("ticker", ""),
+            "type": p.get("instrumentType", ""),
+            "name": info["name"] or p.get("ticker", ""),
+            "isin": info["isin"],
+            "qty": qty,
+            "avg": _q(p.get("averagePositionPrice")),
+            "cur": _q(p.get("currentPrice")),
+            "nkd": _q(p.get("currentNkd")),
+            "pnl": _q(p.get("expectedYield")),
+        })
+    positions.sort(key=lambda x: x["qty"] * x["cur"], reverse=True)
+    return positions, cash
+
+
+def week_change(uid: str) -> float | None:
+    """Изменение цены за неделю в % по дневным свечам."""
+    now = datetime.utcnow()
+    try:
+        candles = tapi("MarketDataService/GetCandles", {
+            "instrumentId": uid,
+            "from": (now - timedelta(days=12)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "to": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "interval": "CANDLE_INTERVAL_DAY",
+        }).get("candles", [])
+    except Exception as e:
+        logger.error(f"week_change {uid}: {e}")
+        return None
+    if len(candles) < 2:
+        return None
+    week_ago = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+    old = [c for c in candles if c.get("time", "")[:10] <= week_ago]
+    base = _q((old[-1] if old else candles[0]).get("close"))
+    last = _q(candles[-1].get("close"))
+    return (last / base - 1) * 100 if base else None
+
+
+# =====================
+# 1. ЕЖЕНЕДЕЛЬНАЯ СВЕРКА
+# =====================
+
+def build_weekly_report() -> str:
+    positions, cash = get_positions()
+    if not positions:
+        return "💼 В портфеле пока нет бумаг."
+    total = sum(p["qty"] * p["cur"] for p in positions)
+    total_pnl = sum(p["pnl"] for p in positions)
+    week_delta = 0.0
+
+    lines = []
+    for p in positions:
+        wc = week_change(p["uid"])
+        value = p["qty"] * p["cur"]
+        if wc is not None:
+            week_delta += value - value / (1 + wc / 100)
+        pnl_pct = (p["cur"] / p["avg"] - 1) * 100 if p["avg"] else 0
+        week_txt = f"за неделю {pct(wc)}" if wc is not None else "за неделю нет данных"
+        lines.append(
+            f"{dot(wc or 0)} <b>{esc(p['name'])}</b>\n"
+            f"{p['qty']:g} шт · средняя {price(p['avg'])} · сейчас {price(p['cur'])}\n"
+            f"{week_txt} · итог {rub(p['pnl'])} ({pct(pnl_pct)})"
+        )
+
+    now = datetime.now(TIMEZONE).strftime("%d.%m.%Y")
+    week_base = total - week_delta
+    header = (
+        f"💼 <b>Сверка портфеля ИИС — {now}</b>\n\n"
+        f"Стоимость бумаг: <b>{rub(total)}</b>\n"
+        f"За неделю: {rub(week_delta)} ({pct(week_delta / week_base * 100 if week_base else 0)})\n"
+        f"Прибыль/убыток за всё время: {rub(total_pnl)}\n"
+        + (f"Свободные деньги: {rub(cash)}\n" if cash >= 1 else "")
+    )
+    return header + "\n" + "\n\n".join(lines)
+
+
+# =====================
+# 2. АЛЕРТЫ
+# =====================
+
+def check_moves(force: bool = False) -> list[str]:
+    """Бумаги, ушедшие больше чем на ALERT_THRESHOLD% от закрытия прошлой сессии."""
+    positions, _ = get_positions()
+    if not positions:
+        return []
+    uids = [p["uid"] for p in positions]
+    last = {x["instrumentUid"]: _q(x.get("price"))
+            for x in tapi("MarketDataService/GetLastPrices", {"instrumentId": uids}).get("lastPrices", [])}
+    close = {x["instrumentUid"]: _q(x.get("price"))
+             for x in tapi("MarketDataService/GetClosePrices",
+                           {"instruments": [{"instrumentId": u} for u in uids]}).get("closePrices", [])}
+    today = datetime.now(MOSCOW).date()
+    alerts = []
+    for p in positions:
+        lp, cp = last.get(p["uid"]), close.get(p["uid"])
+        if not lp or not cp:
+            continue
+        move = (lp / cp - 1) * 100
+        if abs(move) < ALERT_THRESHOLD:
+            continue
+        if not force and _alerted.get(p["uid"]) == today:
+            continue
+        _alerted[p["uid"]] = today
+        unit = "% от номинала" if p["type"] == "bond" else " ₽"
+        fmt = lambda v: f"{v:.2f}".replace(".", ",") + unit
+        word = "выросла" if move > 0 else "упала"
+        delta = p["qty"] * p["cur"] * move / (100 + move)   # изменение стоимости позиции за день
+        alerts.append(
+            f"{'🚀' if move > 0 else '⚠️'} <b>{esc(p['name'])}</b> {word} на {pct(abs(move))[1:]} "
+            f"к вчерашнему закрытию\n{fmt(cp)} → {fmt(lp)}\n"
+            f"У тебя {p['qty']:g} шт: {rub(delta)} за день"
+        )
+    return alerts
+
+
+# =====================
+# 3. КУПОНЫ И ПОГАШЕНИЯ
+# =====================
+
+def moex_bondization(secid: str) -> tuple[list, list]:
+    """Купоны и погашения с Мосбиржи: [(date, value_rub|None)], [(date, value_rub|None)]."""
+    resp = requests.get(
+        f"https://iss.moex.com/iss/securities/{secid}/bondization.json",
+        params={"iss.meta": "off", "iss.only": "coupons,amortizations", "limit": "unlimited"},
+        headers=UA, timeout=20,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    def rows(table, date_col):
+        t = data.get(table, {})
+        cols = t.get("columns", [])
+        out = []
+        for r in t.get("data", []):
+            row = dict(zip(cols, r))
+            out.append((row.get(date_col), row.get("value_rub")))
+        return out
+
+    return rows("coupons", "coupondate"), rows("amortizations", "amortdate")
+
+
+def tapi_coupons(uid: str, start: datetime, end: datetime) -> list:
+    """Запасной источник купонов: T-Invest API."""
+    events = tapi("InstrumentsService/GetBondCoupons", {
+        "instrumentId": uid,
+        "from": start.strftime("%Y-%m-%dT00:00:00Z"),
+        "to": end.strftime("%Y-%m-%dT23:59:59Z"),
+    }).get("events", [])
+    return [(e.get("couponDate", "")[:10], _q(e.get("payOneBond")) or None) for e in events]
+
+
+def build_coupon_calendar(month_shift: int = 0) -> str:
+    today = datetime.now(MOSCOW)
+    first = today.replace(day=1)
+    for _ in range(month_shift):
+        first = (first + timedelta(days=32)).replace(day=1)
+    last = (first + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+    m_from, m_to = first.strftime("%Y-%m-%d"), last.strftime("%Y-%m-%d")
+
+    positions, _ = get_positions()
+    bonds = [p for p in positions if p["type"] == "bond"]
+    if not bonds:
+        return "📅 В портфеле нет облигаций."
+
+    events, unknown, failed = [], [], []
+    for b in bonds:
+        try:
+            coupons, amorts = moex_bondization(b["ticker"])
+            all_amorts = [d for d, _ in amorts if d]
+            maturity = max(all_amorts) if all_amorts else None
+        except Exception as e:
+            logger.warning(f"MOEX {b['ticker']}: {e}, беру купоны из T-Invest")
+            try:
+                coupons = tapi_coupons(b["uid"], first, last)
+                bond = tapi("InstrumentsService/BondBy",
+                            {"idType": "INSTRUMENT_ID_TYPE_UID", "id": b["uid"]}).get("instrument", {})
+                maturity = (bond.get("maturityDate") or "")[:10] or None
+                amorts = [(maturity, _q(bond.get("nominal")))] if maturity else []
+            except Exception as e2:
+                logger.error(f"coupons {b['ticker']}: {e2}")
+                failed.append(b["name"])
+                continue
+        for d, v in coupons:
+            if d and m_from <= d <= m_to:
+                if v is None:
+                    unknown.append((d, b["name"]))
+                else:
+                    events.append((d, "💰", b["name"], v * b["qty"], f"купон {price(v)} × {b['qty']:g}"))
+        for d, v in amorts:
+            if d and m_from <= d <= m_to and v:
+                icon, kind = ("🏁", "погашение") if d == maturity else ("🧩", "амортизация")
+                events.append((d, icon, b["name"], v * b["qty"], f"{kind} {price(v)} × {b['qty']:g}"))
+
+    title = f"📅 <b>Купоны и погашения: {MONTHS[first.month]} {first.year}</b>\n"
+    if not events and not unknown:
+        text = title + "\nВ этом месяце выплат нет."
+    else:
+        events.sort()
+        lines = [f"{datetime.strptime(d, '%Y-%m-%d').strftime('%d.%m')} {icon} <b>{esc(n)}</b>: "
+                 f"{rub(s)}\n      {esc(note)}" for d, icon, n, s, note in events]
+        total = sum(e[3] for e in events)
+        text = title + "\n" + "\n".join(lines) + f"\n\n<b>Всего придёт: {rub(total)}</b>"
+        if unknown:
+            text += "\n\nРазмер купона ещё не объявлен:\n" + "\n".join(
+                f"• {datetime.strptime(d, '%Y-%m-%d').strftime('%d.%m')} {esc(n)}" for d, n in sorted(unknown))
+    if failed:
+        text += "\n\n⚠️ Не удалось получить данные: " + esc(", ".join(failed))
+    text += "\n\n<i>Суммы по текущему количеству бумаг, до налога, если он удерживается.</i>"
+    return text
+
+
+# =====================
+# 4. РАЗБОР ЭМИТЕНТОВ
+# =====================
+
+def _html_to_text(s: str) -> str:
+    s = re.sub(r"<blockquote.*?</blockquote>", " ", s, flags=re.S)
+    s = re.sub(r"<br\s*/?>", "\n", s)
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = html.unescape(s)
+    return re.sub(r"[ \t]+", " ", re.sub(r"\n\s*\n+", "\n", s)).strip()
+
+
+def smartlab_bond(isin_or_secid: str) -> dict:
+    """Страница облигации на Смартлабе: ключевые цифры и ссылка на форум эмитента."""
+    out = {"facts": "", "forum_url": "", "issuer": ""}
+    try:
+        resp = requests.get(f"https://smart-lab.ru/q/bonds/{isin_or_secid}/", headers=UA, timeout=20)
+        if not resp.ok:
+            return out
+        page = resp.text
+        m = re.search(r'href="([^"]*?/bonds/[a-zA-Z0-9_\-]+)"[^>]*>\s*Обсудить на форуме\s*([^<]+)<', page)
+        if m:
+            url = m.group(1)
+            out["forum_url"] = url if url.startswith("http") else "https://smart-lab.ru" + url
+            out["issuer"] = m.group(2).strip()
+        text = _html_to_text(page)
+        start = text.find("стоит сейчас")
+        end = text.find("Календарь выплаты")
+        if start != -1:
+            line_start = text.rfind("\n", 0, start) + 1   # с начала фразы «Облигация ... стоит сейчас»
+            out["facts"] = text[line_start: end if end > start else start + 1500][:1500]
+    except Exception as e:
+        logger.error(f"smartlab_bond {isin_or_secid}: {e}")
+    return out
+
+
+def smartlab_forum(url: str, limit: int = 20) -> str:
+    """Последние сообщения форума эмитента на Смартлабе."""
+    try:
+        resp = requests.get(url, headers=UA, timeout=20)
+        if not resp.ok:
+            return ""
+        posts = re.findall(
+            r'<time datetime="([^"]+)">.*?<div class="text">(.*?)</div><div class="cm_ftr">',
+            resp.text, flags=re.S)
+        lines = []
+        for when, body in posts[:limit]:
+            txt = _html_to_text(body)[:400]
+            if txt:
+                lines.append(f"[{when[:10]}] {txt}")
+        return "\n".join(lines)[:4000]
+    except Exception as e:
+        logger.error(f"smartlab_forum {url}: {e}")
+        return ""
+
+
+def ask_gemini_grounded(prompt: str) -> str:
+    """Gemini 2.5 Flash с поиском Google: свежие новости и отчёты."""
+    if not GEMINI_API_KEY:
+        return ""
+    for attempt in range(2):
+        try:
+            resp = requests.post(
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+                params={"key": GEMINI_API_KEY},
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "tools": [{"google_search": {}}],
+                    "generationConfig": {"maxOutputTokens": 12000, "temperature": 0.2,
+                                         "thinkingConfig": {"thinkingBudget": 2048}},
+                },
+                timeout=120,
+            )
+            cands = resp.json().get("candidates", [])
+            if cands:
+                text = "".join(p.get("text", "") for p in cands[0].get("content", {}).get("parts", []))
+                if text.strip():
+                    return text.strip()
+            logger.error(f"Gemini empty (attempt {attempt + 1}): {resp.text[:300]}")
+        except Exception as e:
+            logger.error(f"Gemini error (attempt {attempt + 1}): {e}")
+    return ""
+
+
+def group_issuers(bonds: list) -> list[dict]:
+    """Группируем облигации по эмитенту (по форуму Смартлаба). ОФЗ отдельно."""
+    groups = {}
+    for b in bonds:
+        is_ofz = b["ticker"].startswith("SU") and "RMFS" in b["ticker"]
+        sl = {"facts": "", "forum_url": "", "issuer": "Минфин РФ"} if is_ofz else smartlab_bond(b["ticker"])
+        key = "ofz" if is_ofz else (sl["forum_url"] or b["name"].split()[0])
+        g = groups.setdefault(key, {"issuer": sl["issuer"] or b["name"].split()[0],
+                                    "forum_url": sl["forum_url"], "ofz": is_ofz, "bonds": []})
+        g["bonds"].append({**b, "facts": sl["facts"]})
+    return list(groups.values())
+
+
+RISK_RE = re.compile(r"РИСК ДЕФОЛТА:\s*(низкий|средний|высокий)", re.I)
+RISK_ICON = {"низкий": "🟢", "средний": "🟡", "высокий": "🔴"}
+
+
+def analyze_issuer(g: dict) -> tuple[str, str]:
+    """Разбор одного эмитента. Возвращает (текст, уровень риска)."""
+    today = datetime.now(TIMEZONE)
+    bonds_txt = "\n".join(
+        f"- {b['name']} (ISIN {b['isin'] or b['ticker']}): {b['qty']:g} шт, "
+        f"цена {price(b['cur'])}, средняя покупки {price(b['avg'])}\n  Смартлаб: {b['facts'] or 'нет данных'}"
+        for b in g["bonds"])
+    forum = smartlab_forum(g["forum_url"]) if g["forum_url"] else ""
+    prompt = (
+        f"Сегодня {today.strftime('%d.%m.%Y')}. Ты аналитик долгового рынка РФ. "
+        f"Сделай ежемесячный разбор эмитента «{g['issuer']}» для частного инвестора, "
+        "который держит его облигации на ИИС до погашения.\n\n"
+        f"Облигации в портфеле:\n{bonds_txt}\n\n"
+        + (f"Последние сообщения с форума эмитента на Смартлабе ({g['forum_url']}):\n{forum}\n\n" if forum else "")
+        + "Найди в интернете свежую информацию за последний месяц: новости компании, последние отчёты "
+        "(МСФО/РСБУ: выручка, EBITDA, долг, чистый долг/EBITDA, покрытие процентов), изменения "
+        "кредитных рейтингов, новые выпуски, оферты, судебные иски, проблемы с выплатами, мнения аналитиков.\n\n"
+        "Ответь простым текстом без Markdown (без звёздочек и решёток), коротко и по делу, в таком порядке:\n"
+        "РИСК ДЕФОЛТА: низкий / средний / высокий\n"
+        "📰 Новости за месяц: 2-4 пункта с датами\n"
+        "📊 Отчётность и долг: последние цифры и их динамика\n"
+        "⭐ Рейтинг: текущий рейтинг и изменения\n"
+        "💬 Смартлаб: о чём спорят и какие опасения у инвесторов\n"
+        "⚠️ Опасения: главные риски\n"
+        "🛡 Риск дефолта: почему именно такой уровень, что может его повысить, за чем следить\n"
+        "Не выдумывай цифры: если данных нет, так и напиши."
+    )
+    text = ask_gemini_grounded(prompt)
+    if not text:
+        return f"🏢 {g['issuer']}\nНе удалось получить разбор, попробую в следующий раз.", ""
+    text = text.replace("**", "").replace("##", "")
+    m = RISK_RE.search(text)
+    risk = m.group(1).lower() if m else ""
+    return f"🏢 {g['issuer'].upper()} {RISK_ICON.get(risk, '')}\n\n{text}", risk
+
+
+async def send_long(bot, chat_id, text: str, parse_mode=None):
+    """Telegram ограничивает сообщение 4096 символами: режем по абзацам."""
+    while text:
+        if len(text) <= 4000:
+            chunk, text = text, ""
+        else:
+            cut = text.rfind("\n", 0, 4000)
+            cut = cut if cut > 1000 else 4000
+            chunk, text = text[:cut], text[cut:].lstrip()
+        await bot.send_message(chat_id=chat_id, text=chunk, parse_mode=parse_mode,
+                               disable_web_page_preview=True)
+
+
+async def send_issuer_report(bot, chat_id):
+    positions, _ = await asyncio.to_thread(get_positions)
+    bonds = [p for p in positions if p["type"] == "bond"]
+    if not bonds:
+        await bot.send_message(chat_id=chat_id, text="🏢 В портфеле нет облигаций для разбора.")
+        return
+    await bot.send_message(chat_id=chat_id, text="🏢 Разбор эмитентов за месяц. Собираю новости, отчёты и Смартлаб, "
+                                                 "это займёт несколько минут…")
+    groups = await asyncio.to_thread(group_issuers, bonds)
+    summary = []
+    for g in groups:
+        if g["ofz"]:
+            summary.append("🟢 ОФЗ (Минфин РФ): государственный долг, риск дефолта минимальный")
+            continue
+        text, risk = await asyncio.to_thread(analyze_issuer, g)
+        await send_long(bot, chat_id, text)
+        summary.append(f"{RISK_ICON.get(risk, '⚪')} {g['issuer']}: риск {risk or 'не определён'}")
+        await asyncio.sleep(1)
+    order = {"🔴": 0, "🟡": 1, "⚪": 2, "🟢": 3}
+    summary.sort(key=lambda s: order.get(s[:1], 2))
+    await bot.send_message(chat_id=chat_id, text="🛡 Итог по риску дефолта\n\n" + "\n".join(summary))
+
+
+# =====================
+# КОМАНДЫ
+# =====================
+
+def _mine(update: Update) -> bool:
+    """Данные портфеля показываем только владельцу."""
+    return update.effective_chat and update.effective_chat.id == MY_CHAT_ID
+
+
+async def _run(update: Update, title: str, func, *args):
+    if not _mine(update):
+        return
+    msg = await update.message.reply_text(f"{title}…")
+    try:
+        text = await asyncio.to_thread(func, *args)
+        await msg.delete()
+        await send_long(update.get_bot(), update.effective_chat.id, text, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"{title}: {e}")
+        await msg.edit_text(f"⚠️ Не получилось: {e}"[:1000])
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _mine(update):
+        return
+    await update.message.reply_text(
+        "💼 Бот портфеля ИИС\n\n"
+        "Сам присылаю:\n"
+        "• по понедельникам в 10:00 — сверку портфеля\n"
+        f"• во время торгов — алерт, если бумага ушла больше чем на {ALERT_THRESHOLD:g}% за день\n"
+        "• 1-го числа — календарь купонов и погашений и разбор эмитентов\n\n"
+        "Команды:\n"
+        "/accounts — какие счета видит бот\n"
+        "/portfolio — сверка портфеля сейчас\n"
+        "/coupons — выплаты в этом месяце\n"
+        "/coupons_next — выплаты в следующем месяце\n"
+        "/check — проверить резкие движения сейчас\n"
+        "/issuers — разбор эмитентов сейчас (несколько минут)"
+    )
+
+
+def build_accounts_text() -> str:
+    accounts = get_accounts()
+    if not accounts:
+        return "Токен работает, но счетов не видно. Проверь, что при создании токена выбран ИИС."
+    try:
+        used = get_account_id()
+    except Exception:
+        used = ""
+    lines = []
+    for a in accounts:
+        kind = ACCOUNT_TYPES.get(a.get("type"), a.get("type", ""))
+        mark = " ✅ использую этот" if a.get("id") == used else ""
+        closed = " (закрыт)" if a.get("status") == "ACCOUNT_STATUS_CLOSED" else ""
+        lines.append(f"• {esc(a.get('name') or kind)}: {kind}{closed}{mark}\n  id: <code>{a.get('id')}</code>")
+    text = "🔑 <b>Счета, которые видит бот</b>\n\n" + "\n".join(lines)
+    if not used:
+        text += ("\n\n⚠️ ИИС не определился сам. Скопируй id нужного счёта в Railway "
+                 "в переменную TINVEST_ACCOUNT_ID.")
+    return text
+
+
+async def accounts_command(update, context):
+    await _run(update, "🔑 Смотрю счета", build_accounts_text)
+
+
+async def portfolio_command(update, context):
+    await _run(update, "💼 Собираю сверку", build_weekly_report)
+
+
+async def coupons_command(update, context):
+    await _run(update, "📅 Считаю выплаты", build_coupon_calendar, 0)
+
+
+async def coupons_next_command(update, context):
+    await _run(update, "📅 Считаю выплаты", build_coupon_calendar, 1)
+
+
+async def check_command(update, context):
+    if not _mine(update):
+        return
+    try:
+        alerts = await asyncio.to_thread(check_moves, True)
+        if alerts:
+            for a in alerts:
+                await update.message.reply_text(a, parse_mode="HTML")
+        else:
+            await update.message.reply_text(f"✅ Резких движений нет: все бумаги в пределах ±{ALERT_THRESHOLD:g}% "
+                                            "от вчерашнего закрытия.")
+    except Exception as e:
+        logger.error(f"check: {e}")
+        await update.message.reply_text(f"⚠️ Не получилось: {e}"[:1000])
+
+
+async def issuers_command(update, context):
+    if not _mine(update):
+        return
+    try:
+        await send_issuer_report(update.get_bot(), update.effective_chat.id)
+    except Exception as e:
+        logger.error(f"issuers: {e}")
+        await update.message.reply_text(f"⚠️ Не получилось: {e}"[:1000])
+
+
+# =====================
+# РАСПИСАНИЕ
+# =====================
+
+async def weekly_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        text = await asyncio.to_thread(build_weekly_report)
+        await send_long(context.bot, MY_CHAT_ID, text, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"weekly_job: {e}")
+        await context.bot.send_message(chat_id=MY_CHAT_ID, text=f"⚠️ Сверка портфеля не собралась: {e}"[:1000])
+
+
+async def alert_job(context: ContextTypes.DEFAULT_TYPE):
+    """Каждые 15 минут, но работает только в торговые часы Мосбиржи (будни 10:00–23:50 МСК)."""
+    now = datetime.now(MOSCOW)
+    if now.weekday() >= 5 or not (dtime(10, 5) <= now.time() <= dtime(23, 50)):
+        return
+    try:
+        for a in await asyncio.to_thread(check_moves):
+            await context.bot.send_message(chat_id=MY_CHAT_ID, text=a, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"alert_job: {e}")
+
+
+async def monthly_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        text = await asyncio.to_thread(build_coupon_calendar, 0)
+        await send_long(context.bot, MY_CHAT_ID, text, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"monthly coupons: {e}")
+        await context.bot.send_message(chat_id=MY_CHAT_ID, text=f"⚠️ Календарь купонов не собрался: {e}"[:1000])
+    try:
+        await send_issuer_report(context.bot, MY_CHAT_ID)
+    except Exception as e:
+        logger.error(f"monthly issuers: {e}")
+        await context.bot.send_message(chat_id=MY_CHAT_ID, text=f"⚠️ Разбор эмитентов не собрался: {e}"[:1000])
+
+
+async def main() -> list:
+    if not PORTFOLIO_BOT_TOKEN or not TINVEST_TOKEN:
+        logger.warning("Портфельный бот выключен: нет PORTFOLIO_BOT_TOKEN или TINVEST_TOKEN")
+        return []
+    app = Application.builder().token(PORTFOLIO_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("accounts", accounts_command))
+    app.add_handler(CommandHandler("portfolio", portfolio_command))
+    app.add_handler(CommandHandler("coupons", coupons_command))
+    app.add_handler(CommandHandler("coupons_next", coupons_next_command))
+    app.add_handler(CommandHandler("check", check_command))
+    app.add_handler(CommandHandler("issuers", issuers_command))
+
+    jq = app.job_queue
+    # run_daily: 0 = воскресенье, 1 = понедельник
+    jq.run_daily(weekly_job, time=dtime(hour=10, minute=0, tzinfo=TIMEZONE), days=(1,))
+    jq.run_repeating(alert_job, interval=900, first=120)
+    jq.run_monthly(monthly_job, when=dtime(hour=10, minute=0, tzinfo=TIMEZONE), day=1)
+    return [app]
