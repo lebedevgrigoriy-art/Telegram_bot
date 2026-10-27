@@ -364,18 +364,12 @@ def build_weekly_report() -> str:
     positions, cash = get_positions()
     if not positions:
         return "💼 В портфеле пока нет бумаг."
-    total = sum(p["qty"] * p["cur"] for p in positions)
-    week_delta = 0.0
     year_income = bonds_value = bonds_cost = year_full = 0.0
 
     lines = []
     for p in positions:
-        wc = week_change(p["uid"])
         value = p["qty"] * p["cur"]
-        if wc is not None:
-            week_delta += value - value / (1 + wc / 100)
-        week_txt = f" · {pct(wc)} за неделю" if wc is not None else ""
-        yields = ""
+        yields = maturity = ""
         if p["type"] == "bond":
             annual = coupon_rate(p["ticker"])
             if annual and p["avg"] and p["cur"]:
@@ -383,19 +377,24 @@ def build_weekly_report() -> str:
                 bonds_value += value
                 bonds_cost += p["avg"] * p["qty"]
                 red = redemption_info(p["ticker"])
+                try:
+                    dates = [d for d, v in moex_bondization(p["ticker"])[1] if d]
+                    if dates:
+                        maturity = " · погашение " + datetime.strptime(max(dates), "%Y-%m-%d").strftime("%m.%Y")
+                except Exception:
+                    pass
                 # с погашением: купоны + разница между номиналом и ценой покупки, растянутая на годы до погашения
                 full = annual + ((red[0] - p["avg"]) / red[1] if red else 0)
                 year_full += full * p["qty"]
                 yields = (f" · к цене {num(annual / p['cur'] * 100)}% · к вложенным {num(annual / p['avg'] * 100)}%"
                           + (f" · с погаш. {num(full / p['avg'] * 100)}%" if red else ""))
         lines.append(
-            f"{dot(wc or 0)} <b>{esc(p['name'])}</b> · {p['qty']:g} шт{week_txt}\n"
+            f"<b>{esc(p['name'])}</b> · {p['qty']:g} шт{maturity}\n"
             f"{price(p['avg'])} → {price(p['cur'])}{yields}"
         )
 
     # стоимость счёта целиком: бумаги + НКД + свободные деньги
     value_now = sum(p["qty"] * (p["cur"] + p["nkd"]) for p in positions) + cash
-    week_base = total - week_delta
     text = f"💼 <b>Сверка ИИС, {datetime.now(TIMEZONE).strftime('%d.%m.%Y')}</b>\n\n"
 
     fr = fact_result(value_now)
@@ -406,7 +405,6 @@ def build_weekly_report() -> str:
                  f"Внёс {rub(net)} → сейчас {rub(value_now)}\n")
     else:
         text += f"💰 <b>Сейчас на счёте: {rub(value_now)}</b>\n"
-    text += f"За неделю: {'+' if week_delta >= 0 else ''}{rub(week_delta)} ({pct(week_delta / week_base * 100 if week_base else 0)})\n"
     if cash >= 1000:
         text += f"Свободные деньги {rub(cash)}: можно вложить\n"
 
