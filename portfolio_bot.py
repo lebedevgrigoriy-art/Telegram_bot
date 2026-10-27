@@ -2,11 +2,11 @@
 Бот портфеля ИИС (Т-Инвестиции).
 
 Что делает:
-  • понедельник 10:00 — сверка портфеля: количество, средняя цена покупки, текущая цена,
+  • понедельник 10:00: сверка портфеля: количество, средняя цена покупки, текущая цена,
     изменение за неделю, прибыль/убыток;
-  • каждые 15 минут во время торгов — алерт, если бумага ушла больше чем на 5% от вчерашнего закрытия;
-  • 1-го числа 10:00 — календарь купонов и погашений на месяц с суммами;
-  • 1-го числа сразу после календаря — разбор эмитентов: новости, отчёты, Смартлаб, риск дефолта.
+  • каждые 15 минут во время торгов: алерт, если бумага ушла больше чем на 5% от вчерашнего закрытия;
+  • 1-го числа 10:00: календарь купонов и погашений на месяц с суммами;
+  • 1-го числа сразу после календаря: разбор эмитентов: новости, отчёты, Смартлаб, риск дефолта.
 
 Источники: T-Invest API (токен только для чтения), Мосбиржа (купоны и погашения),
 Смартлаб (страница облигации и форум эмитента), Gemini с поиском Google (новости и анализ).
@@ -127,10 +127,6 @@ def pct(x: float) -> str:
     return f"{sign}{abs(x):.1f}%".replace(".", ",")
 
 
-def dot(x: float) -> str:
-    return "🟢" if x > 0.05 else ("🔴" if x < -0.05 else "⚪")
-
-
 def esc(s) -> str:
     return html.escape(str(s or ""))
 
@@ -227,28 +223,6 @@ def get_positions() -> tuple[list, float]:
     return positions, cash
 
 
-def week_change(uid: str) -> float | None:
-    """Изменение цены за неделю в % по дневным свечам."""
-    now = datetime.utcnow()
-    try:
-        candles = tapi("MarketDataService/GetCandles", {
-            "instrumentId": uid,
-            "from": (now - timedelta(days=12)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "to": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "interval": "CANDLE_INTERVAL_DAY",
-        }).get("candles", [])
-    except Exception as e:
-        logger.error(f"week_change {uid}: {e}")
-        return None
-    if len(candles) < 2:
-        return None
-    week_ago = (now - timedelta(days=7)).strftime("%Y-%m-%d")
-    old = [c for c in candles if c.get("time", "")[:10] <= week_ago]
-    base = _q((old[-1] if old else candles[0]).get("close"))
-    last = _q(candles[-1].get("close"))
-    return (last / base - 1) * 100 if base else None
-
-
 # =====================
 # 1. ЕЖЕНЕДЕЛЬНАЯ СВЕРКА
 # =====================
@@ -275,41 +249,33 @@ def coupon_rate(ticker: str) -> float | None:
     return value * 365 / period
 
 
-def redemption_info(ticker: str) -> tuple[float, float] | None:
-    """Сколько вернут при погашении на одну облигацию (оставшийся номинал) и через сколько лет."""
-    try:
-        _, amorts = moex_bondization(ticker)
-    except Exception:
-        return None
-    today = datetime.now(MOSCOW).strftime("%Y-%m-%d")
-    future = [(d, v) for d, v in amorts if d and d >= today and v]
-    if not future:
-        return None
-    face = sum(v for _, v in future)
-    # средневзвешенный срок возврата номинала (для амортизации учитывает частичные погашения)
-    years = sum(v * (datetime.strptime(d, "%Y-%m-%d") - datetime.strptime(today, "%Y-%m-%d")).days
-                for d, v in future) / face / 365.25
-    # меньше года не растягиваем: иначе разница с номиналом за пару недель даёт абсурдные сотни процентов
-    return face, max(years, 1.0)
-
-
 DEPOSIT_TYPES = {"OPERATION_TYPE_INPUT", "OPERATION_TYPE_INPUT_SWIFT", "OPERATION_TYPE_INPUT_ACQUIRING",
                  "OPERATION_TYPE_INP_MULTI"}
 WITHDRAW_TYPES = {"OPERATION_TYPE_OUTPUT", "OPERATION_TYPE_OUTPUT_SWIFT", "OPERATION_TYPE_OUTPUT_ACQUIRING",
                   "OPERATION_TYPE_OUT_MULTI"}
 
 
-def money_flows() -> list[tuple[datetime, float]]:
-    """Все пополнения (минус) и выводы (плюс) ИИС за всю историю счёта."""
+def all_operations() -> list:
+    """Все исполненные операции ИИС за всю историю счёта."""
     acc_id = get_account_id()
     opened = next((a.get("openedDate") for a in get_accounts() if a.get("id") == acc_id), None)
     start = (opened or "2015-01-01T00:00:00Z")[:10]
-    ops = tapi("OperationsService/GetOperations", {
+    return tapi("OperationsService/GetOperations", {
         "accountId": acc_id,
         "from": f"{start}T00:00:00Z",
         "to": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "state": "OPERATION_STATE_EXECUTED",
     }).get("operations", [])
+
+
+def _op_day(o) -> datetime:
+    return datetime.strptime(o.get("date", "")[:10], "%Y-%m-%d")
+
+
+def money_flows(ops: list | None = None) -> list[tuple[datetime, float]]:
+    """Все пополнения (минус) и выводы (плюс) ИИС за всю историю счёта."""
+    if ops is None:
+        ops = all_operations()
     flows = []
     for o in ops:
         t = o.get("operationType")
@@ -341,10 +307,10 @@ def xirr(flows: list[tuple[datetime, float]]) -> float | None:
     return (lo + hi) / 2 * 100
 
 
-def fact_result(value_now: float) -> tuple[float, float, float | None] | None:
+def fact_result(value_now: float, ops: list | None = None) -> tuple[float, float, float | None] | None:
     """(внесено чистыми, результат ₽, % годовых) по всей истории пополнений ИИС."""
     try:
-        flows = money_flows()
+        flows = money_flows(ops)
     except Exception as e:
         logger.error(f"money_flows: {e}")
         return None
@@ -353,6 +319,92 @@ def fact_result(value_now: float) -> tuple[float, float, float | None] | None:
         return None
     today = datetime.strptime(datetime.now(MOSCOW).strftime("%Y-%m-%d"), "%Y-%m-%d")
     return net, value_now - net, xirr(flows + [(today, value_now)])
+
+
+COUPON_TYPES = {"OPERATION_TYPE_COUPON"}
+COUPON_TAX_TYPES = {"OPERATION_TYPE_BOND_TAX", "OPERATION_TYPE_BOND_TAX_PROGRESSIVE"}
+BUY_TYPES = {"OPERATION_TYPE_BUY", "OPERATION_TYPE_BUY_CARD"}
+
+
+def fact_12m(ops: list) -> dict | None:
+    """Фактическая доходность за последние 12 месяцев:
+    реально пришедшие купоны (за вычетом налога) + заработанное на уже прошедших полных погашениях
+    (выплата минус цена покупки этих бумаг), делённые на среднюю сумму вложенных денег за период."""
+    today = datetime.strptime(datetime.now(MOSCOW).strftime("%Y-%m-%d"), "%Y-%m-%d")
+    start = today - timedelta(days=365)
+    flows = money_flows(ops)
+    if not flows:
+        return None
+    period_start = max(start, flows[0][0])
+    days = (today - period_start).days
+    if days < 7:
+        return None
+
+    coupons = sum(_q(o.get("payment")) for o in ops
+                  if o.get("operationType") in COUPON_TYPES and _op_day(o) >= period_start)
+    coupons += sum(_q(o.get("payment")) for o in ops   # налог приходит с минусом
+                   if o.get("operationType") in COUPON_TAX_TYPES and _op_day(o) >= period_start)
+
+    # средняя цена покупки по каждой бумаге (для прибыли на погашении)
+    bought = {}
+    for o in ops:
+        if o.get("operationType") in BUY_TYPES and int(o.get("quantity") or 0):
+            q, cost = bought.get(o.get("figi"), (0, 0.0))
+            bought[o.get("figi")] = (q + int(o["quantity"]), cost + abs(_q(o.get("payment"))))
+    redemption_gain = 0.0
+    for o in ops:
+        if o.get("operationType") == "OPERATION_TYPE_BOND_REPAYMENT_FULL" and _op_day(o) >= period_start:
+            q_b, cost = bought.get(o.get("figi"), (0, 0.0))
+            qty = int(o.get("quantity") or 0) or q_b
+            if q_b:
+                redemption_gain += abs(_q(o.get("payment"))) - cost / q_b * qty
+
+    # сколько денег в среднем было вложено за период (по дням)
+    total = 0.0
+    for i in range(days):
+        day = period_start + timedelta(days=i)
+        total += -sum(a for d, a in flows if d <= day)
+    avg_invested = total / days
+    if avg_invested <= 0:
+        return None
+    k = 365 / days   # если счёту меньше года, приводим к году
+    return {
+        "coupons": coupons,
+        "gain": redemption_gain,
+        "coupon_pct": coupons / avg_invested * 100 * k,
+        "gain_pct": redemption_gain / avg_invested * 100 * k,
+        "months": round(days / 30.4),
+    }
+
+
+def bond_cashflows(ticker: str, qty: float) -> list[tuple[datetime, float]]:
+    """Будущие купоны и погашения по бумаге на всё её количество. Необъявленные купоны по последнему известному."""
+    coupons, amorts = moex_bondization(ticker)
+    today = datetime.now(MOSCOW).strftime("%Y-%m-%d")
+    flows, last = [], None
+    for d, v in sorted((d, v) for d, v in coupons if d):
+        if v:
+            last = v
+        if d > today and (v or last):
+            flows.append((datetime.strptime(d, "%Y-%m-%d"), (v or last) * qty))
+    for d, v in amorts:
+        if d and d > today and v:
+            flows.append((datetime.strptime(d, "%Y-%m-%d"), v * qty))
+    return flows
+
+
+def forward_yield(items: list[tuple[str, float, float]]) -> float | None:
+    """Доходность, если держать все бумаги до погашения: заплатил свою цену покупки сегодня,
+    дальше получаешь все купоны и номинал. items = [(тикер, количество, средняя цена)]."""
+    today = datetime.strptime(datetime.now(MOSCOW).strftime("%Y-%m-%d"), "%Y-%m-%d")
+    flows = [(today, -sum(q * avg for _, q, avg in items))]
+    try:
+        for ticker, q, _ in items:
+            flows += bond_cashflows(ticker, q)
+    except Exception as e:
+        logger.error(f"forward_yield: {e}")
+        return None
+    return xirr(sorted(flows)) if len(flows) > 1 else None
 
 
 def num(x: float) -> str:
@@ -364,39 +416,49 @@ def build_weekly_report() -> str:
     positions, cash = get_positions()
     if not positions:
         return "💼 В портфеле пока нет бумаг."
-    year_income = bonds_value = bonds_cost = year_full = 0.0
+    year_income = bonds_value = 0.0
+    held = []   # (тикер, количество, средняя цена) облигаций для форвардной доходности
 
     cards = []
     for p in positions:
-        value = p["qty"] * p["cur"]
         head = f"<b>{esc(p['name'])}</b> · {p['qty']:g} шт"
         body = [f"Куплено по {price(p['avg'])} · сейчас {price(p['cur'])}"]
         if p["type"] == "bond":
-            annual = coupon_rate(p["ticker"])
             try:
                 dates = [d for d, v in moex_bondization(p["ticker"])[1] if d]
                 if dates:
                     head += " · до " + datetime.strptime(max(dates), "%Y-%m-%d").strftime("%m.%Y")
             except Exception:
                 pass
-            if annual and p["avg"] and p["cur"]:
+            annual = coupon_rate(p["ticker"])
+            parts = []
+            if annual and p["avg"]:
+                parts.append(f"купон {num(annual / p['avg'] * 100)}% к вложенным")
+            if p["avg"]:
+                held.append((p["ticker"], p["qty"], p["avg"]))
+                fy = forward_yield([(p["ticker"], 1, p["avg"])])
+                if fy is not None:
+                    parts.append(f"до погашения <b>{num(fy)}%</b>")
+            if annual and p["cur"]:
                 year_income += annual * p["qty"]
-                bonds_value += value
-                bonds_cost += p["avg"] * p["qty"]
-                red = redemption_info(p["ticker"])
-                # с погашением: купоны + разница между номиналом и ценой покупки, растянутая на годы до погашения
-                full = annual + ((red[0] - p["avg"]) / red[1] if red else 0)
-                year_full += full * p["qty"]
-                body.append(f"Купоны <b>{num(annual / p['avg'] * 100)}%</b>"
-                            + (f" · с погашением {num(full / p['avg'] * 100)}%" if red else "")
-                            + f" · к цене {num(annual / p['cur'] * 100)}%")
+                bonds_value += p["qty"] * p["cur"]
+                parts.append(f"к цене {num(annual / p['cur'] * 100)}%")
+            if parts:
+                line = " · ".join(parts)
+                body.append(line[0].upper() + line[1:])
         cards.append(head + "\n" + "\n".join(body))
+
+    try:
+        ops = all_operations()
+    except Exception as e:
+        logger.error(f"operations: {e}")
+        ops = None
 
     # стоимость счёта целиком: бумаги + НКД + свободные деньги
     value_now = sum(p["qty"] * (p["cur"] + p["nkd"]) for p in positions) + cash
     text = f"💼 <b>Сверка ИИС · {datetime.now(TIMEZONE).strftime('%d.%m.%Y')}</b>\n"
 
-    fr = fact_result(value_now)
+    fr = fact_result(value_now, ops) if ops is not None else None
     text += "\n💰 <b>Результат за всё время</b>\n"
     if fr:
         net, result, yearly = fr
@@ -408,15 +470,21 @@ def build_weekly_report() -> str:
     if cash >= 1000:
         text += f"Свободные деньги {rub(cash)}: можно вложить\n"
 
-    if bonds_cost:
-        y_cost = year_income / bonds_cost * 100
-        text += (
-            "\n🎟 <b>Доходность облигаций, годовых</b>\n"
-            f"▫️ Купоны к вложенным: <b>{num(y_cost)}%</b> {'✅' if y_cost >= 20 else '⏳'} цель 20%\n"
-            f"▫️ С учётом погашения: {num(year_full / bonds_cost * 100)}%\n"
-            f"▫️ К текущей цене: {num(year_income / bonds_value * 100)}%\n"
-            f"💵 Купоны ≈ <b>{rub(year_income / 12)}</b> в месяц\n"
-        )
+    text += "\n🎟 <b>Доходность облигаций, годовых</b>\n"
+    f12 = fact_12m(ops) if ops else None
+    if f12:
+        period = "12 мес" if f12["months"] >= 12 else f"{f12['months']} мес, в пересчёте на год"
+        total_pct = f12["coupon_pct"] + f12["gain_pct"]
+        text += (f"📌 <b>Факт за {period}: {num(total_pct)}%</b>\n"
+                 f"    купоны {num(f12['coupon_pct'])}% {'✅' if f12['coupon_pct'] >= 20 else '⏳'} цель 20%"
+                 f" · погашения {num(f12['gain_pct'])}%\n")
+    fw = forward_yield(held) if held else None
+    if fw is not None:
+        text += f"🔭 Если держать всё до погашения: <b>{num(fw)}%</b>\n"
+    if bonds_value:
+        text += f"📊 К текущей цене, как на Смартлабе: {num(year_income / bonds_value * 100)}%\n"
+    if f12:
+        text += f"💵 Пришло купонов: {rub(f12['coupons'])} (≈ {rub(f12['coupons'] / max(f12['months'], 1))} в месяц)\n"
     return text + "\n📄 <b>Бумаги</b>\n\n" + "\n\n".join(cards)
 
 
@@ -851,7 +919,7 @@ def smartlab_bond(isin_or_secid: str) -> dict:
         start = text.find("стоит сейчас")
         end = text.find("Календарь выплаты")
         if start != -1:
-            line_start = text.rfind("\n", 0, start) + 1   # с начала фразы «Облигация ... стоит сейчас»
+            line_start = text.rfind("\n", 0, start) + 1   # с начала фразы "Облигация ... стоит сейчас"
             out["facts"] = text[line_start: end if end > start else start + 1500][:1500]
     except Exception as e:
         logger.error(f"smartlab_bond {isin_or_secid}: {e}")
@@ -933,7 +1001,8 @@ def analyze_issuer(g: dict) -> tuple[str, str]:
     forum = smartlab_forum(g["forum_url"]) if g["forum_url"] else ""
     prompt = (
         f"Сегодня {today.strftime('%d.%m.%Y')}. Ты аналитик долгового рынка РФ. "
-        f"Сделай ежемесячный разбор эмитента «{g['issuer']}» для частного инвестора, "
+        f"Сделай ежемесячный разбор эмитента {g['issuer']} для частного инвестора. "
+        "Не используй длинные тире и кавычки-ёлочки. "
         "который держит его облигации на ИИС до погашения.\n\n"
         f"Облигации в портфеле:\n{bonds_txt}\n\n"
         + (f"Последние сообщения с форума эмитента на Смартлабе ({g['forum_url']}):\n{forum}\n\n" if forum else "")
@@ -953,7 +1022,8 @@ def analyze_issuer(g: dict) -> tuple[str, str]:
     text = ask_gemini_grounded(prompt)
     if not text:
         return f"🏢 {g['issuer']}\nНе удалось получить разбор, попробую в следующий раз.", ""
-    text = text.replace("**", "").replace("##", "")
+    text = (text.replace("**", "").replace("##", "")
+            .replace(" — ", ": ").replace("—", "-").replace("«", '"').replace("»", '"'))
     m = RISK_RE.search(text)
     risk = m.group(1).lower() if m else ""
     return f"🏢 {g['issuer'].upper()} {RISK_ICON.get(risk, '')}\n\n{text}", risk
@@ -1023,22 +1093,22 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "💼 Бот портфеля ИИС\n\n"
         "Сам присылаю:\n"
-        "• по понедельникам в 10:00 — сверку портфеля\n"
-        f"• во время торгов — алерт, если бумага ушла больше чем на {ALERT_THRESHOLD:g}% за день\n"
-        "• в день купона или погашения — сколько пришло и покупать сразу или подождать неделю\n"
-        "• за 2 недели до погашения — сколько вернётся\n"
-        "• 12 апреля и 12 октября — напоминание обновить топ-5\n"
-        "• 1-го числа — календарь купонов, купоны на год вперёд и разбор эмитентов\n\n"
+        "• по понедельникам в 10:00: сверку портфеля\n"
+        f"• во время торгов: алерт, если бумага ушла больше чем на {ALERT_THRESHOLD:g}% за день\n"
+        "• в день купона или погашения: сколько пришло и покупать сразу или подождать неделю\n"
+        "• за 2 недели до погашения: сколько вернётся\n"
+        "• 12 апреля и 12 октября: напоминание обновить топ-5\n"
+        "• 1-го числа: календарь купонов, купоны на год вперёд и разбор эмитентов\n\n"
         "Команды:\n"
-        "/accounts — какие счета видит бот\n"
-        "/portfolio — сверка портфеля сейчас\n"
-        "/coupons — выплаты в этом месяце\n"
-        "/coupons_next — выплаты в следующем месяце\n"
-        "/check — проверить резкие движения сейчас\n"
-        "/payday — выплаты сегодня и до конца месяца\n"
-        "/income — купоны на 12 месяцев вперёд\n"
-        "/queue — что сейчас набираешь до 50 шт\n"
-        "/issuers — разбор эмитентов сейчас (несколько минут)"
+        "/accounts: какие счета видит бот\n"
+        "/portfolio: сверка портфеля сейчас\n"
+        "/coupons: выплаты в этом месяце\n"
+        "/coupons_next: выплаты в следующем месяце\n"
+        "/check: проверить резкие движения сейчас\n"
+        "/payday: выплаты сегодня и до конца месяца\n"
+        "/income: купоны на 12 месяцев вперёд\n"
+        "/queue: что сейчас набираешь до 50 шт\n"
+        "/issuers: разбор эмитентов сейчас (несколько минут)"
     )
 
 
