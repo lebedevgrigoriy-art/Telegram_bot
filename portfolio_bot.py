@@ -40,6 +40,9 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 MY_CHAT_ID = int(os.environ.get("MY_CHAT_ID") or 0)
 
 ALERT_THRESHOLD = 5.0          # % движения цены для алерта
+BUY_TARGET = 50                # набираем бумагу до 50 шт, потом переходим к следующей
+# Очередь покупок: ISIN или коды бумаг через запятую, в порядке покупки (Railway → BUY_QUEUE)
+BUY_QUEUE = [x.strip() for x in os.environ.get("BUY_QUEUE", "").replace(";", ",").split(",") if x.strip()]
 TINVEST_URL = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1."
 UA = {"User-Agent": "Mozilla/5.0 (portfolio-bot)"}
 
@@ -251,6 +254,28 @@ def week_change(uid: str) -> float | None:
 # 1. ЕЖЕНЕДЕЛЬНАЯ СВЕРКА
 # =====================
 
+def coupon_rate(ticker: str) -> float | None:
+    """Годовой купон на одну облигацию, ₽: ближайший известный купон × число выплат в год."""
+    try:
+        coupons, _ = moex_bondization(ticker)
+    except Exception as e:
+        logger.error(f"coupon_rate {ticker}: {e}")
+        return None
+    dated = sorted((d, v) for d, v in coupons if d)
+    if len(dated) < 2:
+        return None
+    today = datetime.now(MOSCOW).strftime("%Y-%m-%d")
+    future_known = [v for d, v in dated if d >= today and v]
+    past_known = [v for d, v in dated if d < today and v]
+    value = (future_known or past_known[-1:] or [None])[0]
+    if not value:
+        return None
+    days = [(datetime.strptime(b, "%Y-%m-%d") - datetime.strptime(a, "%Y-%m-%d")).days
+            for (a, _), (b, _) in zip(dated, dated[1:])]
+    period = sorted(days)[len(days) // 2] or 182   # медиана купонного периода в днях
+    return value * 365 / period
+
+
 def build_weekly_report() -> str:
     positions, cash = get_positions()
     if not positions:
@@ -258,6 +283,7 @@ def build_weekly_report() -> str:
     total = sum(p["qty"] * p["cur"] for p in positions)
     total_pnl = sum(p["pnl"] for p in positions)
     week_delta = 0.0
+    year_income = bonds_value = bonds_cost = 0.0
 
     lines = []
     for p in positions:
@@ -267,10 +293,21 @@ def build_weekly_report() -> str:
             week_delta += value - value / (1 + wc / 100)
         pnl_pct = (p["cur"] / p["avg"] - 1) * 100 if p["avg"] else 0
         week_txt = f"за неделю {pct(wc)}" if wc is not None else "за неделю нет данных"
+        coupon_txt = ""
+        if p["type"] == "bond":
+            annual = coupon_rate(p["ticker"])
+            if annual and p["cur"]:
+                year_income += annual * p["qty"]
+                bonds_value += value
+                bonds_cost += p["avg"] * p["qty"]
+                coupon_txt = f"\n🎟 купонная доходность {pct(annual / p['cur'] * 100)[1:]} годовых"
+            else:
+                coupon_txt = "\n🎟 купонная доходность: нет данных"
         lines.append(
             f"{dot(wc or 0)} <b>{esc(p['name'])}</b>\n"
             f"{p['qty']:g} шт · средняя {price(p['avg'])} · сейчас {price(p['cur'])}\n"
             f"{week_txt} · итог {rub(p['pnl'])} ({pct(pnl_pct)})"
+            + coupon_txt
         )
 
     now = datetime.now(TIMEZONE).strftime("%d.%m.%Y")
@@ -282,6 +319,15 @@ def build_weekly_report() -> str:
         f"Прибыль/убыток за всё время: {rub(total_pnl)}\n"
         + (f"Свободные деньги: {rub(cash)}\n" if cash >= 1 else "")
     )
+    if bonds_value:
+        y_now = year_income / bonds_value * 100
+        y_cost = year_income / bonds_cost * 100 if bonds_cost else 0
+        header += (
+            f"\n🎟 <b>Купонная доходность портфеля: {pct(y_now)[1:]} годовых</b> "
+            f"{'✅' if y_now >= 20 else '⏳'} цель 20%\n"
+            f"К вложенным деньгам: {pct(y_cost)[1:]}\n"
+            f"Купонов за год ≈ {rub(year_income)} (≈ {rub(year_income / 12)} в месяц)\n"
+        )
     return header + "\n" + "\n\n".join(lines)
 
 
@@ -328,8 +374,20 @@ def check_moves(force: bool = False) -> list[str]:
 # 3. КУПОНЫ И ПОГАШЕНИЯ
 # =====================
 
+_moex_cache = {}
+
+
 def moex_bondization(secid: str) -> tuple[list, list]:
-    """Купоны и погашения с Мосбиржи: [(date, value_rub|None)], [(date, value_rub|None)]."""
+    """Купоны и погашения с Мосбиржи: [(date, value_rub|None)], [(date, value_rub|None)]. Кэш на день."""
+    key = (secid, datetime.now(MOSCOW).strftime("%Y-%m-%d"))
+    if key not in _moex_cache:
+        if len(_moex_cache) > 200:
+            _moex_cache.clear()
+        _moex_cache[key] = _moex_bondization(secid)
+    return _moex_cache[key]
+
+
+def _moex_bondization(secid: str) -> tuple[list, list]:
     resp = requests.get(
         f"https://iss.moex.com/iss/securities/{secid}/bondization.json",
         params={"iss.meta": "off", "iss.only": "coupons,amortizations", "limit": "unlimited"},
@@ -360,19 +418,11 @@ def tapi_coupons(uid: str, start: datetime, end: datetime) -> list:
     return [(e.get("couponDate", "")[:10], _q(e.get("payOneBond")) or None) for e in events]
 
 
-def build_coupon_calendar(month_shift: int = 0) -> str:
-    today = datetime.now(MOSCOW)
-    first = today.replace(day=1)
-    for _ in range(month_shift):
-        first = (first + timedelta(days=32)).replace(day=1)
-    last = (first + timedelta(days=32)).replace(day=1) - timedelta(days=1)
-    m_from, m_to = first.strftime("%Y-%m-%d"), last.strftime("%Y-%m-%d")
-
+def collect_payments(d_from: str, d_to: str) -> tuple[list, list, list]:
+    """Купоны и погашения по облигациям портфеля в интервале дат (YYYY-MM-DD, по Москве).
+    Возвращает (events, unknown, failed): events = [(дата, значок, бумага, сумма, пояснение)]."""
     positions, _ = get_positions()
     bonds = [p for p in positions if p["type"] == "bond"]
-    if not bonds:
-        return "📅 В портфеле нет облигаций."
-
     events, unknown, failed = [], [], []
     for b in bonds:
         try:
@@ -382,7 +432,8 @@ def build_coupon_calendar(month_shift: int = 0) -> str:
         except Exception as e:
             logger.warning(f"MOEX {b['ticker']}: {e}, беру купоны из T-Invest")
             try:
-                coupons = tapi_coupons(b["uid"], first, last)
+                coupons = tapi_coupons(b["uid"], datetime.strptime(d_from, "%Y-%m-%d"),
+                                       datetime.strptime(d_to, "%Y-%m-%d"))
                 bond = tapi("InstrumentsService/BondBy",
                             {"idType": "INSTRUMENT_ID_TYPE_UID", "id": b["uid"]}).get("instrument", {})
                 maturity = (bond.get("maturityDate") or "")[:10] or None
@@ -392,32 +443,305 @@ def build_coupon_calendar(month_shift: int = 0) -> str:
                 failed.append(b["name"])
                 continue
         for d, v in coupons:
-            if d and m_from <= d <= m_to:
+            if d and d_from <= d <= d_to:
                 if v is None:
                     unknown.append((d, b["name"]))
                 else:
                     events.append((d, "💰", b["name"], v * b["qty"], f"купон {price(v)} × {b['qty']:g}"))
         for d, v in amorts:
-            if d and m_from <= d <= m_to and v:
+            if d and d_from <= d <= d_to and v:
                 icon, kind = ("🏁", "погашение") if d == maturity else ("🧩", "амортизация")
                 events.append((d, icon, b["name"], v * b["qty"], f"{kind} {price(v)} × {b['qty']:g}"))
+    events.sort()
+    unknown.sort()
+    return events, unknown, failed
+
+
+def _dm(d: str) -> str:
+    return datetime.strptime(d, "%Y-%m-%d").strftime("%d.%m")
+
+
+def _event_lines(events: list, with_date: bool = True) -> str:
+    return "\n".join(
+        (f"{_dm(d)} " if with_date else "") + f"{icon} <b>{esc(n)}</b>: {rub(s)}\n      {esc(note)}"
+        for d, icon, n, s, note in events)
+
+
+def build_coupon_calendar(month_shift: int = 0) -> str:
+    today = datetime.now(MOSCOW)
+    first = today.replace(day=1)
+    for _ in range(month_shift):
+        first = (first + timedelta(days=32)).replace(day=1)
+    last = (first + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+
+    events, unknown, failed = collect_payments(first.strftime("%Y-%m-%d"), last.strftime("%Y-%m-%d"))
 
     title = f"📅 <b>Купоны и погашения: {MONTHS[first.month]} {first.year}</b>\n"
     if not events and not unknown:
         text = title + "\nВ этом месяце выплат нет."
     else:
-        events.sort()
-        lines = [f"{datetime.strptime(d, '%Y-%m-%d').strftime('%d.%m')} {icon} <b>{esc(n)}</b>: "
-                 f"{rub(s)}\n      {esc(note)}" for d, icon, n, s, note in events]
         total = sum(e[3] for e in events)
-        text = title + "\n" + "\n".join(lines) + f"\n\n<b>Всего придёт: {rub(total)}</b>"
+        text = title + "\n" + _event_lines(events) + f"\n\n<b>Всего придёт: {rub(total)}</b>"
         if unknown:
             text += "\n\nРазмер купона ещё не объявлен:\n" + "\n".join(
-                f"• {datetime.strptime(d, '%Y-%m-%d').strftime('%d.%m')} {esc(n)}" for d, n in sorted(unknown))
+                f"• {_dm(d)} {esc(n)}" for d, n in unknown)
     if failed:
         text += "\n\n⚠️ Не удалось получить данные: " + esc(", ".join(failed))
     text += "\n\n<i>Суммы по текущему количеству бумаг, до налога, если он удерживается.</i>"
     return text
+
+
+def build_payday_message(force: bool = False) -> str | None:
+    """В день выплаты: что пришло сегодня, что ещё придёт, покупать сейчас или подождать.
+    Правило Григория: если в ближайшую неделю выплат больше нет, покупать сразу;
+    если следующая выплата в пределах недели, подождать и купить на всю сумму."""
+    now = datetime.now(MOSCOW)
+    today = now.strftime("%Y-%m-%d")
+    month_end = ((now.replace(day=1) + timedelta(days=32)).replace(day=1) - timedelta(days=1))
+    week_end = now + timedelta(days=7)
+    horizon = max(month_end, week_end).strftime("%Y-%m-%d")
+
+    events, unknown, failed = collect_payments(today, horizon)
+    todays = [e for e in events if e[0] == today]
+    if not todays and not force:
+        return None
+
+    later = [e for e in events if e[0] > today]
+    later_unknown = [u for u in unknown if u[0] > today]
+    week_str = week_end.strftime("%Y-%m-%d")
+    month_str = month_end.strftime("%Y-%m-%d")
+    today_sum = sum(e[3] for e in todays)
+
+    if todays:
+        text = (f"💸 <b>Сегодня выплаты, {now.strftime('%d.%m')}</b>\n\n" + _event_lines(todays, with_date=False)
+                + f"\n\n<b>Сегодня придёт: {rub(today_sum)}</b>")
+    else:
+        text = f"💸 Сегодня, {now.strftime('%d.%m')}, выплат нет."
+
+    in_month = [e for e in later if e[0] <= month_str]
+    after_month = [e for e in later if month_str < e[0] <= week_str]
+    if in_month:
+        text += f"\n\n📅 <b>Ещё в этом месяце: {rub(sum(e[3] for e in in_month))}</b>\n" + _event_lines(in_month)
+    else:
+        text += "\n\n📅 В этом месяце больше выплат нет."
+    if after_month:
+        text += "\n\n🗓 <b>В начале следующего месяца (в пределах недели):</b>\n" + _event_lines(after_month)
+    if later_unknown:
+        text += "\n\nРазмер купона ещё не объявлен:\n" + "\n".join(
+            f"• {_dm(d)} {esc(n)}" for d, n in later_unknown)
+
+    # Покупать сейчас или подождать неделю
+    week = [e for e in later if e[0] <= week_str]
+    week_unknown = [u for u in later_unknown if u[0] <= week_str]
+    if todays:
+        if week or week_unknown:
+            last_day = max([e[0] for e in week] + [u[0] for u in week_unknown])
+            week_sum = sum(e[3] for e in week)
+            parts = []
+            if week_sum:
+                parts.append(rub(week_sum))
+            if week_unknown:
+                parts.append("купон, сумма которого ещё не объявлена")
+            text += (f"\n\n⏳ <b>Можно подождать до {_dm(last_day)}</b>: в ближайшую неделю придёт ещё "
+                     + " и ".join(parts) + f". Тогда купишь сразу на {rub(today_sum + week_sum)}"
+                     + (" и больше" if week_unknown else "") + ".")
+            buy_amount = today_sum + week_sum
+        else:
+            text += f"\n\n🛒 <b>В ближайшую неделю выплат больше нет: можно покупать сразу на {rub(today_sum)}.</b>"
+            buy_amount = today_sum
+        try:
+            text += "\n\n" + build_buy_hint(buy_amount)
+        except Exception as e:
+            logger.error(f"buy hint: {e}")
+    if failed:
+        text += "\n\n⚠️ Не удалось получить данные: " + esc(", ".join(failed))
+    text += "\n\n<i>Деньги приходят на ИИС в течение дня. Суммы до налога, если он удерживается.</i>"
+    return text
+
+
+# ---------- Очередь покупок ----------
+
+def moex_find(query: str) -> dict | None:
+    """Ищет облигацию на Мосбирже по ISIN, коду или названию: {secid, name, isin}."""
+    try:
+        resp = requests.get("https://iss.moex.com/iss/securities.json",
+                            params={"q": query, "iss.meta": "off", "limit": 20,
+                                    "securities.columns": "secid,shortname,isin,group"},
+                            headers=UA, timeout=20, verify=CA_BUNDLE)
+        t = resp.json().get("securities", {})
+        rows = [dict(zip(t.get("columns", []), r)) for r in t.get("data", [])]
+        bonds = [r for r in rows if "bond" in (r.get("group") or "")]
+        exact = [r for r in bonds if query.upper() in (str(r.get("isin")).upper(), str(r.get("secid")).upper())]
+        r = (exact or bonds or [None])[0]
+        return {"secid": r["secid"], "name": r["shortname"], "isin": r["isin"]} if r else None
+    except Exception as e:
+        logger.error(f"moex_find {query}: {e}")
+        return None
+
+
+def moex_bond_price(secid: str) -> float | None:
+    """Цена одной облигации в рублях с НКД: (последняя цена или вчерашнее закрытие) × номинал + НКД."""
+    try:
+        resp = requests.get(
+            f"https://iss.moex.com/iss/engines/stock/markets/bonds/securities/{secid}.json",
+            params={"iss.meta": "off", "iss.only": "securities,marketdata",
+                    "securities.columns": "BOARDID,FACEVALUE,ACCRUEDINT,PREVPRICE",
+                    "marketdata.columns": "BOARDID,LAST"},
+            headers=UA, timeout=20, verify=CA_BUNDLE)
+        data = resp.json()
+        sec = [dict(zip(data["securities"]["columns"], r)) for r in data["securities"]["data"]]
+        md = {r[0]: r[1] for r in data["marketdata"]["data"]}
+        for row in sec:
+            pr = md.get(row["BOARDID"]) or row.get("PREVPRICE")
+            if pr and row.get("FACEVALUE"):
+                return pr / 100 * row["FACEVALUE"] + (row.get("ACCRUEDINT") or 0)
+    except Exception as e:
+        logger.error(f"moex_bond_price {secid}: {e}")
+    return None
+
+
+def buy_queue_status(positions: list) -> list[dict]:
+    """Очередь покупок с текущим количеством: [{query, name, secid, qty}]."""
+    out = []
+    for q in BUY_QUEUE:
+        held = next((p for p in positions if q.upper() in (p["ticker"].upper(), (p["isin"] or "").upper())), None)
+        if held:
+            out.append({"query": q, "name": held["name"], "secid": held["ticker"], "qty": held["qty"]})
+            continue
+        found = moex_find(q)
+        out.append({"query": q, "name": found["name"] if found else q,
+                    "secid": found["secid"] if found else q, "qty": 0})
+    return out
+
+
+def build_buy_hint(amount: float | None, positions: list | None = None) -> str:
+    """Что сейчас покупать по правилу: одна бумага до 50 шт, потом следующая."""
+    if not BUY_QUEUE:
+        return ("🛒 Очередь покупок не задана. Добавь в Railway переменную BUY_QUEUE: "
+                "ISIN бумаг через запятую в порядке покупки.")
+    if positions is None:
+        positions, _ = get_positions()
+    queue = buy_queue_status(positions)
+    idx = next((i for i, b in enumerate(queue) if b["qty"] < BUY_TARGET), None)
+    if idx is None:
+        return f"✅ Все бумаги из очереди набраны до {BUY_TARGET} шт: пора обновить очередь BUY_QUEUE."
+    cur = queue[idx]
+    need = BUY_TARGET - cur["qty"]
+    one = moex_bond_price(cur["secid"])
+    lines = [f"🛒 <b>Сейчас набираешь: {esc(cur['name'])}</b>",
+             f"У тебя {cur['qty']:g} из {BUY_TARGET} шт, осталось {need:g} шт"
+             + (f" ≈ {rub(need * one)}" if one else "")]
+    if one and amount:
+        n = int(amount // one)
+        lines.append(f"На {rub(amount)} хватит на <b>{n} шт</b> (одна ≈ {price(one)} с НКД)")
+    elif not one:
+        lines.append("Цену сейчас получить не удалось")
+    if idx + 1 < len(queue):
+        lines.append(f"Следующая в очереди: {esc(queue[idx + 1]['name'])}")
+    return "\n".join(lines)
+
+
+# ---------- Купоны на год вперёд ----------
+
+def build_income_forecast() -> str:
+    """Купоны по месяцам на 12 месяцев вперёд. Необъявленные купоны считаем по последнему известному."""
+    now = datetime.now(MOSCOW)
+    d_from, d_to = now.strftime("%Y-%m-%d"), (now + timedelta(days=365)).strftime("%Y-%m-%d")
+    positions, _ = get_positions()
+    bonds = [p for p in positions if p["type"] == "bond"]
+    months, redemptions, estimated, failed = {}, 0.0, False, []
+    for b in bonds:
+        try:
+            coupons, amorts = moex_bondization(b["ticker"])
+        except Exception:
+            failed.append(b["name"])
+            continue
+        last_known = None
+        for d, v in sorted((d, v) for d, v in coupons if d):
+            if v:
+                last_known = v
+            if d_from <= d <= d_to:
+                val = v or last_known
+                if not v and last_known:
+                    estimated = True
+                if val:
+                    months[d[:7]] = months.get(d[:7], 0) + val * b["qty"]
+        redemptions += sum(v * b["qty"] for d, v in amorts if d and d_from <= d <= d_to and v)
+
+    keys = []
+    y, m = now.year, now.month
+    for _ in range(12):
+        keys.append(f"{y}-{m:02d}")
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    top = max([months.get(k, 0) for k in keys] + [1])
+    short = ["", "янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"]
+    rows = []
+    for k in keys:
+        v = months.get(k, 0)
+        filled = round(v / top * 8)
+        rows.append(f"<code>{short[int(k[5:])]} {k[2:4]} {'▓' * filled}{'░' * (8 - filled)}</code> {rub(v)}")
+    total = sum(months.get(k, 0) for k in keys)
+    text = ("📈 <b>Купоны на 12 месяцев вперёд</b>\n\n" + "\n".join(rows)
+            + f"\n\n<b>Всего за год: {rub(total)} · в среднем {rub(total / 12)} в месяц</b>")
+    if redemptions:
+        text += f"\nПлюс вернётся при погашениях: {rub(redemptions)}"
+    if estimated:
+        text += "\n\n<i>Купоны, размер которых ещё не объявлен, посчитаны по последнему известному.</i>"
+    if failed:
+        text += "\n⚠️ Нет данных: " + esc(", ".join(failed))
+    text += "\n<i>По текущему количеству бумаг: каждая докупка увеличит эти цифры.</i>"
+    return text
+
+
+def build_queue_text() -> str:
+    positions, cash = get_positions()
+    head = "🛒 <b>Очередь покупок</b>\n\n"
+    if BUY_QUEUE:
+        rows = []
+        found_current = False
+        for b in buy_queue_status(positions):
+            if b["qty"] >= BUY_TARGET:
+                mark = "✅"
+            elif not found_current:
+                mark, found_current = "👉", True
+            else:
+                mark = "⏳"
+            rows.append(f"{mark} {esc(b['name'])}: {b['qty']:g} / {BUY_TARGET}")
+        head += "\n".join(rows) + "\n\n"
+    return head + build_buy_hint(cash if cash >= 1 else None, positions) + (
+        f"\n\nСвободные деньги на счёте: {rub(cash)}" if cash >= 1 else "")
+
+
+def build_maturity_message(days_ahead: int = 14) -> str | None:
+    """За 2 недели до погашения: сколько вернётся."""
+    day = (datetime.now(MOSCOW) + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+    events, _, _ = collect_payments(day, day)
+    redemptions = [e for e in events if e[1] == "🏁"]
+    if not redemptions:
+        return None
+    parts = []
+    for d, _, name, total, note in redemptions:
+        coupon = sum(e[3] for e in events if e[1] == "💰" and e[2] == name)
+        parts.append(
+            f"🎉🥳 <b>{esc(name)}</b> погашается {_dm(d)}!\n"
+            f"💵 Вернётся номинал: <b>{rub(total)}</b> ({esc(note.replace('погашение ', ''))})"
+            + (f"\n🎁 И последний купон: {rub(coupon)}" if coupon else "")
+        )
+    grand = sum(e[3] for e in events)
+    return ("🍾 <b>Через 2 недели погашение!</b>\n\n" + "\n\n".join(parts)
+            + f"\n\n💰 Всего придёт {rub(grand)}. Самое время присмотреть, куда вложить 🚀")
+
+
+SCREENING_DAYS = ((4, 12), (10, 12))   # первый скрининг был 12.10.2026, дальше каждые полгода
+
+
+def build_screening_reminder() -> str | None:
+    now = datetime.now(MOSCOW)
+    if (now.month, now.day) not in SCREENING_DAYS:
+        return None
+    return ("📋 <b>Пора обновить топ-5 облигаций на полугодие</b>\n\n"
+            "Полгода прошло: время нового скрининга. После него все взносы и купоны "
+            "следующие 6 месяцев идут в новые 5 бумаг.")
 
 
 # =====================
@@ -623,13 +947,19 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Сам присылаю:\n"
         "• по понедельникам в 10:00 — сверку портфеля\n"
         f"• во время торгов — алерт, если бумага ушла больше чем на {ALERT_THRESHOLD:g}% за день\n"
-        "• 1-го числа — календарь купонов и погашений и разбор эмитентов\n\n"
+        "• в день купона или погашения — сколько пришло и покупать сразу или подождать неделю\n"
+        "• за 2 недели до погашения — сколько вернётся\n"
+        "• 12 апреля и 12 октября — напоминание обновить топ-5\n"
+        "• 1-го числа — календарь купонов, купоны на год вперёд и разбор эмитентов\n\n"
         "Команды:\n"
         "/accounts — какие счета видит бот\n"
         "/portfolio — сверка портфеля сейчас\n"
         "/coupons — выплаты в этом месяце\n"
         "/coupons_next — выплаты в следующем месяце\n"
         "/check — проверить резкие движения сейчас\n"
+        "/payday — выплаты сегодня и до конца месяца\n"
+        "/income — купоны на 12 месяцев вперёд\n"
+        "/queue — очередь покупок: что набираешь сейчас\n"
         "/issuers — разбор эмитентов сейчас (несколько минут)"
     )
 
@@ -671,6 +1001,18 @@ async def coupons_next_command(update, context):
     await _run(update, "📅 Считаю выплаты", build_coupon_calendar, 1)
 
 
+async def income_command(update, context):
+    await _run(update, "📈 Считаю купоны на год", build_income_forecast)
+
+
+async def queue_command(update, context):
+    await _run(update, "🛒 Смотрю очередь", build_queue_text)
+
+
+async def payday_command(update, context):
+    await _run(update, "💸 Смотрю выплаты", build_payday_message, True)
+
+
 async def check_command(update, context):
     if not _mine(update):
         return
@@ -710,6 +1052,19 @@ async def weekly_job(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=MY_CHAT_ID, text=f"⚠️ Сверка портфеля не собралась: {e}"[:1000])
 
 
+async def daily_job(context: ContextTypes.DEFAULT_TYPE):
+    """Каждый день в 10:05: выплаты сегодня, погашения через 2 недели, напоминание о скрининге.
+    Если ничего нет, бот молчит."""
+    for name, func in (("payday", build_payday_message), ("maturity", build_maturity_message),
+                       ("screening", build_screening_reminder)):
+        try:
+            text = await asyncio.to_thread(func)
+            if text:
+                await send_long(context.bot, MY_CHAT_ID, text, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"daily_job {name}: {e}")
+
+
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
     """Каждые 15 минут, но работает только в торговые часы Мосбиржи (будни 10:00–23:50 МСК)."""
     now = datetime.now(MOSCOW)
@@ -730,6 +1085,11 @@ async def monthly_job(context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"monthly coupons: {e}")
         await context.bot.send_message(chat_id=MY_CHAT_ID, text=f"⚠️ Календарь купонов не собрался: {e}"[:1000])
     try:
+        text = await asyncio.to_thread(build_income_forecast)
+        await send_long(context.bot, MY_CHAT_ID, text, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"monthly income: {e}")
+    try:
         await send_issuer_report(context.bot, MY_CHAT_ID)
     except Exception as e:
         logger.error(f"monthly issuers: {e}")
@@ -747,11 +1107,15 @@ async def main() -> list:
     app.add_handler(CommandHandler("coupons", coupons_command))
     app.add_handler(CommandHandler("coupons_next", coupons_next_command))
     app.add_handler(CommandHandler("check", check_command))
+    app.add_handler(CommandHandler("payday", payday_command))
+    app.add_handler(CommandHandler("income", income_command))
+    app.add_handler(CommandHandler("queue", queue_command))
     app.add_handler(CommandHandler("issuers", issuers_command))
 
     jq = app.job_queue
     # run_daily: 0 = воскресенье, 1 = понедельник
     jq.run_daily(weekly_job, time=dtime(hour=10, minute=0, tzinfo=TIMEZONE), days=(1,))
+    jq.run_daily(daily_job, time=dtime(hour=10, minute=5, tzinfo=TIMEZONE))
     jq.run_repeating(alert_job, interval=900, first=120)
     jq.run_monthly(monthly_job, when=dtime(hour=10, minute=0, tzinfo=TIMEZONE), day=1)
     return [app]
