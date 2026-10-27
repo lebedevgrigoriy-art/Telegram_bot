@@ -256,16 +256,54 @@ WITHDRAW_TYPES = {"OPERATION_TYPE_OUTPUT", "OPERATION_TYPE_OUTPUT_SWIFT", "OPERA
 
 
 def all_operations() -> list:
-    """Все исполненные операции ИИС за всю историю счёта."""
+    """Все исполненные операции ИИС за всю историю счёта.
+    Берём через GetOperationsByCursor: там у покупок отдельно указан НКД, который доплачивался продавцу.
+    Приводим к одному виду: operationType, payment, date, figi, quantity, price, accruedInt."""
     acc_id = get_account_id()
     opened = next((a.get("openedDate") for a in get_accounts() if a.get("id") == acc_id), None)
     start = (opened or "2015-01-01T00:00:00Z")[:10]
-    return tapi("OperationsService/GetOperations", {
+    body = {
         "accountId": acc_id,
         "from": f"{start}T00:00:00Z",
         "to": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "state": "OPERATION_STATE_EXECUTED",
-    }).get("operations", [])
+        "limit": 1000,
+        "withoutTrades": True,
+    }
+    try:
+        ops, cursor = [], ""
+        for _ in range(50):   # до 50 000 операций
+            if cursor:
+                body["cursor"] = cursor
+            data = tapi("OperationsService/GetOperationsByCursor", body)
+            for it in data.get("items", []):
+                ops.append({
+                    "operationType": it.get("type"),
+                    "payment": it.get("payment"),
+                    "date": it.get("date", ""),
+                    "figi": it.get("figi", ""),
+                    "quantity": it.get("quantity") or it.get("quantityDone") or 0,
+                    "price": it.get("price"),
+                    "accruedInt": it.get("accruedInt"),
+                })
+            if not data.get("hasNext"):
+                return ops
+            cursor = data.get("nextCursor", "")
+        return ops
+    except Exception as e:
+        logger.warning(f"GetOperationsByCursor не сработал ({e}), беру GetOperations без НКД")
+        return tapi("OperationsService/GetOperations", {k: v for k, v in body.items()
+                                                       if k not in ("limit", "withoutTrades", "cursor")}
+                    ).get("operations", [])
+
+
+def buy_cost(o) -> float:
+    """Сколько стоили сами бумаги в покупке, без доплаты НКД продавцу."""
+    qty = int(o.get("quantity") or 0)
+    pr = _q(o.get("price"))
+    if pr and qty:
+        return pr * qty
+    return abs(_q(o.get("payment"))) - abs(_q(o.get("accruedInt")))
 
 
 def _op_day(o) -> datetime:
@@ -344,13 +382,11 @@ def fact_12m(ops: list) -> dict | None:
                   if o.get("operationType") in COUPON_TYPES and _op_day(o) >= period_start)
     coupons += sum(_q(o.get("payment")) for o in ops   # налог приходит с минусом
                    if o.get("operationType") in COUPON_TAX_TYPES and _op_day(o) >= period_start)
+    # НКД, доплаченный продавцам при покупках: это не доход, а возврат своих же денег в следующем купоне
+    nkd_paid = sum(abs(_q(o.get("accruedInt"))) for o in ops
+                   if o.get("operationType") in BUY_TYPES and _op_day(o) >= period_start)
+    earned = coupons - nkd_paid
 
-    # средняя цена покупки по каждой бумаге (для прибыли на погашении)
-    bought = {}
-    for o in ops:
-        if o.get("operationType") in BUY_TYPES and int(o.get("quantity") or 0):
-            q, cost = bought.get(o.get("figi"), (0, 0.0))
-            bought[o.get("figi")] = (q + int(o["quantity"]), cost + abs(_q(o.get("payment"))))
     redemption_gain = sum(r["gain"] for r in redemptions(ops, period_start))
 
     # сколько денег в среднем было вложено за период (по дням)
@@ -364,8 +400,10 @@ def fact_12m(ops: list) -> dict | None:
     k = 365 / days   # если счёту меньше года, приводим к году
     return {
         "coupons": coupons,
+        "nkd_paid": nkd_paid,
+        "earned": earned,
         "gain": redemption_gain,
-        "coupon_pct": coupons / avg_invested * 100 * k,
+        "coupon_pct": earned / avg_invested * 100 * k,
         "gain_pct": redemption_gain / avg_invested * 100 * k,
         "months": round(days / 30.4),
     }
@@ -382,7 +420,7 @@ def redemptions(ops: list, since: datetime) -> list[dict]:
         f, t = o.get("figi"), o.get("operationType")
         if t in BUY_TYPES and int(o.get("quantity") or 0):
             q, cost = bought.get(f, (0, 0.0))
-            bought[f] = (q + int(o["quantity"]), cost + abs(_q(o.get("payment"))))
+            bought[f] = (q + int(o["quantity"]), cost + buy_cost(o))
         elif t in REPAY_TYPES:
             repaid[f] = repaid.get(f, 0.0) + abs(_q(o.get("payment")))
             if t == "OPERATION_TYPE_BOND_REPAYMENT_FULL":
@@ -523,7 +561,7 @@ def build_weekly_report() -> str:
     f12 = fact_12m(ops) if ops else None
     if f12:
         period = "12 мес" if f12["months"] >= 12 else f"{f12['months']} мес, в пересчёте на год"
-        text += (f"📌 <b>Факт за {period}</b>\n"
+        text += (f"📌 <b>По выплатам за {period}</b>\n"
                  f"▫️ Купоны: <b>{num(f12['coupon_pct'])}%</b> {'✅' if f12['coupon_pct'] >= 20 else '⏳'} цель 20%\n"
                  f"▫️ Купоны + доход от погашений: {num(f12['coupon_pct'] + f12['gain_pct'])}%\n")
     fw = forward_yield(held) if held else None
@@ -532,7 +570,11 @@ def build_weekly_report() -> str:
     if bonds_value:
         text += f"📊 К текущей цене: {num(year_income / bonds_value * 100)}%\n"
     if f12:
-        text += f"💵 Пришло купонов: {rub(f12['coupons'])} (≈ {rub(f12['coupons'] / max(f12['months'], 1))} в месяц)\n"
+        m = max(f12["months"], 1)
+        text += f"💵 Заработано купонами: <b>{rub(f12['earned'])}</b> (≈ {rub(f12['earned'] / m)} в месяц)\n"
+        if f12["nkd_paid"] >= 1:
+            text += (f"<i>Пришло {rub(f12['coupons'])}, из них {rub(f12['nkd_paid'])} это возврат НКД, "
+                     "доплаченного при покупках</i>\n")
     return text + "\n📄 <b>Бумаги</b>\n\n" + "\n\n".join(cards)
 
 
