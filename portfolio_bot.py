@@ -366,57 +366,58 @@ def build_weekly_report() -> str:
         return "💼 В портфеле пока нет бумаг."
     year_income = bonds_value = bonds_cost = year_full = 0.0
 
-    lines = []
+    cards = []
     for p in positions:
         value = p["qty"] * p["cur"]
-        yields = maturity = ""
+        head = f"<b>{esc(p['name'])}</b> · {p['qty']:g} шт"
+        body = [f"Куплено по {price(p['avg'])} · сейчас {price(p['cur'])}"]
         if p["type"] == "bond":
             annual = coupon_rate(p["ticker"])
+            try:
+                dates = [d for d, v in moex_bondization(p["ticker"])[1] if d]
+                if dates:
+                    head += " · до " + datetime.strptime(max(dates), "%Y-%m-%d").strftime("%m.%Y")
+            except Exception:
+                pass
             if annual and p["avg"] and p["cur"]:
                 year_income += annual * p["qty"]
                 bonds_value += value
                 bonds_cost += p["avg"] * p["qty"]
                 red = redemption_info(p["ticker"])
-                try:
-                    dates = [d for d, v in moex_bondization(p["ticker"])[1] if d]
-                    if dates:
-                        maturity = " · погашение " + datetime.strptime(max(dates), "%Y-%m-%d").strftime("%m.%Y")
-                except Exception:
-                    pass
                 # с погашением: купоны + разница между номиналом и ценой покупки, растянутая на годы до погашения
                 full = annual + ((red[0] - p["avg"]) / red[1] if red else 0)
                 year_full += full * p["qty"]
-                yields = (f" · к цене {num(annual / p['cur'] * 100)}% · к вложенным {num(annual / p['avg'] * 100)}%"
-                          + (f" · с погаш. {num(full / p['avg'] * 100)}%" if red else ""))
-        lines.append(
-            f"<b>{esc(p['name'])}</b> · {p['qty']:g} шт{maturity}\n"
-            f"{price(p['avg'])} → {price(p['cur'])}{yields}"
-        )
+                body.append(f"Купоны <b>{num(annual / p['avg'] * 100)}%</b>"
+                            + (f" · с погашением {num(full / p['avg'] * 100)}%" if red else "")
+                            + f" · к цене {num(annual / p['cur'] * 100)}%")
+        cards.append(head + "\n" + "\n".join(body))
 
     # стоимость счёта целиком: бумаги + НКД + свободные деньги
     value_now = sum(p["qty"] * (p["cur"] + p["nkd"]) for p in positions) + cash
-    text = f"💼 <b>Сверка ИИС, {datetime.now(TIMEZONE).strftime('%d.%m.%Y')}</b>\n\n"
+    text = f"💼 <b>Сверка ИИС · {datetime.now(TIMEZONE).strftime('%d.%m.%Y')}</b>\n"
 
     fr = fact_result(value_now)
+    text += "\n💰 <b>Результат за всё время</b>\n"
     if fr:
         net, result, yearly = fr
-        text += (f"💰 <b>Результат: {'+' if result >= 0 else ''}{rub(result)} ({pct(result / net * 100)})"
-                 + (f" · {num(yearly)}% годовых" if yearly is not None else "") + "</b>\n"
-                 f"Внёс {rub(net)} → сейчас {rub(value_now)}\n")
+        text += f"<b>{'+' if result >= 0 else ''}{rub(result)}</b> · {pct(result / net * 100)}"
+        text += (f" · <b>{num(yearly)}% годовых</b>\n" if yearly is not None else "\n")
+        text += f"Внёс {rub(net)} → сейчас {rub(value_now)}\n"
     else:
-        text += f"💰 <b>Сейчас на счёте: {rub(value_now)}</b>\n"
+        text += f"Сейчас на счёте {rub(value_now)}\n"
     if cash >= 1000:
         text += f"Свободные деньги {rub(cash)}: можно вложить\n"
 
     if bonds_cost:
         y_cost = year_income / bonds_cost * 100
         text += (
-            "\n🎟 <b>Доходность, % годовых</b>\n"
-            f"К цене: {num(year_income / bonds_value * 100)} · купоны к вложенным: <b>{num(y_cost)}</b> "
-            f"{'✅' if y_cost >= 20 else '⏳'} цель 20 · с погашением: {num(year_full / bonds_cost * 100)}\n"
-            f"Купоны ≈ {rub(year_income / 12)} в месяц\n"
+            "\n🎟 <b>Доходность облигаций, годовых</b>\n"
+            f"▫️ Купоны к вложенным: <b>{num(y_cost)}%</b> {'✅' if y_cost >= 20 else '⏳'} цель 20%\n"
+            f"▫️ С учётом погашения: {num(year_full / bonds_cost * 100)}%\n"
+            f"▫️ К текущей цене: {num(year_income / bonds_value * 100)}%\n"
+            f"💵 Купоны ≈ <b>{rub(year_income / 12)}</b> в месяц\n"
         )
-    return text + "\n" + "\n\n".join(lines)
+    return text + "\n📄 <b>Бумаги</b>\n\n" + "\n\n".join(cards)
 
 
 # =====================
