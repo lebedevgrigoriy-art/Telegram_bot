@@ -41,8 +41,6 @@ MY_CHAT_ID = int(os.environ.get("MY_CHAT_ID") or 0)
 
 ALERT_THRESHOLD = 5.0          # % движения цены для алерта
 BUY_TARGET = 50                # набираем бумагу до 50 шт, потом переходим к следующей
-# Очередь покупок: ISIN или коды бумаг через запятую, в порядке покупки (Railway → BUY_QUEUE)
-BUY_QUEUE = [x.strip() for x in os.environ.get("BUY_QUEUE", "").replace(";", ",").split(",") if x.strip()]
 TINVEST_URL = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1."
 UA = {"User-Agent": "Mozilla/5.0 (portfolio-bot)"}
 
@@ -214,6 +212,7 @@ def get_positions() -> tuple[list, float]:
         info = instrument_info(uid)
         positions.append({
             "uid": uid,
+            "figi": p.get("figi", ""),
             "ticker": p.get("ticker", ""),
             "type": p.get("instrumentType", ""),
             "name": info["name"] or p.get("ticker", ""),
@@ -559,25 +558,7 @@ def build_payday_message(force: bool = False) -> str | None:
     return text
 
 
-# ---------- Очередь покупок ----------
-
-def moex_find(query: str) -> dict | None:
-    """Ищет облигацию на Мосбирже по ISIN, коду или названию: {secid, name, isin}."""
-    try:
-        resp = requests.get("https://iss.moex.com/iss/securities.json",
-                            params={"q": query, "iss.meta": "off", "limit": 20,
-                                    "securities.columns": "secid,shortname,isin,group"},
-                            headers=UA, timeout=20, verify=CA_BUNDLE)
-        t = resp.json().get("securities", {})
-        rows = [dict(zip(t.get("columns", []), r)) for r in t.get("data", [])]
-        bonds = [r for r in rows if "bond" in (r.get("group") or "")]
-        exact = [r for r in bonds if query.upper() in (str(r.get("isin")).upper(), str(r.get("secid")).upper())]
-        r = (exact or bonds or [None])[0]
-        return {"secid": r["secid"], "name": r["shortname"], "isin": r["isin"]} if r else None
-    except Exception as e:
-        logger.error(f"moex_find {query}: {e}")
-        return None
-
+# ---------- Что сейчас набираем ----------
 
 def moex_bond_price(secid: str) -> float | None:
     """Цена одной облигации в рублях с НКД: (последняя цена или вчерашнее закрытие) × номинал + НКД."""
@@ -600,44 +581,55 @@ def moex_bond_price(secid: str) -> float | None:
     return None
 
 
-def buy_queue_status(positions: list) -> list[dict]:
-    """Очередь покупок с текущим количеством: [{query, name, secid, qty}]."""
-    out = []
-    for q in BUY_QUEUE:
-        held = next((p for p in positions if q.upper() in (p["ticker"].upper(), (p["isin"] or "").upper())), None)
-        if held:
-            out.append({"query": q, "name": held["name"], "secid": held["ticker"], "qty": held["qty"]})
-            continue
-        found = moex_find(q)
-        out.append({"query": q, "name": found["name"] if found else q,
-                    "secid": found["secid"] if found else q, "qty": 0})
-    return out
+def recent_buys() -> list[str]:
+    """FIGI купленных бумаг за 4 месяца, от последней покупки к ранней."""
+    now = datetime.utcnow()
+    try:
+        ops = tapi("OperationsService/GetOperations", {
+            "accountId": get_account_id(),
+            "from": (now - timedelta(days=120)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "to": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "state": "OPERATION_STATE_EXECUTED",
+        }).get("operations", [])
+    except Exception as e:
+        logger.error(f"recent_buys: {e}")
+        return []
+    buys = sorted((o for o in ops if o.get("operationType") == "OPERATION_TYPE_BUY"),
+                  key=lambda o: o.get("date", ""), reverse=True)
+    return [o.get("figi") for o in buys]
+
+
+def current_target(positions: list) -> tuple[dict | None, list]:
+    """Какую бумагу сейчас набираем: ту, что меньше 50 шт и покупалась последней.
+    Возвращает (текущая, остальные недобранные)."""
+    bonds = [p for p in positions if p["type"] == "bond"]
+    unfinished = [b for b in bonds if b["qty"] < BUY_TARGET]
+    if not unfinished:
+        return None, []
+    by_figi = {b["figi"]: b for b in unfinished}
+    cur = next((by_figi[f] for f in recent_buys() if f in by_figi), None)
+    if cur is None:
+        cur = max(unfinished, key=lambda b: b["qty"])   # покупок не нашли: берём самую набранную
+    return cur, [b for b in unfinished if b is not cur]
 
 
 def build_buy_hint(amount: float | None, positions: list | None = None) -> str:
     """Что сейчас покупать по правилу: одна бумага до 50 шт, потом следующая."""
-    if not BUY_QUEUE:
-        return ("🛒 Очередь покупок не задана. Добавь в Railway переменную BUY_QUEUE: "
-                "ISIN бумаг через запятую в порядке покупки.")
     if positions is None:
         positions, _ = get_positions()
-    queue = buy_queue_status(positions)
-    idx = next((i for i, b in enumerate(queue) if b["qty"] < BUY_TARGET), None)
-    if idx is None:
-        return f"✅ Все бумаги из очереди набраны до {BUY_TARGET} шт: пора обновить очередь BUY_QUEUE."
-    cur = queue[idx]
+    cur, others = current_target(positions)
+    if cur is None:
+        return (f"✅ Все облигации в портфеле набраны до {BUY_TARGET} шт. Выбери следующую бумагу "
+                "и купи первую штуку: бот сам подхватит её как текущую.")
     need = BUY_TARGET - cur["qty"]
-    one = moex_bond_price(cur["secid"])
+    one = moex_bond_price(cur["ticker"])
     lines = [f"🛒 <b>Сейчас набираешь: {esc(cur['name'])}</b>",
              f"У тебя {cur['qty']:g} из {BUY_TARGET} шт, осталось {need:g} шт"
              + (f" ≈ {rub(need * one)}" if one else "")]
     if one and amount:
-        n = int(amount // one)
-        lines.append(f"На {rub(amount)} хватит на <b>{n} шт</b> (одна ≈ {price(one)} с НКД)")
+        lines.append(f"На {rub(amount)} хватит на <b>{int(amount // one)} шт</b> (одна ≈ {price(one)} с НКД)")
     elif not one:
         lines.append("Цену сейчас получить не удалось")
-    if idx + 1 < len(queue):
-        lines.append(f"Следующая в очереди: {esc(queue[idx + 1]['name'])}")
     return "\n".join(lines)
 
 
@@ -695,21 +687,17 @@ def build_income_forecast() -> str:
 
 def build_queue_text() -> str:
     positions, cash = get_positions()
-    head = "🛒 <b>Очередь покупок</b>\n\n"
-    if BUY_QUEUE:
-        rows = []
-        found_current = False
-        for b in buy_queue_status(positions):
-            if b["qty"] >= BUY_TARGET:
-                mark = "✅"
-            elif not found_current:
-                mark, found_current = "👉", True
-            else:
-                mark = "⏳"
-            rows.append(f"{mark} {esc(b['name'])}: {b['qty']:g} / {BUY_TARGET}")
-        head += "\n".join(rows) + "\n\n"
-    return head + build_buy_hint(cash if cash >= 1 else None, positions) + (
-        f"\n\nСвободные деньги на счёте: {rub(cash)}" if cash >= 1 else "")
+    bonds = sorted([p for p in positions if p["type"] == "bond"], key=lambda b: -b["qty"])
+    cur, _ = current_target(positions)
+    rows = []
+    for b in bonds:
+        mark = "✅" if b["qty"] >= BUY_TARGET else ("👉" if cur and b is cur else "⏳")
+        rows.append(f"{mark} {esc(b['name'])}: {b['qty']:g} / {BUY_TARGET}")
+    text = "🛒 <b>Набор бумаг до 50 шт</b>\n\n" + "\n".join(rows) + "\n\n"
+    text += build_buy_hint(cash if cash >= 1 else None, positions)
+    if cash >= 1:
+        text += f"\n\nСвободные деньги на счёте: {rub(cash)}"
+    return text
 
 
 def build_maturity_message(days_ahead: int = 14) -> str | None:
@@ -959,7 +947,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/check — проверить резкие движения сейчас\n"
         "/payday — выплаты сегодня и до конца месяца\n"
         "/income — купоны на 12 месяцев вперёд\n"
-        "/queue — очередь покупок: что набираешь сейчас\n"
+        "/queue — что сейчас набираешь до 50 шт\n"
         "/issuers — разбор эмитентов сейчас (несколько минут)"
     )
 
