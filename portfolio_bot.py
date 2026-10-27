@@ -275,6 +275,96 @@ def coupon_rate(ticker: str) -> float | None:
     return value * 365 / period
 
 
+def redemption_info(ticker: str) -> tuple[float, float] | None:
+    """Сколько вернут при погашении на одну облигацию (оставшийся номинал) и через сколько лет."""
+    try:
+        _, amorts = moex_bondization(ticker)
+    except Exception:
+        return None
+    today = datetime.now(MOSCOW).strftime("%Y-%m-%d")
+    future = [(d, v) for d, v in amorts if d and d >= today and v]
+    if not future:
+        return None
+    face = sum(v for _, v in future)
+    # средневзвешенный срок возврата номинала (для амортизации учитывает частичные погашения)
+    years = sum(v * (datetime.strptime(d, "%Y-%m-%d") - datetime.strptime(today, "%Y-%m-%d")).days
+                for d, v in future) / face / 365.25
+    # меньше года не растягиваем: иначе разница с номиналом за пару недель даёт абсурдные сотни процентов
+    return face, max(years, 1.0)
+
+
+DEPOSIT_TYPES = {"OPERATION_TYPE_INPUT", "OPERATION_TYPE_INPUT_SWIFT", "OPERATION_TYPE_INPUT_ACQUIRING",
+                 "OPERATION_TYPE_INP_MULTI"}
+WITHDRAW_TYPES = {"OPERATION_TYPE_OUTPUT", "OPERATION_TYPE_OUTPUT_SWIFT", "OPERATION_TYPE_OUTPUT_ACQUIRING",
+                  "OPERATION_TYPE_OUT_MULTI"}
+
+
+def money_flows() -> list[tuple[datetime, float]]:
+    """Все пополнения (минус) и выводы (плюс) ИИС за всю историю счёта."""
+    acc_id = get_account_id()
+    opened = next((a.get("openedDate") for a in get_accounts() if a.get("id") == acc_id), None)
+    start = (opened or "2015-01-01T00:00:00Z")[:10]
+    ops = tapi("OperationsService/GetOperations", {
+        "accountId": acc_id,
+        "from": f"{start}T00:00:00Z",
+        "to": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "state": "OPERATION_STATE_EXECUTED",
+    }).get("operations", [])
+    flows = []
+    for o in ops:
+        t = o.get("operationType")
+        if t in DEPOSIT_TYPES or t in WITHDRAW_TYPES:
+            amount = abs(_q(o.get("payment")))
+            when = datetime.strptime(o.get("date", "")[:10], "%Y-%m-%d")
+            flows.append((when, -amount if t in DEPOSIT_TYPES else amount))
+    return sorted(flows)
+
+
+def xirr(flows: list[tuple[datetime, float]]) -> float | None:
+    """Годовая доходность с учётом дат взносов (как XIRR в Excel), в %."""
+    if len(flows) < 2:
+        return None
+    t0 = flows[0][0]
+
+    def npv(rate):
+        return sum(a / (1 + rate) ** ((d - t0).days / 365.25) for d, a in flows)
+
+    lo, hi = -0.99, 10.0
+    if npv(lo) * npv(hi) > 0:
+        return None
+    for _ in range(200):
+        mid = (lo + hi) / 2
+        if npv(lo) * npv(mid) <= 0:
+            hi = mid
+        else:
+            lo = mid
+    return (lo + hi) / 2 * 100
+
+
+def build_fact_result(value_now: float) -> str:
+    """Фактический результат: сколько сейчас минус сколько внёс, и то же в % годовых."""
+    try:
+        flows = money_flows()
+    except Exception as e:
+        logger.error(f"money_flows: {e}")
+        return "💰 Фактический результат: не удалось получить историю пополнений\n"
+    deposited = -sum(a for _, a in flows if a < 0)
+    withdrawn = sum(a for _, a in flows if a > 0)
+    net = deposited - withdrawn
+    if net <= 0:
+        return "💰 Фактический результат: нет данных о пополнениях\n"
+    result = value_now - net
+    today = datetime.strptime(datetime.now(MOSCOW).strftime("%Y-%m-%d"), "%Y-%m-%d")
+    yearly = xirr(flows + [(today, value_now)])
+    first = flows[0][0].strftime("%m.%Y")
+    return (
+        f"💰 <b>Фактический результат: {'+' if result >= 0 else ''}{rub(result)} ({pct(result / net * 100)})</b>\n"
+        f"Внёс {rub(net)} с {first} → сейчас {rub(value_now)}"
+        + (f" (выводил {rub(withdrawn)})" if withdrawn >= 1 else "") + "\n"
+        + (f"В пересчёте на год: {pct(yearly).lstrip('+')} годовых\n" if yearly is not None else "")
+    )
+
+
 def build_weekly_report() -> str:
     positions, cash = get_positions()
     if not positions:
@@ -282,7 +372,7 @@ def build_weekly_report() -> str:
     total = sum(p["qty"] * p["cur"] for p in positions)
     total_pnl = sum(p["pnl"] for p in positions)
     week_delta = 0.0
-    year_income = bonds_value = bonds_cost = 0.0
+    year_income = bonds_value = bonds_cost = year_full = 0.0
 
     lines = []
     for p in positions:
@@ -295,11 +385,17 @@ def build_weekly_report() -> str:
         coupon_txt = ""
         if p["type"] == "bond":
             annual = coupon_rate(p["ticker"])
-            if annual and p["cur"]:
+            if annual and p["avg"] and p["cur"]:
                 year_income += annual * p["qty"]
                 bonds_value += value
                 bonds_cost += p["avg"] * p["qty"]
-                coupon_txt = f"\n🎟 купонная доходность {pct(annual / p['cur'] * 100)[1:]} годовых"
+                red = redemption_info(p["ticker"])
+                # с погашением: купоны + разница между номиналом и ценой покупки, растянутая на годы до погашения
+                full = annual + ((red[0] - p["avg"]) / red[1] if red else 0)
+                year_full += full * p["qty"]
+                coupon_txt = (f"\n🎟 к цене {pct(annual / p['cur'] * 100)[1:]} · "
+                              f"к вложенным {pct(annual / p['avg'] * 100)[1:]}"
+                              + (f" · с погашением {pct(full / p['avg'] * 100).lstrip('+')}" if red else ""))
             else:
                 coupon_txt = "\n🎟 купонная доходность: нет данных"
         lines.append(
@@ -315,17 +411,23 @@ def build_weekly_report() -> str:
         f"💼 <b>Сверка портфеля ИИС — {now}</b>\n\n"
         f"Стоимость бумаг: <b>{rub(total)}</b>\n"
         f"За неделю: {rub(week_delta)} ({pct(week_delta / week_base * 100 if week_base else 0)})\n"
-        f"Прибыль/убыток за всё время: {rub(total_pnl)}\n"
+        f"Прибыль/убыток по ценам: {rub(total_pnl)}\n"
         + (f"Свободные деньги: {rub(cash)}\n" if cash >= 1 else "")
     )
-    if bonds_value:
+    # стоимость счёта целиком: бумаги + НКД + свободные деньги
+    value_now = sum(p["qty"] * (p["cur"] + p["nkd"]) for p in positions) + cash
+    header += "\n" + build_fact_result(value_now)
+    if bonds_cost:
         y_now = year_income / bonds_value * 100
-        y_cost = year_income / bonds_cost * 100 if bonds_cost else 0
+        y_cost = year_income / bonds_cost * 100
+        y_full = year_full / bonds_cost * 100
         header += (
-            f"\n🎟 <b>Купонная доходность портфеля: {pct(y_now)[1:]} годовых</b> "
-            f"{'✅' if y_now >= 20 else '⏳'} цель 20%\n"
-            f"К вложенным деньгам: {pct(y_cost)[1:]}\n"
-            f"Купонов за год ≈ {rub(year_income)} (≈ {rub(year_income / 12)} в месяц)\n"
+            f"\n🎟 Купонная доходность к текущей цене: {pct(y_now)[1:]} годовых\n"
+            f"🎟 <b>Купоны к вложенным деньгам: {pct(y_cost)[1:]} годовых</b> "
+            f"{'✅' if y_cost >= 20 else '⏳'} цель 20%\n"
+            f"📈 С учётом погашения: {pct(y_full).lstrip('+')} годовых к вложенным\n"
+            f"Купонов за год ≈ {rub(year_income)} (≈ {rub(year_income / 12)} в месяц) "
+            f"на вложенные {rub(bonds_cost)}\n"
         )
     return header + "\n" + "\n\n".join(lines)
 
