@@ -341,28 +341,23 @@ def xirr(flows: list[tuple[datetime, float]]) -> float | None:
     return (lo + hi) / 2 * 100
 
 
-def build_fact_result(value_now: float) -> str:
-    """Фактический результат: сколько сейчас минус сколько внёс, и то же в % годовых."""
+def fact_result(value_now: float) -> tuple[float, float, float | None] | None:
+    """(внесено чистыми, результат ₽, % годовых) по всей истории пополнений ИИС."""
     try:
         flows = money_flows()
     except Exception as e:
         logger.error(f"money_flows: {e}")
-        return "💰 Фактический результат: не удалось получить историю пополнений\n"
-    deposited = -sum(a for _, a in flows if a < 0)
-    withdrawn = sum(a for _, a in flows if a > 0)
-    net = deposited - withdrawn
+        return None
+    net = -sum(a for _, a in flows)          # пополнения минус выводы
     if net <= 0:
-        return "💰 Фактический результат: нет данных о пополнениях\n"
-    result = value_now - net
+        return None
     today = datetime.strptime(datetime.now(MOSCOW).strftime("%Y-%m-%d"), "%Y-%m-%d")
-    yearly = xirr(flows + [(today, value_now)])
-    first = flows[0][0].strftime("%m.%Y")
-    return (
-        f"💰 <b>Фактический результат: {'+' if result >= 0 else ''}{rub(result)} ({pct(result / net * 100)})</b>\n"
-        f"Внёс {rub(net)} с {first} → сейчас {rub(value_now)}"
-        + (f" (выводил {rub(withdrawn)})" if withdrawn >= 1 else "") + "\n"
-        + (f"В пересчёте на год: {pct(yearly).lstrip('+')} годовых\n" if yearly is not None else "")
-    )
+    return net, value_now - net, xirr(flows + [(today, value_now)])
+
+
+def num(x: float) -> str:
+    """18.43 -> '18,4' (знак минус только у отрицательных)."""
+    return pct(x).lstrip("+").rstrip("%")
 
 
 def build_weekly_report() -> str:
@@ -370,7 +365,6 @@ def build_weekly_report() -> str:
     if not positions:
         return "💼 В портфеле пока нет бумаг."
     total = sum(p["qty"] * p["cur"] for p in positions)
-    total_pnl = sum(p["pnl"] for p in positions)
     week_delta = 0.0
     year_income = bonds_value = bonds_cost = year_full = 0.0
 
@@ -380,9 +374,8 @@ def build_weekly_report() -> str:
         value = p["qty"] * p["cur"]
         if wc is not None:
             week_delta += value - value / (1 + wc / 100)
-        pnl_pct = (p["cur"] / p["avg"] - 1) * 100 if p["avg"] else 0
-        week_txt = f"за неделю {pct(wc)}" if wc is not None else "за неделю нет данных"
-        coupon_txt = ""
+        week_txt = f" · {pct(wc)} за неделю" if wc is not None else ""
+        yields = ""
         if p["type"] == "bond":
             annual = coupon_rate(p["ticker"])
             if annual and p["avg"] and p["cur"]:
@@ -393,43 +386,39 @@ def build_weekly_report() -> str:
                 # с погашением: купоны + разница между номиналом и ценой покупки, растянутая на годы до погашения
                 full = annual + ((red[0] - p["avg"]) / red[1] if red else 0)
                 year_full += full * p["qty"]
-                coupon_txt = (f"\n🎟 к цене {pct(annual / p['cur'] * 100)[1:]} · "
-                              f"к вложенным {pct(annual / p['avg'] * 100)[1:]}"
-                              + (f" · с погашением {pct(full / p['avg'] * 100).lstrip('+')}" if red else ""))
-            else:
-                coupon_txt = "\n🎟 купонная доходность: нет данных"
+                yields = (f" · к цене {num(annual / p['cur'] * 100)}% · к вложенным {num(annual / p['avg'] * 100)}%"
+                          + (f" · с погаш. {num(full / p['avg'] * 100)}%" if red else ""))
         lines.append(
-            f"{dot(wc or 0)} <b>{esc(p['name'])}</b>\n"
-            f"{p['qty']:g} шт · средняя {price(p['avg'])} · сейчас {price(p['cur'])}\n"
-            f"{week_txt} · итог {rub(p['pnl'])} ({pct(pnl_pct)})"
-            + coupon_txt
+            f"{dot(wc or 0)} <b>{esc(p['name'])}</b> · {p['qty']:g} шт{week_txt}\n"
+            f"{price(p['avg'])} → {price(p['cur'])}{yields}"
         )
 
-    now = datetime.now(TIMEZONE).strftime("%d.%m.%Y")
-    week_base = total - week_delta
-    header = (
-        f"💼 <b>Сверка портфеля ИИС — {now}</b>\n\n"
-        f"Стоимость бумаг: <b>{rub(total)}</b>\n"
-        f"За неделю: {rub(week_delta)} ({pct(week_delta / week_base * 100 if week_base else 0)})\n"
-        f"Прибыль/убыток по ценам: {rub(total_pnl)}\n"
-        + (f"Свободные деньги: {rub(cash)}\n" if cash >= 1 else "")
-    )
     # стоимость счёта целиком: бумаги + НКД + свободные деньги
     value_now = sum(p["qty"] * (p["cur"] + p["nkd"]) for p in positions) + cash
-    header += "\n" + build_fact_result(value_now)
+    week_base = total - week_delta
+    text = f"💼 <b>Сверка ИИС, {datetime.now(TIMEZONE).strftime('%d.%m.%Y')}</b>\n\n"
+
+    fr = fact_result(value_now)
+    if fr:
+        net, result, yearly = fr
+        text += (f"💰 <b>Результат: {'+' if result >= 0 else ''}{rub(result)} ({pct(result / net * 100)})"
+                 + (f" · {num(yearly)}% годовых" if yearly is not None else "") + "</b>\n"
+                 f"Внёс {rub(net)} → сейчас {rub(value_now)}\n")
+    else:
+        text += f"💰 <b>Сейчас на счёте: {rub(value_now)}</b>\n"
+    text += f"За неделю: {'+' if week_delta >= 0 else ''}{rub(week_delta)} ({pct(week_delta / week_base * 100 if week_base else 0)})\n"
+    if cash >= 1000:
+        text += f"Свободные деньги {rub(cash)}: можно вложить\n"
+
     if bonds_cost:
-        y_now = year_income / bonds_value * 100
         y_cost = year_income / bonds_cost * 100
-        y_full = year_full / bonds_cost * 100
-        header += (
-            f"\n🎟 Купонная доходность к текущей цене: {pct(y_now)[1:]} годовых\n"
-            f"🎟 <b>Купоны к вложенным деньгам: {pct(y_cost)[1:]} годовых</b> "
-            f"{'✅' if y_cost >= 20 else '⏳'} цель 20%\n"
-            f"📈 С учётом погашения: {pct(y_full).lstrip('+')} годовых к вложенным\n"
-            f"Купонов за год ≈ {rub(year_income)} (≈ {rub(year_income / 12)} в месяц) "
-            f"на вложенные {rub(bonds_cost)}\n"
+        text += (
+            "\n🎟 <b>Доходность, % годовых</b>\n"
+            f"К цене: {num(year_income / bonds_value * 100)} · купоны к вложенным: <b>{num(y_cost)}</b> "
+            f"{'✅' if y_cost >= 20 else '⏳'} цель 20 · с погашением: {num(year_full / bonds_cost * 100)}\n"
+            f"Купоны ≈ {rub(year_income / 12)} в месяц\n"
         )
-    return header + "\n" + "\n\n".join(lines)
+    return text + "\n" + "\n\n".join(lines)
 
 
 # =====================
