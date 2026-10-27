@@ -11,6 +11,7 @@ from telegram import Update
 import bot as core_bots          # существующие боты (рефлексия, курсы, кино, виза, todoist, накопления, книги)
 import podcast_bot               # подкаст-дайджест
 import wishlist_bot              # вишлист
+import portfolio_bot             # портфель ИИС: сверка, алерты, купоны, эмитенты
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -23,6 +24,7 @@ MODULES = [
     ("core", core_bots),
     ("podcast", podcast_bot),
     ("wishlist", wishlist_bot),
+    ("portfolio", portfolio_bot),
 ]
 
 
