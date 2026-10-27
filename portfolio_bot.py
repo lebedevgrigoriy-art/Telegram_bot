@@ -351,13 +351,7 @@ def fact_12m(ops: list) -> dict | None:
         if o.get("operationType") in BUY_TYPES and int(o.get("quantity") or 0):
             q, cost = bought.get(o.get("figi"), (0, 0.0))
             bought[o.get("figi")] = (q + int(o["quantity"]), cost + abs(_q(o.get("payment"))))
-    redemption_gain = 0.0
-    for o in ops:
-        if o.get("operationType") == "OPERATION_TYPE_BOND_REPAYMENT_FULL" and _op_day(o) >= period_start:
-            q_b, cost = bought.get(o.get("figi"), (0, 0.0))
-            qty = int(o.get("quantity") or 0) or q_b
-            if q_b:
-                redemption_gain += abs(_q(o.get("payment"))) - cost / q_b * qty
+    redemption_gain = sum(r["gain"] for r in redemptions(ops, period_start))
 
     # сколько денег в среднем было вложено за период (по дням)
     total = 0.0
@@ -375,6 +369,61 @@ def fact_12m(ops: list) -> dict | None:
         "gain_pct": redemption_gain / avg_invested * 100 * k,
         "months": round(days / 30.4),
     }
+
+
+REPAY_TYPES = {"OPERATION_TYPE_BOND_REPAYMENT", "OPERATION_TYPE_BOND_REPAYMENT_FULL"}
+
+
+def redemptions(ops: list, since: datetime) -> list[dict]:
+    """Полностью погашенные бумаги с даты since. Доход = все возвраты номинала по бумаге
+    (частичные амортизации + финальное погашение) минус сколько заплатил при покупке."""
+    bought, repaid, full_day, full_qty = {}, {}, {}, {}
+    for o in ops:
+        f, t = o.get("figi"), o.get("operationType")
+        if t in BUY_TYPES and int(o.get("quantity") or 0):
+            q, cost = bought.get(f, (0, 0.0))
+            bought[f] = (q + int(o["quantity"]), cost + abs(_q(o.get("payment"))))
+        elif t in REPAY_TYPES:
+            repaid[f] = repaid.get(f, 0.0) + abs(_q(o.get("payment")))
+            if t == "OPERATION_TYPE_BOND_REPAYMENT_FULL":
+                full_day[f] = _op_day(o)
+                full_qty[f] = int(o.get("quantity") or 0)
+    out = []
+    for f, day in full_day.items():
+        if day < since or f not in bought:
+            continue
+        q_b, cost = bought[f]
+        qty = full_qty[f] or q_b
+        paid = cost / q_b * qty
+        out.append({"figi": f, "day": day, "qty": qty, "paid": paid,
+                    "returned": repaid[f], "gain": repaid[f] - paid})
+    return sorted(out, key=lambda r: r["day"])
+
+
+def figi_name(figi: str) -> str:
+    try:
+        ins = tapi("InstrumentsService/GetInstrumentBy",
+                   {"idType": "INSTRUMENT_ID_TYPE_FIGI", "id": figi}).get("instrument", {})
+        return ins.get("name") or figi
+    except Exception:
+        return figi
+
+
+def build_redeemed_text() -> str:
+    """Проверка: каждое погашение за 12 месяцев, сколько заплатил и сколько вернули."""
+    since = datetime.now(MOSCOW).replace(tzinfo=None) - timedelta(days=365)
+    rows = redemptions(all_operations(), since)
+    if not rows:
+        return "🏁 За последние 12 месяцев полных погашений не было."
+    lines = []
+    for r in rows:
+        lines.append(f"<b>{esc(figi_name(r['figi']))}</b> · {r['day'].strftime('%d.%m.%Y')} · {r['qty']} шт\n"
+                     f"Заплатил {rub(r['paid'])} → вернули {rub(r['returned'])} · "
+                     f"доход <b>{'+' if r['gain'] >= 0 else ''}{rub(r['gain'])}</b>")
+    total = sum(r["gain"] for r in rows)
+    return ("🏁 <b>Погашения за 12 месяцев</b>\n\n" + "\n\n".join(lines)
+            + f"\n\nИтого доход от погашений: <b>{'+' if total >= 0 else ''}{rub(total)}</b>\n"
+            "<i>Вернули: вместе с частичными возвратами номинала (амортизацией).</i>")
 
 
 def bond_cashflows(ticker: str, qty: float) -> list[tuple[datetime, float]]:
@@ -474,15 +523,14 @@ def build_weekly_report() -> str:
     f12 = fact_12m(ops) if ops else None
     if f12:
         period = "12 мес" if f12["months"] >= 12 else f"{f12['months']} мес, в пересчёте на год"
-        total_pct = f12["coupon_pct"] + f12["gain_pct"]
-        text += (f"📌 <b>Факт за {period}: {num(total_pct)}%</b>\n"
-                 f"    купоны {num(f12['coupon_pct'])}% {'✅' if f12['coupon_pct'] >= 20 else '⏳'} цель 20%"
-                 f" · погашения {num(f12['gain_pct'])}%\n")
+        text += (f"📌 <b>Факт за {period}</b>\n"
+                 f"▫️ Купоны: <b>{num(f12['coupon_pct'])}%</b> {'✅' if f12['coupon_pct'] >= 20 else '⏳'} цель 20%\n"
+                 f"▫️ Купоны + доход от погашений: {num(f12['coupon_pct'] + f12['gain_pct'])}%\n")
     fw = forward_yield(held) if held else None
     if fw is not None:
         text += f"🔭 Если держать всё до погашения: <b>{num(fw)}%</b>\n"
     if bonds_value:
-        text += f"📊 К текущей цене, как на Смартлабе: {num(year_income / bonds_value * 100)}%\n"
+        text += f"📊 К текущей цене: {num(year_income / bonds_value * 100)}%\n"
     if f12:
         text += f"💵 Пришло купонов: {rub(f12['coupons'])} (≈ {rub(f12['coupons'] / max(f12['months'], 1))} в месяц)\n"
     return text + "\n📄 <b>Бумаги</b>\n\n" + "\n\n".join(cards)
@@ -1107,7 +1155,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/check: проверить резкие движения сейчас\n"
         "/payday: выплаты сегодня и до конца месяца\n"
         "/income: купоны на 12 месяцев вперёд\n"
-        "/queue: что сейчас набираешь до 50 шт\n"
+        "/queue: что сейчас набираешь до 50 шт\n"        "/redeemed: погашения за 12 месяцев, сколько заплатил и вернули\n"
         "/issuers: разбор эмитентов сейчас (несколько минут)"
     )
 
@@ -1155,6 +1203,10 @@ async def income_command(update, context):
 
 async def queue_command(update, context):
     await _run(update, "🛒 Смотрю очередь", build_queue_text)
+
+
+async def redeemed_command(update, context):
+    await _run(update, "🏁 Смотрю погашения", build_redeemed_text)
 
 
 async def payday_command(update, context):
@@ -1258,6 +1310,7 @@ async def main() -> list:
     app.add_handler(CommandHandler("payday", payday_command))
     app.add_handler(CommandHandler("income", income_command))
     app.add_handler(CommandHandler("queue", queue_command))
+    app.add_handler(CommandHandler("redeemed", redeemed_command))
     app.add_handler(CommandHandler("issuers", issuers_command))
 
     jq = app.job_queue
