@@ -387,7 +387,7 @@ def fact_12m(ops: list) -> dict | None:
                    if o.get("operationType") in BUY_TYPES and _op_day(o) >= period_start)
     earned = coupons - nkd_paid
 
-    redemption_gain = sum(r["gain"] for r in redemptions(ops, period_start))
+    redemption_gain = sum(r["gain_window"] for r in redemptions(ops, period_start))
 
     # сколько денег в среднем было вложено за период (по дням)
     total = 0.0
@@ -414,13 +414,16 @@ REPAY_TYPES = {"OPERATION_TYPE_BOND_REPAYMENT", "OPERATION_TYPE_BOND_REPAYMENT_F
 
 def redemptions(ops: list, since: datetime) -> list[dict]:
     """Полностью погашенные бумаги с даты since. Доход = все возвраты номинала по бумаге
-    (частичные амортизации + финальное погашение) минус сколько заплатил при покупке."""
-    bought, repaid, full_day, full_qty = {}, {}, {}, {}
+    (частичные амортизации + финальное погашение) минус сколько заплатил при покупке.
+    gain_window: часть дохода, которая пришлась на период с since. Доход копился всё время,
+    пока бумага была у тебя, поэтому делим его по дням владения каждой покупкой."""
+    bought, lots, repaid, full_day, full_qty = {}, {}, {}, {}, {}
     for o in ops:
         f, t = o.get("figi"), o.get("operationType")
         if t in BUY_TYPES and int(o.get("quantity") or 0):
             q, cost = bought.get(f, (0, 0.0))
             bought[f] = (q + int(o["quantity"]), cost + buy_cost(o))
+            lots.setdefault(f, []).append((_op_day(o), int(o["quantity"]), buy_cost(o)))
         elif t in REPAY_TYPES:
             repaid[f] = repaid.get(f, 0.0) + abs(_q(o.get("payment")))
             if t == "OPERATION_TYPE_BOND_REPAYMENT_FULL":
@@ -433,8 +436,17 @@ def redemptions(ops: list, since: datetime) -> list[dict]:
         q_b, cost = bought[f]
         qty = full_qty[f] or q_b
         paid = cost / q_b * qty
-        out.append({"figi": f, "day": day, "qty": qty, "paid": paid,
-                    "returned": repaid[f], "gain": repaid[f] - paid})
+        gain = repaid[f] - paid
+        in_window = 0.0
+        returned_per_bond = repaid[f] / qty
+        for buy_day, lot_qty, lot_cost in lots[f]:
+            lot_gain = returned_per_bond * lot_qty - lot_cost   # доход именно этой покупки
+            held = max((day - buy_day).days, 1)
+            overlap = max((day - max(buy_day, since)).days, 0)
+            in_window += lot_gain * overlap / held
+        out.append({"figi": f, "day": day, "qty": qty, "paid": paid, "returned": repaid[f],
+                    "gain": gain, "gain_window": in_window,
+                    "held_days": sum(max((day - d).days, 1) * lq for d, lq, _ in lots[f]) / q_b})
     return sorted(out, key=lambda r: r["day"])
 
 
@@ -455,12 +467,16 @@ def build_redeemed_text() -> str:
         return "🏁 За последние 12 месяцев полных погашений не было."
     lines = []
     for r in rows:
+        months = round(r["held_days"] / 30.4)
         lines.append(f"<b>{esc(figi_name(r['figi']))}</b> · {r['day'].strftime('%d.%m.%Y')} · {r['qty']} шт\n"
-                     f"Заплатил {rub(r['paid'])} → вернули {rub(r['returned'])} · "
-                     f"доход <b>{'+' if r['gain'] >= 0 else ''}{rub(r['gain'])}</b>")
+                     f"Заплатил {rub(r['paid'])} → вернули {rub(r['returned'])}\n"
+                     f"Доход <b>{'+' if r['gain'] >= 0 else ''}{rub(r['gain'])}</b> за ~{months} мес владения, "
+                     f"из них за последний год {'+' if r['gain_window'] >= 0 else ''}{rub(r['gain_window'])}")
     total = sum(r["gain"] for r in rows)
+    window = sum(r["gain_window"] for r in rows)
     return ("🏁 <b>Погашения за 12 месяцев</b>\n\n" + "\n\n".join(lines)
             + f"\n\nИтого доход от погашений: <b>{'+' if total >= 0 else ''}{rub(total)}</b>\n"
+            f"В доходность за 12 мес идёт часть за последний год: <b>{'+' if window >= 0 else ''}{rub(window)}</b>\n"
             "<i>Вернули: вместе с частичными возвратами номинала (амортизацией).</i>")
 
 
@@ -482,11 +498,13 @@ def bond_cashflows(ticker: str, qty: float) -> list[tuple[datetime, float]]:
 
 def forward_yield(items: list[tuple[str, float, float]]) -> float | None:
     """Доходность, если держать все бумаги до погашения: заплатил свою цену покупки сегодня,
-    дальше получаешь все купоны и номинал. items = [(тикер, количество, средняя цена)]."""
+    дальше получаешь все купоны и номинал. items = [(тикер, количество, средняя цена, НКД сейчас)].
+    Ближайший купон включает НКД, который накопился до сегодня: это уже прошлый доход,
+    поэтому прибавляем его к стартовой сумме, чтобы не засчитать в будущую доходность."""
     today = datetime.strptime(datetime.now(MOSCOW).strftime("%Y-%m-%d"), "%Y-%m-%d")
-    flows = [(today, -sum(q * avg for _, q, avg in items))]
+    flows = [(today, -sum(q * (avg + nkd) for _, q, avg, nkd in items))]
     try:
-        for ticker, q, _ in items:
+        for ticker, q, _, _ in items:
             flows += bond_cashflows(ticker, q)
     except Exception as e:
         logger.error(f"forward_yield: {e}")
@@ -503,8 +521,7 @@ def build_weekly_report() -> str:
     positions, cash = get_positions()
     if not positions:
         return "💼 В портфеле пока нет бумаг."
-    year_income = bonds_value = 0.0
-    held = []   # (тикер, количество, средняя цена) облигаций для форвардной доходности
+    held = []   # (тикер, количество, средняя цена, НКД сейчас) для доходности до погашения
 
     cards = []
     for p in positions:
@@ -517,22 +534,23 @@ def build_weekly_report() -> str:
                     head += " · до " + datetime.strptime(max(dates), "%Y-%m-%d").strftime("%m.%Y")
             except Exception:
                 pass
-            annual = coupon_rate(p["ticker"])
             parts = []
-            if annual and p["avg"]:
-                parts.append(f"купон {num(annual / p['avg'] * 100)}% к вложенным")
+            annual = coupon_rate(p["ticker"])
+            try:
+                today_s = datetime.now(MOSCOW).strftime("%Y-%m-%d")
+                face = sum(v for d, v in moex_bondization(p["ticker"])[1] if d and d >= today_s and v) or 1000
+            except Exception:
+                face = 1000
+            if annual:
+                # ставка купона: сколько платит в год от номинала (свойство самой облигации)
+                parts.append(f"Ставка купона {num(annual / face * 100)}%")
             if p["avg"]:
-                held.append((p["ticker"], p["qty"], p["avg"]))
-                fy = forward_yield([(p["ticker"], 1, p["avg"])])
+                held.append((p["ticker"], p["qty"], p["avg"], p["nkd"]))
+                fy = forward_yield([(p["ticker"], 1, p["avg"], p["nkd"])])
                 if fy is not None:
                     parts.append(f"до погашения <b>{num(fy)}%</b>")
-            if annual and p["cur"]:
-                year_income += annual * p["qty"]
-                bonds_value += p["qty"] * p["cur"]
-                parts.append(f"к цене {num(annual / p['cur'] * 100)}%")
             if parts:
-                line = " · ".join(parts)
-                body.append(line[0].upper() + line[1:])
+                body.append(" · ".join(parts))
         cards.append(head + "\n" + "\n".join(body))
 
     try:
@@ -543,39 +561,34 @@ def build_weekly_report() -> str:
 
     # стоимость счёта целиком: бумаги + НКД + свободные деньги
     value_now = sum(p["qty"] * (p["cur"] + p["nkd"]) for p in positions) + cash
-    text = f"💼 <b>Сверка ИИС · {datetime.now(TIMEZONE).strftime('%d.%m.%Y')}</b>\n"
+    text = f"💼 <b>Сверка ИИС · {datetime.now(TIMEZONE).strftime('%d.%m.%Y')}</b>\n\n"
 
     fr = fact_result(value_now, ops) if ops is not None else None
-    text += "\n💰 <b>Результат за всё время</b>\n"
     if fr:
         net, result, yearly = fr
-        text += f"<b>{'+' if result >= 0 else ''}{rub(result)}</b> · {pct(result / net * 100)}"
-        text += (f" · <b>{num(yearly)}% годовых</b>\n" if yearly is not None else "\n")
-        text += f"Внёс {rub(net)} → сейчас {rub(value_now)}\n"
+        text += (f"💰 <b>Результат: {'+' if result >= 0 else ''}{rub(result)} ({pct(result / net * 100)})"
+                 + (f" · {num(yearly)}% годовых" if yearly is not None else "") + "</b>\n"
+                 f"Внёс {rub(net)} → сейчас {rub(value_now)}\n")
     else:
-        text += f"Сейчас на счёте {rub(value_now)}\n"
+        text += f"💰 <b>Сейчас на счёте {rub(value_now)}</b>\n"
     if cash >= 1000:
         text += f"Свободные деньги {rub(cash)}: можно вложить\n"
 
-    text += "\n🎟 <b>Доходность облигаций, годовых</b>\n"
     f12 = fact_12m(ops) if ops else None
-    if f12:
-        period = "12 мес" if f12["months"] >= 12 else f"{f12['months']} мес, в пересчёте на год"
-        text += (f"📌 <b>По выплатам за {period}</b>\n"
-                 f"▫️ Купоны: <b>{num(f12['coupon_pct'])}%</b> {'✅' if f12['coupon_pct'] >= 20 else '⏳'} цель 20%\n"
-                 f"▫️ Купоны + доход от погашений: {num(f12['coupon_pct'] + f12['gain_pct'])}%\n")
     fw = forward_yield(held) if held else None
-    if fw is not None:
-        text += f"🔭 Если держать всё до погашения: <b>{num(fw)}%</b>\n"
-    if bonds_value:
-        text += f"📊 К текущей цене: {num(year_income / bonds_value * 100)}%\n"
+    if f12 or fw is not None:
+        year = "за год" if not f12 or f12["months"] >= 12 else f"за {f12['months']} мес, в пересчёте на год"
+        text += "\n📈 <b>Доходность, % годовых</b>\n"
+        if f12:
+            text += (f"• Купоны {year}: <b>{num(f12['coupon_pct'])}%</b> "
+                     f"{'✅' if f12['coupon_pct'] >= 20 else '⏳'} цель 20%\n"
+                     f"• С погашениями {year}: {num(f12['coupon_pct'] + f12['gain_pct'])}%\n")
+        if fw is not None:
+            text += f"• До погашения, прогноз: {num(fw)}%\n"
     if f12:
-        m = max(f12["months"], 1)
-        text += f"💵 Заработано купонами: <b>{rub(f12['earned'])}</b> (≈ {rub(f12['earned'] / m)} в месяц)\n"
-        if f12["nkd_paid"] >= 1:
-            text += (f"<i>Пришло {rub(f12['coupons'])}, из них {rub(f12['nkd_paid'])} это возврат НКД, "
-                     "доплаченного при покупках</i>\n")
-    return text + "\n📄 <b>Бумаги</b>\n\n" + "\n\n".join(cards)
+        text += (f"\n💵 Купоны: {rub(f12['earned'])} {year}, "
+                 f"≈ {rub(f12['earned'] / max(min(f12['months'], 12), 1))} в месяц\n")
+    return text + "\n" + "\n\n".join(cards)
 
 
 # =====================
