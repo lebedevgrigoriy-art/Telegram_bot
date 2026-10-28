@@ -1044,6 +1044,133 @@ def get_rates():
     return result if result else None
 
 
+_key_rate_cache = {}
+
+
+def _get(url, **kw):
+    """GET с запасным вариантом для сайтов на сертификате российского УЦ (берём набор из портфельного бота)."""
+    try:
+        return requests.get(url, **kw)
+    except requests.exceptions.SSLError:
+        import portfolio_bot
+        return requests.get(url, verify=portfolio_bot.CA_BUNDLE, **kw)
+
+
+def get_key_rate() -> float | None:
+    """Ключевая ставка ЦБ: сайт ЦБ, запасной вариант поиск через Gemini. Кэш на день."""
+    today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
+    if today in _key_rate_cache:
+        return _key_rate_cache[today]
+    rate = None
+    try:
+        now = datetime.now(TIMEZONE)
+        resp = _get("https://www.cbr.ru/hd_base/KeyRate/", timeout=15, headers={"User-Agent": "Mozilla/5.0"},
+                    params={"UniDbQuery.Posted": "True",
+                            "UniDbQuery.From": (now - timedelta(days=60)).strftime("%d.%m.%Y"),
+                            "UniDbQuery.To": now.strftime("%d.%m.%Y")})
+        rows = re.findall(r"<td>(\d{2}\.\d{2}\.\d{4})</td>\s*<td>([\d,]+)</td>", resp.text)
+        if rows:
+            latest = max(rows, key=lambda r: datetime.strptime(r[0], "%d.%m.%Y"))
+            rate = float(latest[1].replace(",", "."))
+    except Exception as e:
+        logger.warning(f"Ключевая ставка с cbr.ru не получена: {e}")
+    if rate is None:
+        raw = _ask_gemini_grounded("Какая сегодня ключевая ставка Банка России? "
+                                   "Ответь только числом в процентах, например 16.5", max_tokens=3000)
+        m = re.search(r"\d{1,2}(?:[.,]\d{1,2})?", raw or "")
+        rate = float(m.group(0).replace(",", ".")) if m else None
+    if rate is not None and not 3 <= rate <= 30:
+        rate = None
+    if rate is not None:
+        _key_rate_cache.clear()
+        _key_rate_cache[today] = rate
+    return rate
+
+
+def get_portfolio_yield() -> float | None:
+    """Доходность портфеля ИИС в % годовых на сегодня: факт по всем пополнениям и текущей стоимости.
+    Та же цифра, что в сверке портфельного бота."""
+    try:
+        import portfolio_bot as pb
+        if not pb.TINVEST_TOKEN:
+            return None
+        positions, cash = pb.get_positions()
+        value_now = sum(p["qty"] * (p["cur"] + p["nkd"]) for p in positions) + cash
+        fr = pb.fact_result(value_now)
+        return fr[2] if fr else None
+    except Exception as e:
+        logger.error(f"Доходность портфеля не получена: {e}")
+        return None
+
+
+def extra_rates_lines(key_rate, portfolio) -> str:
+    text = ""
+    if key_rate is not None:
+        text += f"\n🏦 *Ключевая ставка:* `{key_rate:g}%`".replace(".", ",")
+    if portfolio is not None:
+        text += f"\n\n💼 *Портфель:* {portfolio:.1f}% годовых".replace(".", ",")
+    return text
+
+
+# --- конвертация: «5000 бат», «100 долларов», «50 евро», «2500 рублей» ---
+CURRENCY_WORDS = [
+    ("THB", r"бат|thb|฿"),
+    ("USD", r"доллар|бакс|usd|\$"),
+    ("EUR", r"евро|eur|€"),
+    ("RUB", r"руб|rub|₽|р\b"),
+]
+CURRENCY_SIGN = {"RUB": "₽", "USD": "$", "EUR": "€", "THB": "฿"}
+
+
+def parse_amount(text: str):
+    """Возвращает (сумма, валюта) или None. Понимает «5000 бат», «5 000,5 рублей», «5к долларов», «евро 100»."""
+    t = text.lower().replace("\u00a0", " ").strip()
+    m = re.search(r"(\d[\d\s]*(?:[.,]\d+)?)\s*(к|k|тыс\.?)?", t)
+    if not m:
+        return None
+    amount = float(re.sub(r"\s", "", m.group(1)).replace(",", "."))
+    if m.group(2):
+        amount *= 1000
+    for code, pattern in CURRENCY_WORDS:
+        if re.search(pattern, t):
+            return amount, code
+    return None
+
+
+def _fmt_money(value: float, code: str) -> str:
+    decimals = 0 if abs(value) >= 1000 else (1 if abs(value) >= 10 else 2)
+    s = f"{value:,.{decimals}f}".replace(",", " ").replace(".", ",")
+    return f"{s} {CURRENCY_SIGN[code]}"
+
+
+def convert_text(amount: float, code: str) -> str | None:
+    """Конвертация по текущему курсу в остальные три валюты."""
+    try:
+        fx = requests.get("https://open.er-api.com/v6/latest/USD", timeout=10).json()["rates"]
+    except Exception as e:
+        logger.error(f"convert: курсы недоступны: {e}")
+        return None
+    per_usd = {"USD": 1.0, "RUB": fx["RUB"], "EUR": fx["EUR"], "THB": fx["THB"]}
+    usd = amount / per_usd[code]
+    head = (f"{amount:,.0f}".replace(",", " ") + f" {CURRENCY_SIGN[code]}") if amount == int(amount) else _fmt_money(amount, code)
+    lines = [f"💱 *{head}*"]
+    for other in ("RUB", "USD", "EUR", "THB"):
+        if other != code:
+            lines.append(f"= {_fmt_money(usd * per_usd[other], other)}")
+    return "\n".join(lines)
+
+
+async def convert_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != BYBIT_CHAT_ID:
+        return
+    parsed = parse_amount(update.message.text or "")
+    if not parsed:
+        await update.message.reply_text("Напиши сумму и валюту, например: 5000 бат, 100 долларов, 50 евро, 2500 рублей")
+        return
+    text = await asyncio.to_thread(convert_text, *parsed)
+    await update.message.reply_text(text or "❌ Курсы сейчас недоступны, попробуй позже.", parse_mode="Markdown")
+
+
 def format_rates(rates, prev=None):
     """Форматирует курсы единообразно: эмодзи, название, значение, опционально % за сутки."""
     if not rates:
@@ -1963,7 +2090,10 @@ async def rates_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Не удалось получить курсы — источники данных недоступны. Попробуй позже.")
             return
         prev = _get_yesterday_snapshot()
-        await update.message.reply_text(format_rates(rates, prev), parse_mode="Markdown")
+        key_rate = await asyncio.to_thread(get_key_rate)
+        portfolio = await asyncio.to_thread(get_portfolio_yield)
+        await update.message.reply_text(format_rates(rates, prev) + extra_rates_lines(key_rate, portfolio),
+                                        parse_mode="Markdown")
     except Exception as e:
         logger.error(f"rates_command error: {e}")
         await update.message.reply_text(f"❌ Ошибка при получении курсов: {e}")
@@ -1972,12 +2102,17 @@ async def rates_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def bybit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != BYBIT_CHAT_ID:
         return
-    await update.message.reply_text("Привет! Я слежу за курсами 📊\n\nКаждое утро в 08:00 — курсы.\nОбзоры: неделя (вс 18:00), месяц, полгода, год.\n\n/rates — курсы сейчас\n/review — обзор за неделю\n/month — за месяц\n/halfyear — за полгода\n/year — за год")
+    await update.message.reply_text("Привет! Я слежу за курсами 📊\n\nКаждое утро в 08:00: курсы.\nОбзоры: неделя (вс 18:00), месяц, полгода, год.\n\n/rates: курсы сейчас\nКонвертация: напиши сумму и валюту, например 5000 бат\n/review: обзор за неделю\n/month: за месяц\n/halfyear: за полгода\n/year: за год")
 
 
 async def morning_rates(context: ContextTypes.DEFAULT_TYPE):
     prev = _get_yesterday_snapshot()
-    await context.bot.send_message(chat_id=BYBIT_CHAT_ID, text="☀️ *Доброе утро!*\n\n" + format_rates(get_rates(), prev), parse_mode="Markdown")
+    key_rate = await asyncio.to_thread(get_key_rate)
+    portfolio = await asyncio.to_thread(get_portfolio_yield)
+    await context.bot.send_message(chat_id=BYBIT_CHAT_ID,
+                                   text="☀️ *Доброе утро!*\n\n" + format_rates(get_rates(), prev)
+                                   + extra_rates_lines(key_rate, portfolio),
+                                   parse_mode="Markdown")
 
 
 async def review_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2746,6 +2881,7 @@ async def main():
     rates_app.add_handler(CommandHandler("month", month_command))
     rates_app.add_handler(CommandHandler("halfyear", halfyear_command))
     rates_app.add_handler(CommandHandler("year", year_command))
+    rates_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, convert_message))
     rates_app.job_queue.run_daily(morning_rates, time=dtime(hour=8, minute=0, tzinfo=TIMEZONE))
     # Ежедневный снимок рынка для истории сравнений (08:05)
     rates_app.job_queue.run_daily(daily_snapshot_job, time=dtime(hour=8, minute=5, tzinfo=TIMEZONE))
