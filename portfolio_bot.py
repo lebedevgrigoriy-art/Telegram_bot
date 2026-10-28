@@ -521,7 +521,6 @@ def build_weekly_report() -> str:
     positions, cash = get_positions()
     if not positions:
         return "💼 В портфеле пока нет бумаг."
-    held = []   # (тикер, количество, средняя цена, НКД сейчас) для доходности до погашения
 
     cards = []
     for p in positions:
@@ -544,11 +543,9 @@ def build_weekly_report() -> str:
             if annual:
                 # ставка купона: сколько платит в год от номинала (свойство самой облигации)
                 parts.append(f"Ставка купона {num(annual / face * 100)}%")
-            if p["avg"]:
-                held.append((p["ticker"], p["qty"], p["avg"], p["nkd"]))
-                fy = forward_yield([(p["ticker"], 1, p["avg"], p["nkd"])])
-                if fy is not None:
-                    parts.append(f"до погашения <b>{num(fy)}%</b>")
+                if p["avg"]:
+                    # те же купоны, но от твоей цены покупки
+                    parts.append(f"к вложенным <b>{num(annual / p['avg'] * 100)}%</b>")
             if parts:
                 body.append(" · ".join(parts))
         cards.append(head + "\n" + "\n".join(body))
@@ -575,16 +572,12 @@ def build_weekly_report() -> str:
         text += f"Свободные деньги {rub(cash)}: можно вложить\n"
 
     f12 = fact_12m(ops) if ops else None
-    fw = forward_yield(held) if held else None
-    if f12 or fw is not None:
+    if f12:
         year = "за год" if not f12 or f12["months"] >= 12 else f"за {f12['months']} мес, в пересчёте на год"
         text += "\n📈 <b>Доходность, % годовых</b>\n"
-        if f12:
-            text += (f"• Купоны {year}: <b>{num(f12['coupon_pct'])}%</b> "
-                     f"{'✅' if f12['coupon_pct'] >= 20 else '⏳'} цель 20%\n"
-                     f"• С погашениями {year}: {num(f12['coupon_pct'] + f12['gain_pct'])}%\n")
-        if fw is not None:
-            text += f"• До погашения, прогноз: {num(fw)}%\n"
+        text += (f"• Купоны {year}: <b>{num(f12['coupon_pct'])}%</b> "
+                 f"{'✅' if f12['coupon_pct'] >= 20 else '⏳'} цель 20%\n"
+                 f"• С погашениями {year}: {num(f12['coupon_pct'] + f12['gain_pct'])}%\n")
     if f12:
         text += (f"\n💵 Купоны: {rub(f12['earned'])} {year}, "
                  f"≈ {rub(f12['earned'] / max(min(f12['months'], 12), 1))} в месяц\n")
