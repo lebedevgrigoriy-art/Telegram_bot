@@ -604,24 +604,24 @@ def _norm_title(title: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
-def _get_sent_book_titles() -> set:
-    """Все уже присланные названия книг (нормализованные), чтобы не повторяться неделя за неделей."""
+def _get_sent_book_titles() -> list:
+    """Все уже присланные названия книг (нормализованные), от последних к ранним."""
     try:
         resp = requests.get(
             f"{SUPABASE_URL}/rest/v1/sent_books",
             headers=sb_headers(),
-            params={"select": "title"},
+            params={"select": "title,sent_at", "order": "sent_at.desc.nullslast"},
             timeout=10,
         )
         if resp.ok:
-            titles = {_norm_title(row["title"]) for row in resp.json() if row.get("title")}
+            titles = list(dict.fromkeys(_norm_title(row["title"]) for row in resp.json() if row.get("title")))
             logger.info(f"sent_books: в памяти {len(titles)} книг")
             return titles
         logger.error(f"sent_books недоступна ({resp.status_code}): {resp.text[:200]}. "
                      f"Защита от повторов НЕ работает, создай таблицу sent_books")
     except Exception as e:
         logger.error(f"_get_sent_book_titles error: {e}")
-    return set()
+    return []
 
 
 def _mark_book_sent(title: str, author: str):
@@ -693,14 +693,15 @@ def _parse_book_lines(raw: str) -> list:
     return books
 
 
-def _find_fresh_books(exclude: set, ru_count: int = 4, world_count: int = 4) -> list:
-    """Gemini ищет в интернете реальные книжные новинки последних 30 дней."""
+def _find_fresh_books(exclude: list, ru_count: int = 4, world_count: int = 4, days: int = 30) -> list:
+    """Gemini ищет в интернете реальные книжные новинки последних days дней."""
     today = datetime.now(TIMEZONE)
-    since = (today - timedelta(days=30)).strftime("%d.%m.%Y")
+    since = (today - timedelta(days=days)).strftime("%d.%m.%Y")
     exclude_text = ""
     if exclude:
+        # последние присланные книги (а не по алфавиту), чтобы Gemini не предлагал их снова
         exclude_text = ("\nНЕ ПРЕДЛАГАЙ эти книги, они уже были: "
-                        + "; ".join(sorted(exclude)[-80:]) + "\n")
+                        + "; ".join(exclude[:100]) + "\n")
     prompt = (
         f"Сегодня {today.strftime('%d.%m.%Y')}. Найди в интернете САМЫЕ СВЕЖИЕ книжные новинки, "
         f"которые вышли с {since} по сегодня. Темы: {BOOKS_THEMES}.\n\n"
@@ -709,7 +710,7 @@ def _find_fresh_books(exclude: set, ru_count: int = 4, world_count: int = 4) -> 
         f"и {world_count} книги, вышедшие в мире на английском (свежие релизы нон-фикшн, "
         "новинки из списков бестселлеров, о которых сейчас говорят).\n"
         "Выбирай то, что обсуждают и ждут, а не проходное. Только реальные книги с подтверждённой "
-        "датой выхода в этом окне. Классику и книги старше 30 дней не бери.\n"
+        f"датой выхода в этом окне. Классику и книги старше {days} дней не бери.\n"
         f"{exclude_text}\n"
         "Ответь ТОЛЬКО JSON-массивом, без пояснений до и после. Каждая книга:\n"
         '{"section": "RU или WORLD", "title": "название", "author": "автор (обязательно, имя человека)", '
@@ -721,8 +722,11 @@ def _find_fresh_books(exclude: set, ru_count: int = 4, world_count: int = 4) -> 
     )
     raw = _ask_gemini_grounded(prompt)
     if not raw:
+        logger.warning(f"Книги: Gemini ничего не вернул (окно {days} дн)")
         return []
     books = _parse_books_json(raw) or _parse_book_lines(raw)
+    if not books:
+        logger.warning(f"Книги: ответ Gemini не разобрался (окно {days} дн): {raw[:500]}")
     logger.info(f"Свежие книги из поиска: {len(books)} (RU {sum(b['section']=='RU' for b in books)}, "
                 f"WORLD {sum(b['section']=='WORLD' for b in books)})")
     return books
@@ -786,14 +790,23 @@ def _attach_cover(book: dict) -> dict:
 
 def get_weekly_books() -> list:
     """Свежие новинки недели: 4 на русском + 4 мировые. Без повторов из прошлых подборок."""
-    sent = _get_sent_book_titles()
+    sent_list = _get_sent_book_titles()
+    sent = set(sent_list)
     books, seen = [], set()
-    for b in _find_fresh_books(sent):
-        key = _norm_title(b["title"])
-        if key in sent or key in seen:
-            continue
-        seen.add(key)
-        books.append(b)
+    # сначала новинки за 30 дней; если после отсева повторов мало, расширяем окно до 60 дней
+    for days in (30, 60):
+        found = _find_fresh_books(sent_list, days=days)
+        repeats = 0
+        for b in found:
+            key = _norm_title(b["title"])
+            if key in sent or key in seen:
+                repeats += 1
+                continue
+            seen.add(key)
+            books.append(b)
+        logger.info(f"Книги: окно {days} дн, найдено {len(found)}, повторов {repeats}, итого новых {len(books)}")
+        if len(books) >= 4:
+            break
 
     if not books:
         logger.warning("Поиск новинок пустой, беру свежие издания из Google Books")
@@ -1026,15 +1039,24 @@ def get_rates():
     except Exception as e:
         logger.error(f"Rates: CoinGecko BTC failed: {e}")
 
-    # Валюты — er-api
+    # Валюты: официальный курс ЦБ. ЦБ сам отдаёт и вчерашний курс, поэтому % за сутки честный
     try:
-        fx_resp = requests.get("https://open.er-api.com/v6/latest/USD", timeout=10)
-        fx = fx_resp.json()["rates"]
-        result["rub_per_usd"] = fx["RUB"]
-        result["rub_per_thb"] = fx["RUB"] / fx["THB"]
-        result["rub_per_eur"] = fx["RUB"] / fx["EUR"]
+        cbr = _get("https://www.cbr-xml-daily.ru/daily_json.js", timeout=10).json()["Valute"]
+        prev_fx = {}
+        for key, code in (("rub_per_usd", "USD"), ("rub_per_eur", "EUR"), ("rub_per_thb", "THB")):
+            v = cbr[code]
+            result[key] = v["Value"] / v["Nominal"]
+            prev_fx[key] = v["Previous"] / v["Nominal"]
+        result["fx_prev"] = prev_fx
     except Exception as e:
-        logger.error(f"Rates: er-api FX failed: {e}")
+        logger.error(f"Rates: курсы ЦБ не получены ({e}), беру er-api")
+        try:
+            fx = requests.get("https://open.er-api.com/v6/latest/USD", timeout=10).json()["rates"]
+            result["rub_per_usd"] = fx["RUB"]
+            result["rub_per_thb"] = fx["RUB"] / fx["THB"]
+            result["rub_per_eur"] = fx["RUB"] / fx["EUR"]
+        except Exception as e2:
+            logger.error(f"Rates: er-api FX failed: {e2}")
 
     # Мосбиржа (уже защищена — возвращает None при сбое)
     result["moex"] = _moex_index()
@@ -1177,18 +1199,15 @@ def format_rates(rates, prev=None):
         return "❌ Не удалось получить курсы."
     now = datetime.now(TIMEZONE).strftime("%d.%m.%Y %H:%M")
 
+    fx_prev = rates.get("fx_prev") or {}
+
     def fmt_line(emoji, name, key, value, unit, as_int=False, decimals=2):
-        val_str = f"{value:,.0f}".replace(",", " ") if as_int else f"{value:.{decimals}f}"
+        val_str = f"{value:,.0f}".replace(",", " ") if as_int else f"{value:.{decimals}f}".replace(".", ",")
         line = f"{emoji} *{name}:* `{val_str} {unit}`".rstrip() if unit else f"{emoji} *{name}:* `{val_str}`"
-        if prev and prev.get(key):
-            p = _pct(prev[key], value)
-            if p is not None:
-                if p > 0:
-                    line += f" +{p:.1f}%"
-                elif p < 0:
-                    line += f" {p:.1f}%"
-                else:
-                    line += " 0.0%"
+        base = fx_prev.get(key) or (prev.get(key) if prev else None)   # валюты: вчерашний курс ЦБ
+        p = _pct(base, value) if base else None
+        if p is not None:
+            line += f" {p:+.1f}%".replace(".", ",") if round(p, 1) else " 0,0%"
         return line
 
     lines = [f"📊 *Курсы на {now}*\n"]
@@ -1286,14 +1305,15 @@ def make_market_review(period_label, days_back):
 
     changes = []
     def line(emoji, name, key, cur, unit="", as_int=False):
-        val = f"{cur:,.0f}".replace(",", " ") if as_int else f"{cur:.2f}"
+        val = f"{cur:,.0f}".replace(",", " ") if as_int else f"{cur:.2f}".replace(".", ",")
         txt = f"{emoji} *{name}:* `{val}{unit}`"
         if prev and prev.get(key):
             p = _pct(prev[key], cur)
             if p is not None:
                 arrow = "📈" if p >= 0 else "📉"
-                txt += f"  {arrow} {p:+.1f}%"
-                changes.append(f"{name}: {val}{unit} ({p:+.1f}% за {period_label})")
+                p_str = f"{p:+.1f}%".replace(".", ",")
+                txt += f"  {arrow} {p_str}"
+                changes.append(f"{name}: {val}{unit} ({p_str} за {period_label})")
         else:
             changes.append(f"{name}: {val}{unit}")
         return txt
@@ -1305,8 +1325,17 @@ def make_market_review(period_label, days_back):
         lines.append(line("💵", "Доллар", "rub_per_usd", rates["rub_per_usd"], " ₽"))
     if rates.get("rub_per_eur"):
         lines.append(line("🇪🇺", "Евро", "rub_per_eur", rates["rub_per_eur"], " ₽"))
+    if rates.get("rub_per_thb"):
+        lines.append(line("🇹🇭", "Бат", "rub_per_thb", rates["rub_per_thb"], " ₽"))
     if rates.get("moex"):
         lines.append(line("🇷🇺", "Мосбиржа", "moex", rates["moex"], "", as_int=True))
+    key_rate = get_key_rate()
+    if key_rate is not None:
+        lines.append(f"🏦 *Ключевая ставка:* `{key_rate:g}%`".replace(".", ","))
+        changes.append(f"Ключевая ставка ЦБ: {key_rate:g}%")
+    portfolio = get_portfolio_yield()
+    if portfolio is not None:
+        lines.append(f"\n💼 *Портфель:* {portfolio:.1f}% годовых".replace(".", ","))
 
     table = "\n".join(lines)
     has_dynamics = prev is not None
@@ -1319,10 +1348,10 @@ def make_market_review(period_label, days_back):
                 + "\n".join(changes) +
                 f"\n\nНапиши живой ироничный комментарий (5-7 предложений) про движения за {period_label}. "
                 "Обыграй кто вырос, кто упал, что просело сильнее, что держится. "
-                "Свяжи активы где уместно (доллар и нефть, золото как защита). "
+                "Свяжи активы где уместно (рубль, биткоин, российские акции, ключевая ставка). "
                 "ВАЖНО: опирайся ТОЛЬКО на эти цифры и проценты. "
                 "НЕ выдумывай новости, события, имена, компании, причины — знаешь только цифры. "
-                "Без markdown-заголовков, живой разговорный тон."
+                "Без markdown-заголовков, без длинных тире и кавычек-ёлочек, живой разговорный тон."
             )
         else:
             prompt = (
@@ -1334,6 +1363,8 @@ def make_market_review(period_label, days_back):
             )
         comment = _ask_claude(prompt, max_tokens=900)
         if comment:
+            comment = (comment.replace(" — ", ": ").replace("—", "-")
+                       .replace("«", '"').replace("»", '"'))
             footer = "" if has_dynamics else f"\n\n_📸 Нет данных за {period_label} назад — динамика появится когда накопится история._"
             return f"{table}\n\n💬 {comment}{footer}"
 
