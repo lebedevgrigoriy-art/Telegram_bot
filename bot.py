@@ -53,7 +53,7 @@ KP_API_KEY = os.environ.get("KP_API_KEY")
 SAVINGS_GOAL = 10000
 TODOIST_API = "https://api.todoist.com/api/v1"
 
-Q1, Q_MOOD, Q2, Q_SELF, Q3, Q4, Q5 = range(7)
+Q1, Q_MOOD, Q2, Q_SELF, Q_JOY, Q3, Q4, Q5 = range(8)
 ENTER_DATE, ENTER_EXPIRY = range(2)
 WQ1, WQ2, WQ3, WQ4, WQ5, WQ6, WQ7 = range(10, 17)
 
@@ -62,6 +62,7 @@ QUESTIONS = [
     "💭 Как ты себя чувствуешь? Какие эмоции и состояние сегодня?",
     "🙏 Кому или чему ты сегодня благодарен?",
     "🏆 Чем ты сегодня можешь гордиться? Какие были успехи, даже маленькие?",
+    "🎁 Чем ты сегодня себя порадовал?",
     "📖 Какой урок или вывод можно вынести из сегодняшнего дня?",
     "🗓 Какой у тебя план на завтра? Три главных дела.",
 ]
@@ -151,10 +152,25 @@ def save_entry(date_str, answers):
         "mood": answers.get("mood", ""),
         "gratitude": answers.get("gratitude", ""),
         "self_gratitude": answers.get("self_gratitude", ""),
+        "joy": answers.get("joy", ""),
         "lesson": answers.get("lesson", ""),
         "plan": answers.get("plan", ""),
         "plan_review": answers.get("plan_review", ""),
     }, on_conflict="date")
+    if not ok and answers.get("joy"):
+        # страховка: если колонки joy ещё нет в Supabase, сохраняем запись без неё
+        logger.warning("save_entry: не сохранилось с полем joy, пробую без него (нужен ALTER TABLE journal ADD COLUMN joy)")
+        ok = sb_upsert("journal", {
+            "date": date_str,
+            "saved_at": datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M"),
+            "day_text": answers.get("day", ""),
+            "mood": answers.get("mood", ""),
+            "gratitude": answers.get("gratitude", ""),
+            "self_gratitude": answers.get("self_gratitude", ""),
+            "lesson": answers.get("lesson", ""),
+            "plan": answers.get("plan", ""),
+            "plan_review": answers.get("plan_review", ""),
+        }, on_conflict="date")
     if ok:
         logger.info(f"save_entry OK для {date_str}")
     else:
@@ -171,6 +187,55 @@ def get_yesterday_plan():
         if plan:
             return row["date"], plan
     return None, None
+
+
+JOY_EMPTY = {"ничем", "нечем", "ничего", "нет", "не знаю", "-", "—", "."}
+WEEKDAYS_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+
+def _is_empty_joy(text) -> bool:
+    return (text or "").strip().lower().strip(" .!") in JOY_EMPTY
+
+
+def joy_items(rows) -> list:
+    """[(дата, радость)] только за дни, где радость реально записана."""
+    return [(r["date"], (r.get("joy") or "").strip())
+            for r in rows if (r.get("joy") or "").strip() and not _is_empty_joy(r.get("joy"))]
+
+
+def make_joy_block(rows, total_days: int, title: str) -> str:
+    """Простой список радостей без AI: сразу видно, за сколько дней записано."""
+    items = joy_items(rows)
+    head = f"🎁 {title}: {len(items)} из {total_days} дней"
+    if not items:
+        return head + "\n\nПока ни одной радости не записано. Начни с маленькой, завтра."
+    lines = []
+    for d, text in items:
+        dt = datetime.strptime(d, "%Y-%m-%d")
+        lines.append(f"• {WEEKDAYS_SHORT[dt.weekday()]} {dt.strftime('%d.%m')}: {text}")
+    return head + "\n\n" + "\n".join(lines)
+
+
+def make_joy_comment(rows, period: str) -> str | None:
+    """Короткий тёплый комментарий ИИ про радости: что даёт энергию и что повторять."""
+    items = joy_items(rows)
+    if not items:
+        return None
+    listing = "\n".join(f"{d}: {t}" for d, t in items)
+    prompt = (
+        f"Вот радости человека за {period}. Он записывал их каждый вечер, "
+        "потому что его цель: радовать себя и менять майндсет.\n\n"
+        f"{listing}\n\n"
+        "Напиши короткий тёплый комментарий, 4-6 предложений, на «ты», без markdown-заголовков. "
+        "Что из этого даёт больше всего энергии и настроения, какие радости стоит повторять чаще, "
+        "и одна маленькая идея радости на следующий период. Без пафоса и канцелярита."
+    )
+    return _ask_claude(prompt, max_tokens=800) or None
+
+
+def get_week_journal():
+    week_ago = (datetime.now(TIMEZONE) - timedelta(days=7)).strftime("%Y-%m-%d")
+    return sb_get("journal", {"date": f"gte.{week_ago}", "order": "date.asc"})
 
 
 def _gratitude_target_month():
@@ -220,6 +285,8 @@ def make_month_portrait(month_str=None):
             parts.append(f"гордость/успехи: {r['self_gratitude']}")
         if r.get("gratitude"):
             parts.append(f"благодарность: {r['gratitude']}")
+        if r.get("joy") and not _is_empty_joy(r.get("joy")):
+            parts.append(f"радость: {r['joy']}")
         if r.get("lesson"):
             parts.append(f"урок: {r['lesson']}")
         if r.get("plan"):
@@ -333,6 +400,8 @@ def make_weekly_ai_summary(weekly_answers):
             parts.append(f"гордость/успехи: {r['self_gratitude']}")
         if r.get("gratitude"):
             parts.append(f"благодарность: {r['gratitude']}")
+        if r.get("joy") and not _is_empty_joy(r.get("joy")):
+            parts.append(f"радость: {r['joy']}")
         if r.get("lesson"):
             parts.append(f"урок: {r['lesson']}")
         if parts:
@@ -357,7 +426,8 @@ def make_weekly_ai_summary(weekly_answers):
         "Сделай тёплую, но честную сводку недели (без воды, по делу):\n"
         "1. Чем человек может гордиться за неделю — 2-3 конкретных пункта из его записей.\n"
         "2. Какие повторяющиеся темы, настроения или паттерны заметны (и хорошие, и тревожные).\n"
-        "3. Одно мягкое наблюдение или вопрос для размышления на следующую неделю.\n\n"
+        "3. Радости: что он себе подарил на этой неделе, что давало энергию и что стоит повторять чаще.\n"
+        "4. Одно мягкое наблюдение или вопрос для размышления на следующую неделю.\n\n"
         "Пиши на «ты», живым языком, 6-10 предложений. Без markdown-заголовков."
     )
     summary = _ask_claude(prompt, max_tokens=1500)
@@ -1922,13 +1992,29 @@ async def answer_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["answers"]["self_gratitude"] = update.message.text
     save_entry(context.user_data["date"], context.user_data["answers"])
     await update.message.reply_text(QUESTIONS[4])
+    return Q_JOY
+
+
+async def answer_joy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if _is_empty_joy(text):
+        # не блокируем: просто мягкая подсказка, и переходим к уроку
+        context.user_data["answers"]["joy"] = ""
+        await update.message.reply_text(
+            "Ничего страшного. Завтра попробуй заранее выбрать одну маленькую радость: "
+            "кофе в любимом месте, прогулка, 15 минут на игру."
+        )
+    else:
+        context.user_data["answers"]["joy"] = text
+    save_entry(context.user_data["date"], context.user_data["answers"])
+    await update.message.reply_text(QUESTIONS[5])
     return Q3
 
 
 async def answer_q3(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["answers"]["lesson"] = update.message.text
     save_entry(context.user_data["date"], context.user_data["answers"])
-    await update.message.reply_text(QUESTIONS[5])
+    await update.message.reply_text(QUESTIONS[6])
     return Q4
 
 
@@ -2098,6 +2184,19 @@ async def monthly_portrait_report(context: ContextTypes.DEFAULT_TYPE):
         async def _send(text, parse_mode=None):
             await context.bot.send_message(chat_id=MY_CHAT_ID, text=text, parse_mode=parse_mode)
         await _send_long(_send, f"🖼 *Портрет месяца — {month_name}*\n\n{portrait}")
+
+    # отдельное сообщение про радости месяца: список и тёплый комментарий
+    month_rows = get_month_entries(last_month)
+    first = datetime.strptime(last_month + "-01", "%Y-%m-%d")
+    days_in_month = ((first + timedelta(days=32)).replace(day=1) - first).days
+    if month_rows:
+        joy_msg = make_joy_block(month_rows, days_in_month, "Радости месяца")
+        comment = make_joy_comment(month_rows, "прошедший месяц")
+        if comment:
+            joy_msg += "\n\n💛 " + comment
+        async def _send_joy(text, parse_mode=None):
+            await context.bot.send_message(chat_id=MY_CHAT_ID, text=text, parse_mode=parse_mode)
+        await _send_long(_send_joy, joy_msg)
 
 
 # =====================
@@ -2813,6 +2912,8 @@ async def weekly_q7(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ *Итоги недели сохранены!*\n\nГотовлю сводку за неделю... 🧠",
         parse_mode="Markdown"
     )
+    # отдельный блок радостей недели: список по дням, без AI
+    await update.message.reply_text(make_joy_block(get_week_journal(), 7, "Радости недели"))
     summary = make_weekly_ai_summary(answers)
     if summary:
         await _send_long(update.message.reply_text, f"📊 *Твоя неделя — взгляд со стороны*\n\n{summary}")
@@ -2867,6 +2968,7 @@ async def main():
             Q_MOOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, answer_mood)],
             Q2: [MessageHandler(filters.TEXT & ~filters.COMMAND, answer_q2)],
             Q_SELF: [MessageHandler(filters.TEXT & ~filters.COMMAND, answer_self)],
+            Q_JOY: [MessageHandler(filters.TEXT & ~filters.COMMAND, answer_joy)],
             Q3: [MessageHandler(filters.TEXT & ~filters.COMMAND, answer_q3)],
             Q4: [MessageHandler(filters.TEXT & ~filters.COMMAND, answer_q4)],
             Q5: [MessageHandler(filters.TEXT & ~filters.COMMAND, answer_plan_review)],
