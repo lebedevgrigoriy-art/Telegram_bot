@@ -671,6 +671,14 @@ def tapi_coupons(uid: str, start: datetime, end: datetime) -> list:
     return [(e.get("couponDate", "")[:10], _q(e.get("payOneBond")) or None) for e in events]
 
 
+def next_business_day(d: str) -> str:
+    """Выплата, которая выпала на выходной, приходит в ближайший рабочий день (как в приложении Т-Инвестиций)."""
+    day = datetime.strptime(d, "%Y-%m-%d")
+    while day.weekday() >= 5:   # 5 = суббота, 6 = воскресенье
+        day += timedelta(days=1)
+    return day.strftime("%Y-%m-%d")
+
+
 def collect_payments(d_from: str, d_to: str) -> tuple[list, list, list]:
     """Купоны и погашения по облигациям портфеля в интервале дат (YYYY-MM-DD, по Москве).
     Возвращает (events, unknown, failed): events = [(дата, значок, бумага, сумма, пояснение)]."""
@@ -695,6 +703,10 @@ def collect_payments(d_from: str, d_to: str) -> tuple[list, list, list]:
                 logger.error(f"coupons {b['ticker']}: {e2}")
                 failed.append(b["name"])
                 continue
+        # даты переносим на рабочий день и заново определяем погашение (последнюю амортизацию)
+        coupons = [(next_business_day(d) if d else d, v) for d, v in coupons]
+        amorts = [(next_business_day(d) if d else d, v) for d, v in amorts]
+        maturity = max((d for d, _ in amorts if d), default=None)
         for d, v in coupons:
             if d and d_from <= d <= d_to:
                 if v is None:
